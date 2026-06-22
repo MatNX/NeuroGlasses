@@ -40,7 +40,7 @@ class SettingsActivity : AppCompatActivity() {
         const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
         const val DEFAULT_API_TIMEOUT = 15
-        const val DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant for Rokid AR glasses. Keep responses brief and glanceable unless the user asks for detail."
+        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools proaktiv für Anrufe, SMS, Navigation, Wetter, Websuche, Erinnerungen, Kalender, E-Mail, Apps, Teilen, Akku und Fotos, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn eine Pflichtangabe fehlt."
         const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
         const val DEFAULT_VLM_MAX_TOKENS = 1024
         const val DEFAULT_ASR_MODEL = "whisper-large-v3"
@@ -146,7 +146,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save API base URL
             val apiBaseUrl = apiBaseUrlEditText.text.toString().trim()
             if (apiBaseUrl.isEmpty()) {
-                Toast.makeText(this, "Groq API Base URL cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Groq-API-Basis-URL darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_API_BASE_URL, apiBaseUrl)
@@ -159,7 +159,7 @@ class SettingsActivity : AppCompatActivity() {
             val apiTimeoutStr = apiTimeoutEditText.text.toString().trim()
             val apiTimeout = apiTimeoutStr.toIntOrNull()
             if (apiTimeout == null || apiTimeout <= 0) {
-                Toast.makeText(this, "API Timeout must be a positive number (in seconds)", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "API-Timeout muss eine positive Zahl in Sekunden sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putInt(KEY_API_TIMEOUT, apiTimeout)
@@ -167,7 +167,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save system prompt
             val systemPrompt = systemPromptEditText.text.toString().trim()
             if (systemPrompt.isEmpty()) {
-                Toast.makeText(this, "System Prompt cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "System-Prompt darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_SYSTEM_PROMPT, systemPrompt)
@@ -175,7 +175,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save VLM model
             val vlmModel = vlmModelEditText.text.toString().trim()
             if (vlmModel.isEmpty()) {
-                Toast.makeText(this, "VLM Model cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "VLM-Modell darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_VLM_MODEL, vlmModel)
@@ -184,7 +184,7 @@ class SettingsActivity : AppCompatActivity() {
             val vlmMaxTokensStr = vlmMaxTokensEditText.text.toString().trim()
             val vlmMaxTokens = vlmMaxTokensStr.toIntOrNull()
             if (vlmMaxTokens == null || vlmMaxTokens <= 0) {
-                Toast.makeText(this, "VLM Max Tokens must be a positive number", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Maximale VLM-Tokens müssen eine positive Zahl sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putInt(KEY_VLM_MAX_TOKENS, vlmMaxTokens)
@@ -192,7 +192,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save ASR model
             val asrModel = asrModelEditText.text.toString().trim()
             if (asrModel.isEmpty()) {
-                Toast.makeText(this, "ASR Model cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "ASR-Modell darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_ASR_MODEL, asrModel)
@@ -200,7 +200,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save TTS model
             val ttsModel = ttsModelEditText.text.toString().trim()
             if (ttsModel.isEmpty()) {
-                Toast.makeText(this, "TTS Model cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "TTS-Modell darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_TTS_MODEL, ttsModel)
@@ -208,7 +208,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save TTS voice
             val ttsVoice = ttsVoiceEditText.text.toString().trim()
             if (ttsVoice.isEmpty()) {
-                Toast.makeText(this, "TTS Voice cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "TTS-Stimme darf nicht leer sein", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_TTS_VOICE, ttsVoice)
@@ -216,10 +216,10 @@ class SettingsActivity : AppCompatActivity() {
             // Apply changes
             editor.apply()
 
-            Toast.makeText(this, "Settings saved successfully", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Einstellungen gespeichert", Toast.LENGTH_SHORT).show()
             finish()
         } catch (e: Exception) {
-            Toast.makeText(this, "Error saving settings: ${e.message}", Toast.LENGTH_LONG).show()
+            Toast.makeText(this, "Fehler beim Speichern: ${e.message}", Toast.LENGTH_LONG).show()
         }
     }
 
@@ -234,6 +234,6 @@ class SettingsActivity : AppCompatActivity() {
         ttsModelEditText.setText(DEFAULT_TTS_MODEL)
         ttsVoiceEditText.setText(DEFAULT_TTS_VOICE)
 
-        Toast.makeText(this, "Reset to default values", Toast.LENGTH_SHORT).show()
+        Toast.makeText(this, "Auf Standardwerte zurückgesetzt", Toast.LENGTH_SHORT).show()
     }
 }
