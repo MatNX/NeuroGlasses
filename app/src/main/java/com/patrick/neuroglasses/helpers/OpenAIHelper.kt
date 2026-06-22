@@ -27,6 +27,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
 import java.util.Locale
+import java.util.UUID
 
 /**
  * Data classes for OpenAI API request/response
@@ -129,6 +130,20 @@ data class TtsRequest(
     val voice: String
 )
 
+data class PersistedChatMessage(
+    val role: String,
+    val text: String,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
+data class PersistedChatSession(
+    val id: String,
+    val title: String,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val messages: List<PersistedChatMessage> = emptyList()
+)
+
 /**
  * Groq AI Helper
  * Handles AI-related API calls including ASR (speech-to-text) and OpenAI chat completion
@@ -136,6 +151,8 @@ data class TtsRequest(
 class OpenAIHelper(private val context: Context, private val appTag: String = "OpenAIHelper") {
 
     private val gson = Gson()
+    private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+
 
     // Get configuration from SharedPreferences
     private fun getApiBaseUrl(): String = SettingsActivity.getApiBaseUrl(context).trimEnd('/')
@@ -163,6 +180,98 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun getChatApiUrl(): String = "${getApiBaseUrl()}/chat/completions"
     private fun getAsrApiUrl(): String = "${getApiBaseUrl()}/audio/transcriptions"
     private fun getTtsApiUrl(): String = "${getApiBaseUrl()}/audio/speech"
+
+
+    private fun getChatSessions(): MutableList<PersistedChatSession> {
+        val json = chatPrefs.getString("sessions", null) ?: return mutableListOf()
+        return runCatching {
+            gson.fromJson(json, Array<PersistedChatSession>::class.java).toMutableList()
+        }.getOrElse {
+            Log.w(appTag, "Could not parse persisted chats", it)
+            mutableListOf()
+        }
+    }
+
+    private fun saveChatSessions(sessions: List<PersistedChatSession>) {
+        chatPrefs.edit().putString("sessions", gson.toJson(sessions)).apply()
+    }
+
+    private fun activeChatId(): String {
+        val sessions = getChatSessions()
+        val stored = chatPrefs.getString("active_chat_id", null)
+        if (stored != null && sessions.any { it.id == stored }) return stored
+        val session = sessions.firstOrNull() ?: createChatSession("Chat 1")
+        chatPrefs.edit().putString("active_chat_id", session.id).apply()
+        return session.id
+    }
+
+    private fun createChatSession(title: String? = null): PersistedChatSession {
+        val sessions = getChatSessions()
+        val now = System.currentTimeMillis()
+        val session = PersistedChatSession(
+            id = UUID.randomUUID().toString(),
+            title = title?.takeIf { it.isNotBlank() } ?: "Chat ${sessions.size + 1}",
+            createdAt = now,
+            updatedAt = now
+        )
+        sessions.add(0, session)
+        saveChatSessions(sessions)
+        chatPrefs.edit().putString("active_chat_id", session.id).apply()
+        return session
+    }
+
+    private fun updateChatSession(chatId: String, transform: (PersistedChatSession) -> PersistedChatSession): PersistedChatSession? {
+        val sessions = getChatSessions()
+        val index = sessions.indexOfFirst { it.id == chatId }
+        if (index == -1) return null
+        val updated = transform(sessions[index]).copy(updatedAt = System.currentTimeMillis())
+        sessions[index] = updated
+        saveChatSessions(sessions.sortedByDescending { it.updatedAt })
+        return updated
+    }
+
+    private fun appendChatMessages(chatId: String, messages: List<PersistedChatMessage>) {
+        if (messages.isEmpty()) return
+        updateChatSession(chatId) { session ->
+            val title = if (session.messages.isEmpty() && session.title.startsWith("Chat ")) {
+                messages.firstOrNull { it.role == "user" }?.text?.take(40)?.ifBlank { session.title } ?: session.title
+            } else session.title
+            session.copy(title = title, messages = (session.messages + messages).takeLast(40))
+        }
+    }
+
+    private fun activeChatHistoryMessages(): List<Message> {
+        val session = getChatSessions().firstOrNull { it.id == activeChatId() } ?: return emptyList()
+        return session.messages.takeLast(20).map { Message(role = it.role, content = it.text) }
+    }
+
+    private fun switchChat(chatId: String?, title: String?): String {
+        val sessions = getChatSessions()
+        val session = when {
+            !chatId.isNullOrBlank() -> sessions.firstOrNull { it.id == chatId }
+            !title.isNullOrBlank() -> sessions.firstOrNull { it.title.equals(title, ignoreCase = true) }
+            else -> null
+        } ?: return "Chat not found. Use list_chats to see available chat ids and titles."
+        chatPrefs.edit().putString("active_chat_id", session.id).apply()
+        return "Switched to chat '${session.title}' (${session.id})."
+    }
+
+    private fun listChats(): String {
+        val active = activeChatId()
+        val sessions = getChatSessions()
+        if (sessions.isEmpty()) return "No chats exist yet."
+        return sessions.joinToString("\n") { session ->
+            val marker = if (session.id == active) "*" else "-"
+            "$marker ${session.title} [${session.id}] (${session.messages.size} messages)"
+        }
+    }
+
+    private fun renameChat(chatId: String?, title: String): String {
+        if (title.isBlank()) return "A new chat title is required."
+        val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatId()
+        val updated = updateChatSession(targetId) { it.copy(title = title) }
+        return if (updated == null) "Chat not found." else "Renamed chat to '${updated.title}'."
+    }
 
     /**
      * Listener interface for AI API callbacks
@@ -439,6 +548,32 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 name = "snap_glasses_photo",
                 description = "Deutschsprachig: Mache freihändig ein Foto mit der Rokid-Brillenkamera als visuellen Kontext. Die Activity verarbeitet dieses Tool.",
                 parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "new_chat",
+                description = "Create and switch to a fresh persistent chat thread when the user asks for a new topic, new chat, or separate conversation.",
+                parameters = objectSchema(emptyList(), mapOf("title" to stringProp("Optional title for the new chat.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "list_chats",
+                description = "List persistent chat threads with ids, titles, and the active chat marker.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "switch_chat",
+                description = "Switch the active persistent chat thread by id or exact title before answering.",
+                parameters = objectSchema(emptyList(), mapOf(
+                    "chat_id" to stringProp("Chat id returned by list_chats."),
+                    "title" to stringProp("Chat title to switch to if no id is known.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "rename_chat",
+                description = "Rename the active persistent chat or a specified chat.",
+                parameters = objectSchema(listOf("title"), mapOf(
+                    "title" to stringProp("New title."),
+                    "chat_id" to stringProp("Optional chat id; omit to rename active chat.")
+                ))
             ))
         )
     }
@@ -468,6 +603,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "share_text" -> shareText(arg("text"))
             "get_battery_status" -> getBatteryStatus()
             "open_accessibility_settings" -> launchIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), "Bedienungshilfen")
+            "new_chat" -> {
+                val session = createChatSession(arg("title"))
+                "Created and switched to new chat '${session.title}' (${session.id})."
+            }
+            "list_chats" -> listChats()
+            "switch_chat" -> switchChat(arg("chat_id"), arg("title"))
+            "rename_chat" -> renameChat(arg("chat_id"), arg("title"))
             else -> "Unknown tool: ${toolCall.function.name}"
         }
     }
@@ -705,17 +847,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     )
                 }
 
-                // Build the messages list with system prompt
+                val requestChatId = activeChatId()
+
+                // Build the messages list with system prompt, persisted chat history, and current user turn.
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze die verfügbaren Tools proaktiv, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn für Aktionen wie Anruf, SMS, Navigation, Kalender oder E-Mail wichtige Angaben fehlen."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze die verfügbaren Tools proaktiv, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn für Aktionen wie Anruf, SMS, Navigation, Kalender oder E-Mail wichtige Angaben fehlen. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
                         content = listOf(Content(type = "text", text = systemPrompt))
                     )
                 )
+
+                // Add persisted chat history before the current turn. Image content is not persisted.
+                messagesList.addAll(activeChatHistoryMessages())
 
                 // Add user message
                 messagesList.add(
@@ -840,6 +987,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     val finalResponse = fullResponse.toString()
                     if (finalResponse.isNotEmpty()) {
                         Log.d(appTag, "Full streaming response: $finalResponse")
+                        appendChatMessages(
+                            activeChatId().takeIf { it != requestChatId } ?: requestChatId,
+                            listOf(
+                                PersistedChatMessage("user", instruction),
+                                PersistedChatMessage("assistant", finalResponse)
+                            )
+                        )
                         listener?.onOpenAIResponse(finalResponse)
                     } else {
                         Log.w(appTag, "Streaming completed but no content was received")
