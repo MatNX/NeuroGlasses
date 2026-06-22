@@ -1,6 +1,14 @@
 package com.patrick.neuroglasses.helpers
 
+import android.Manifest
 import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import android.provider.AlarmClock
+import android.provider.ContactsContract
+import android.telephony.SmsManager
+import android.location.LocationManager
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
@@ -15,6 +23,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.net.URLEncoder
 
 /**
  * Data classes for OpenAI API request/response
@@ -24,12 +33,41 @@ data class OpenAIRequest(
     val messages: List<Message>,
     @SerializedName("max_tokens")
     val maxTokens: Int,
-    val stream: Boolean = false
+    val stream: Boolean = false,
+    val tools: List<AssistantTool>? = null,
+    @SerializedName("tool_choice")
+    val toolChoice: String? = null
 )
 
 data class Message(
     val role: String,
-    val content: List<Content>
+    val content: Any? = null,
+    @SerializedName("tool_calls")
+    val toolCalls: List<ToolCall>? = null,
+    @SerializedName("tool_call_id")
+    val toolCallId: String? = null
+)
+
+data class AssistantTool(
+    val type: String = "function",
+    val function: ToolFunction
+)
+
+data class ToolFunction(
+    val name: String,
+    val description: String,
+    val parameters: Map<String, Any>
+)
+
+data class ToolCall(
+    val id: String,
+    val type: String,
+    val function: ToolCallFunction
+)
+
+data class ToolCallFunction(
+    val name: String,
+    val arguments: String
 )
 
 data class Content(
@@ -46,6 +84,16 @@ data class ImageUrl(
 /**
  * Data classes for streaming responses
  */
+data class ChatCompletionResponse(
+    val choices: List<ChatCompletionChoice>
+)
+
+data class ChatCompletionChoice(
+    val message: Message,
+    @SerializedName("finish_reason")
+    val finishReason: String?
+)
+
 data class StreamingResponse(
     val id: String,
     val choices: List<StreamingChoice>
@@ -146,6 +194,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
          * @param isComplete Whether this is the final chunk
          */
         fun onOpenAIStreamingChunk(chunk: String, isComplete: Boolean) {}
+
+        /**
+         * Gives the activity first chance to handle glasses-specific tool calls such as snapshots.
+         * Return null to let OpenAIHelper handle the tool locally.
+         */
+        fun onAssistantToolCall(toolName: String, arguments: Map<String, String>): String? = null
 
         /**
          * Called when OpenAI API call fails
@@ -260,6 +314,262 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }.start()
     }
 
+
+    private fun assistantTools(): List<AssistantTool> {
+        fun objectSchema(required: List<String>, properties: Map<String, Map<String, Any>>): Map<String, Any> = mapOf(
+            "type" to "object",
+            "required" to required,
+            "properties" to properties,
+            "additionalProperties" to false
+        )
+
+        fun stringProp(description: String): Map<String, Any> = mapOf("type" to "string", "description" to description)
+
+        return listOf(
+            AssistantTool(function = ToolFunction(
+                name = "place_phone_call",
+                description = "Hands-free: immediately place a phone call to a number or contact name when CALL_PHONE permission is granted; otherwise report that permission is needed.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Phone number or contact name.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "send_sms",
+                description = "Hands-free: send an SMS to a number or contact name when SEND_SMS permission is granted.",
+                parameters = objectSchema(listOf("recipient", "message"), mapOf(
+                    "recipient" to stringProp("Phone number or contact name."),
+                    "message" to stringProp("Message body to send.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "start_navigation",
+                description = "Start turn-by-turn navigation to a destination, preferring a maps app that can begin navigation directly.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Address, landmark, or business name.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "play_youtube_music",
+                description = "Start YouTube/YouTube Music playback or search for a requested song, artist, playlist, or genre.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Music query to play.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "open_rokid_translator",
+                description = "Open the native Rokid real-time translator app/scene if it is installed on the companion phone.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "get_gps_location",
+                description = "Read the phone's last known GPS/network location and return coordinates for the assistant to use hands-free.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "get_weather",
+                description = "Fetch a concise weather report for the current GPS location or a named place without opening a browser.",
+                parameters = objectSchema(emptyList(), mapOf("location" to stringProp("Optional city/place; omit for current GPS location.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "web_search",
+                description = "Fetch a short web-search/instant-answer summary without opening a browser.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "set_timer",
+                description = "Create a hands-free Android timer.",
+                parameters = objectSchema(listOf("seconds"), mapOf(
+                    "seconds" to mapOf("type" to "integer", "description" to "Timer duration in seconds."),
+                    "label" to stringProp("Optional timer label.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "create_reminder",
+                description = "Store an in-app reminder that can be listed later by the assistant.",
+                parameters = objectSchema(listOf("text"), mapOf(
+                    "text" to stringProp("Reminder text."),
+                    "when" to stringProp("Optional natural language due time." )
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "list_reminders",
+                description = "Read reminders previously stored by the assistant.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "snap_glasses_photo",
+                description = "Take a picture with the Rokid glasses camera for hands-free visual context. The activity handles this tool.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            ))
+        )
+    }
+
+    private fun executeAssistantTool(toolCall: ToolCall): String {
+        val args = parseToolArguments(toolCall.function.arguments)
+        listener?.onAssistantToolCall(toolCall.function.name, args)?.let { return it }
+
+        fun arg(name: String): String = args[name].orEmpty()
+        fun resolvePhone(recipient: String): String = if (recipient.any { it.isDigit() }) recipient else lookupContactPhone(recipient) ?: recipient
+
+        return when (toolCall.function.name) {
+            "place_phone_call" -> placePhoneCall(resolvePhone(arg("recipient")))
+            "send_sms" -> sendSms(resolvePhone(arg("recipient")), arg("message"))
+            "start_navigation" -> launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${Uri.encode(arg("destination"))}")), "turn-by-turn navigation")
+            "play_youtube_music" -> playYoutubeMusic(arg("query"))
+            "open_rokid_translator" -> openRokidTranslator()
+            "get_gps_location" -> getGpsLocation()
+            "get_weather" -> getWeather(arg("location"))
+            "web_search" -> webSearch(arg("query"))
+            "set_timer" -> setTimer(arg("seconds").toIntOrNull() ?: 0, arg("label"))
+            "create_reminder" -> createReminder(arg("text"), arg("when"))
+            "list_reminders" -> listReminders()
+            else -> "Unknown tool: ${toolCall.function.name}"
+        }
+    }
+
+    private fun parseToolArguments(arguments: String): Map<String, String> {
+        val parsed = runCatching { gson.fromJson(arguments, Map::class.java) as Map<*, *> }.getOrDefault(emptyMap<Any, Any>())
+        return parsed.mapNotNull { (key, value) -> key?.toString()?.let { it to value?.toString().orEmpty() } }.toMap()
+    }
+
+    private fun launchIntent(intent: Intent, label: String): String = try {
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        context.startActivity(intent)
+        "Started $label hands-free."
+    } catch (e: Exception) {
+        Log.e(appTag, "Could not start $label", e)
+        "Could not start $label: ${e.message}"
+    }
+
+    private fun hasPermission(permission: String): Boolean = context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
+
+    private fun lookupContactPhone(name: String): String? = try {
+        if (!hasPermission(Manifest.permission.READ_CONTACTS)) return null
+        val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER)
+        val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} LIKE ?"
+        val selectionArgs = arrayOf("%$name%")
+        context.contentResolver.query(
+            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+            projection,
+            selection,
+            selectionArgs,
+            null
+        )?.use { cursor ->
+            if (cursor.moveToFirst()) cursor.getString(0) else null
+        }
+    } catch (e: Exception) {
+        Log.w(appTag, "Contact lookup failed", e)
+        null
+    }
+
+    private fun placePhoneCall(phone: String): String {
+        if (phone.isBlank()) return "I need a contact name or phone number to place a call."
+        if (!hasPermission(Manifest.permission.CALL_PHONE)) return "CALL_PHONE permission is required before I can place calls hands-free."
+        return launchIntent(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phone)}")), "phone call")
+    }
+
+    private fun sendSms(phone: String, message: String): String {
+        if (phone.isBlank() || message.isBlank()) return "I need both a recipient and message before sending SMS."
+        if (!hasPermission(Manifest.permission.SEND_SMS)) return "SEND_SMS permission is required before I can send texts hands-free."
+        return try {
+            context.getSystemService(SmsManager::class.java).sendTextMessage(phone, null, message, null, null)
+            "SMS sent to $phone."
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not send SMS", e)
+            "Could not send SMS: ${e.message}"
+        }
+    }
+
+    private fun playYoutubeMusic(query: String): String {
+        if (query.isBlank()) return "I need a song, artist, playlist, or genre to play."
+        val encoded = Uri.encode(query)
+        val intents = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://results?search_query=$encoded")).setPackage("com.google.android.youtube"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com/search?q=$encoded")),
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded"))
+        )
+        intents.forEach { intent ->
+            val result = launchIntent(intent, "YouTube music search for $query")
+            if (!result.startsWith("Could not")) return result
+        }
+        return "Could not start YouTube or YouTube Music."
+    }
+
+    private fun openRokidTranslator(): String {
+        val packageNames = listOf("com.rokid.translate", "com.rokid.translator", "com.rokid.glass.translator", "com.rokid.ai.translate")
+        packageNames.forEach { packageName ->
+            context.packageManager.getLaunchIntentForPackage(packageName)?.let { return launchIntent(it, "Rokid real-time translator") }
+        }
+        return "I could not find the Rokid translator app on this phone."
+    }
+
+    private fun getGpsLocation(): String {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
+            return "Location permission is required before I can read GPS hands-free."
+        }
+        return try {
+            val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            val location = providers.asSequence().mapNotNull { provider ->
+                runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
+            }.maxByOrNull { it.time }
+            if (location == null) "No last known location is available yet." else "Current location: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracy}m."
+        } catch (e: Exception) {
+            "Could not read location: ${e.message}"
+        }
+    }
+
+    private fun getWeather(location: String): String {
+        val query = if (location.isNotBlank()) location else getGpsLocation().takeIf { it.startsWith("Current location:") }?.let {
+            val lat = Regex("latitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
+            val lon = Regex("longitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
+            if (lat != null && lon != null) "$lat,$lon" else null
+        }.orEmpty()
+        if (query.isBlank()) return "I need a location or GPS permission to fetch weather."
+        return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "weather")
+    }
+
+    private fun webSearch(query: String): String {
+        if (query.isBlank()) return "I need a query to search the web."
+        val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
+        val raw = fetchText(url, "web search")
+        val parsed = runCatching { gson.fromJson(raw, Map::class.java) as Map<*, *> }.getOrNull() ?: return raw.take(800)
+        val abstract = parsed["AbstractText"]?.toString().orEmpty()
+        val heading = parsed["Heading"]?.toString().orEmpty()
+        val related = (parsed["RelatedTopics"] as? List<*>)?.firstOrNull()?.let { it as? Map<*, *> }?.get("Text")?.toString().orEmpty()
+        return listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n").ifBlank { "No instant answer found for $query." }
+    }
+
+    private fun fetchText(url: String, label: String): String = try {
+        val request = Request.Builder().url(url).get().build()
+        getClient().newCall(request).execute().use { response ->
+            if (!response.isSuccessful) "Could not fetch $label: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
+        }
+    } catch (e: Exception) {
+        "Could not fetch $label: ${e.message}"
+    }
+
+    private fun setTimer(seconds: Int, label: String): String {
+        if (seconds <= 0) return "Timer duration must be greater than zero seconds."
+        val intent = Intent(AlarmClock.ACTION_SET_TIMER)
+            .putExtra(AlarmClock.EXTRA_LENGTH, seconds)
+            .putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "NeuroGlasses timer" })
+            .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
+        return launchIntent(intent, "${seconds}-second timer")
+    }
+
+    private fun createReminder(text: String, dueTime: String): String {
+        if (text.isBlank()) return "Reminder text cannot be empty."
+        val prefs = context.getSharedPreferences("assistant_reminders", Context.MODE_PRIVATE)
+        val existing = prefs.getStringSet("items", emptySet()).orEmpty().toMutableSet()
+        existing.add("${System.currentTimeMillis()}|$text|$dueTime")
+        prefs.edit().putStringSet("items", existing).apply()
+        return "Reminder saved: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
+    }
+
+    private fun listReminders(): String {
+        val prefs = context.getSharedPreferences("assistant_reminders", Context.MODE_PRIVATE)
+        val reminders = prefs.getStringSet("items", emptySet()).orEmpty().sorted().map { item ->
+            val parts = item.split("|", limit = 3)
+            "- ${parts.getOrNull(1).orEmpty()}${parts.getOrNull(2)?.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()}"
+        }
+        return if (reminders.isEmpty()) "No reminders saved." else reminders.joinToString("\n")
+    }
+
     /**
      * Call OpenAI API for chat completion with streaming
      * @param instruction The user instruction/prompt
@@ -310,10 +620,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     )
                 )
 
-                // Create the request with streaming enabled
+                val toolMessages = resolveToolCallsIfNeeded(messagesList)
+
+                // Create the request with streaming enabled. Tools are resolved in a prior
+                // non-streaming pass so the final response can stream cleanly to the glasses.
                 val request = OpenAIRequest(
                     model = getVlmModel(),
-                    messages = messagesList,
+                    messages = toolMessages,
                     maxTokens = getVlmMaxTokens(),
                     stream = true
                 )
@@ -435,6 +748,59 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 listener?.onOpenAIFailed("Error: ${e.message}")
             }
         }.start()
+    }
+
+
+    private fun resolveToolCallsIfNeeded(messagesList: MutableList<Message>): List<Message> {
+        val request = OpenAIRequest(
+            model = getVlmModel(),
+            messages = messagesList,
+            maxTokens = getVlmMaxTokens(),
+            stream = false,
+            tools = assistantTools(),
+            toolChoice = "auto"
+        )
+        val jsonBody = gson.toJson(request)
+        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+        val httpRequest = Request.Builder()
+            .url(getChatApiUrl())
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Authorization", "Bearer ${getApiToken()}")
+            .post(requestBody)
+            .build()
+
+        return try {
+            getClient().newCall(httpRequest).execute().use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
+                    return messagesList
+                }
+                val responseBody = response.body?.string() ?: return messagesList
+                val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
+                val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return messagesList
+                val toolCalls = assistantMessage.toolCalls.orEmpty()
+                if (toolCalls.isEmpty()) {
+                    messagesList.add(assistantMessage)
+                    return messagesList
+                }
+
+                messagesList.add(assistantMessage)
+                toolCalls.forEach { toolCall ->
+                    val result = executeAssistantTool(toolCall)
+                    messagesList.add(
+                        Message(
+                            role = "tool",
+                            content = result,
+                            toolCallId = toolCall.id
+                        )
+                    )
+                }
+                messagesList
+            }
+        } catch (e: Exception) {
+            Log.e(appTag, "Tool planning failed; continuing without tools", e)
+            messagesList
+        }
     }
 
     /**
