@@ -3,16 +3,11 @@ package com.patrick.neuroglasses.helpers
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.util.Log
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.callbacks.PhotoResultCallback
-import com.rokid.cxr.client.utils.ValueUtil
+import com.example.cxrglobal.callbacks.IImageStreamCbk
 
 /**
- * Helper class for AI scene camera operations using PhotoResultCallback.
+ * Helper class for AI scene camera operations through the authorized Hi Rokid channel.
  * This handles camera operations that return WebP image data as byte arrays.
- *
- * Note: This is different from CameraHelper which uses PhotoPathCallback
- * and returns file paths on the glasses.
  */
 class AICameraHelper(private val appTag: String = "AICameraHelper") {
 
@@ -33,78 +28,64 @@ class AICameraHelper(private val appTag: String = "AICameraHelper") {
 
     fun setListener(listener: AICameraListener) {
         this.listener = listener
+        RokidHostConnection.setImageStreamListener(imageStreamCallback)
     }
 
     /**
-     * Photo result callback with comprehensive logging
+     * Image callback with comprehensive logging
      */
-    private val photoResultCallback = PhotoResultCallback { status, photo ->
-        /**
-         * Called when photo capture is complete
-         * @param status photo take status
-         * @param photo WebP photo data byte array
-         */
-        Log.d(appTag, "=== Photo Result Callback Triggered ===")
-        Log.d(appTag, "Photo status: $status")
-        Log.d(appTag, "Photo data null: ${photo == null}")
-        Log.d(appTag, "Photo data size: ${photo?.size ?: 0} bytes")
-
-        when (status) {
-            ValueUtil.CxrStatus.RESPONSE_SUCCEED -> {
-                Log.i(appTag, "Photo captured successfully!")
-                if (photo != null && photo.isNotEmpty()) {
-                    Log.i(appTag, "Photo data received: ${photo.size} bytes (WebP format)")
-
-                    // Log first few bytes for debugging (header check)
-                    if (photo.size >= 12) {
-                        val headerBytes = photo.take(12).joinToString(" ") {
-                            "%02X".format(it)
-                        }
-                        Log.d(appTag, "Photo header bytes: $headerBytes")
-                    }
-
-                    // Decode WebP image to Bitmap
-                    try {
-                        Log.d(appTag, "Attempting to decode WebP image data...")
-                        val bitmap = BitmapFactory.decodeByteArray(photo, 0, photo.size)
-
-                        if (bitmap != null) {
-                            Log.i(appTag, "WebP decoded successfully! Bitmap size: ${bitmap.width}x${bitmap.height}")
-                            Log.d(appTag, "Bitmap config: ${bitmap.config}")
-                            Log.d(appTag, "Bitmap byte count: ${bitmap.byteCount}")
-
-                            listener?.onPhotoSuccess(bitmap, photo.size, bitmap.width, bitmap.height)
-                        } else {
-                            Log.e(appTag, "Failed to decode WebP - BitmapFactory returned null")
-                            listener?.onPhotoFailed("Photo received but decode failed")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(appTag, "Exception while decoding WebP image", e)
-                        Log.e(appTag, "Exception type: ${e.javaClass.simpleName}")
-                        Log.e(appTag, "Exception message: ${e.message}")
-                        listener?.onPhotoFailed("Photo decode error: ${e.message}")
-                    }
-                } else {
-                    Log.w(appTag, "Photo captured but data is null or empty!")
-                    listener?.onPhotoFailed("Photo captured but no data received")
-                }
-            }
-
-            ValueUtil.CxrStatus.RESPONSE_INVALID -> {
-                Log.e(appTag, "Photo capture failed: Invalid response")
-                listener?.onPhotoFailed("Photo failed: Invalid response")
-            }
-
-            ValueUtil.CxrStatus.RESPONSE_TIMEOUT -> {
-                Log.e(appTag, "Photo capture failed: Timeout")
-                listener?.onPhotoFailed("Photo failed: Timeout")
-            }
-
-            else -> {
-                Log.e(appTag, "Photo capture failed with unknown status: $status")
-                listener?.onPhotoFailed("Photo failed: Unknown status")
-            }
+    private val imageStreamCallback = object : IImageStreamCbk {
+        override fun onImageReceived(data: ByteArray) {
+            handlePhotoData(data)
         }
+
+        override fun onImageError(code: Int, msg: String?) {
+            Log.e(appTag, "Photo capture failed: $code $msg")
+            listener?.onPhotoFailed(msg ?: "Photo failed: $code")
+        }
+    }
+
+    private fun handlePhotoData(photo: ByteArray) {
+        Log.d(appTag, "=== Photo Result Callback Triggered ===")
+        Log.d(appTag, "Photo data size: ${photo.size} bytes")
+
+        if (photo.isEmpty()) {
+            Log.w(appTag, "Photo captured but data is empty!")
+            listener?.onPhotoFailed("Photo captured but no data received")
+            return
+        }
+
+        Log.i(appTag, "Photo data received: ${photo.size} bytes (WebP format)")
+
+        // Log first few bytes for debugging (header check)
+        if (photo.size >= 12) {
+            val headerBytes = photo.take(12).joinToString(" ") {
+                "%02X".format(it)
+            }
+            Log.d(appTag, "Photo header bytes: $headerBytes")
+        }
+
+        try {
+            Log.d(appTag, "Attempting to decode WebP image data...")
+            val bitmap = BitmapFactory.decodeByteArray(photo, 0, photo.size)
+
+            if (bitmap != null) {
+                Log.i(appTag, "WebP decoded successfully! Bitmap size: ${bitmap.width}x${bitmap.height}")
+                Log.d(appTag, "Bitmap config: ${bitmap.config}")
+                Log.d(appTag, "Bitmap byte count: ${bitmap.byteCount}")
+
+                listener?.onPhotoSuccess(bitmap, photo.size, bitmap.width, bitmap.height)
+            } else {
+                Log.e(appTag, "Failed to decode WebP - BitmapFactory returned null")
+                listener?.onPhotoFailed("Photo received but decode failed")
+            }
+        } catch (e: Exception) {
+            Log.e(appTag, "Exception while decoding WebP image", e)
+            Log.e(appTag, "Exception type: ${e.javaClass.simpleName}")
+            Log.e(appTag, "Exception message: ${e.message}")
+            listener?.onPhotoFailed("Photo decode error: ${e.message}")
+        }
+
         Log.d(appTag, "=== Photo Result Callback Complete ===")
     }
 
@@ -119,28 +100,15 @@ class AICameraHelper(private val appTag: String = "AICameraHelper") {
         Log.d(appTag, "=== Opening Glass Camera ===")
         Log.d(appTag, "Camera parameters - Width: $width, Height: $height, Quality: $quality")
 
-        val status = CxrApi.getInstance().openGlassCamera(width, height, quality)
-
-        Log.d(appTag, "Open camera status: $status")
-
-        when (status) {
-            ValueUtil.CxrStatus.REQUEST_SUCCEED -> {
-                Log.i(appTag, "Camera opened successfully")
-                isCameraOpen = true
-                listener?.onCameraOpened("Camera opened (${width}x${height}, Q:$quality)")
-            }
-            ValueUtil.CxrStatus.REQUEST_WAITING -> {
-                Log.w(appTag, "Camera open request is waiting - previous request still processing")
-                listener?.onPhotoStatusUpdate("Camera opening in progress...")
-            }
-            ValueUtil.CxrStatus.REQUEST_FAILED -> {
-                Log.e(appTag, "Failed to open camera")
-                listener?.onCameraOpenFailed("Camera open failed")
-            }
-            else -> {
-                Log.w(appTag, "Unknown camera open status: $status")
-                listener?.onPhotoStatusUpdate("Unknown camera status")
-            }
+        if (RokidHostConnection.isConnected()) {
+            Log.i(appTag, "Camera ready through Hi Rokid channel")
+            isCameraOpen = true
+            RokidHostConnection.setImageStreamListener(imageStreamCallback)
+            listener?.onCameraOpened("Camera ready (${width}x${height}, Q:$quality)")
+        } else {
+            Log.e(appTag, "Hi Rokid channel is not connected")
+            isCameraOpen = false
+            listener?.onCameraOpenFailed("Hi Rokid channel is not connected")
         }
 
         Log.d(appTag, "=== Open Camera Complete ===")
@@ -164,32 +132,28 @@ class AICameraHelper(private val appTag: String = "AICameraHelper") {
         }
 
         // Take the photo
-        Log.d(appTag, "Calling takeGlassPhoto API...")
-        val status = CxrApi.getInstance().takeGlassPhoto(width, height, quality, photoResultCallback)
+        if (!isCameraOpen) {
+            Log.e(appTag, "Photo capture aborted because camera/channel is not ready")
+            listener?.onPhotoFailed("Hi Rokid channel is not connected")
+            return
+        }
 
-        Log.d(appTag, "Take photo request status: $status")
+        Log.d(appTag, "Calling takePhoto through Hi Rokid channel...")
+        RokidHostConnection.setImageStreamListener(imageStreamCallback)
+        val requested = RokidHostConnection.takePhoto(width, height, quality)
 
-        when (status) {
-            ValueUtil.CxrStatus.REQUEST_SUCCEED -> {
-                Log.i(appTag, "Photo capture request sent successfully - waiting for callback")
-                listener?.onPhotoStatusUpdate("Capturing photo... (${width}x${height}, Q:$quality)")
-            }
-            ValueUtil.CxrStatus.REQUEST_WAITING -> {
-                Log.w(appTag, "Photo capture request waiting - previous request still processing")
-                listener?.onPhotoStatusUpdate("Photo request pending...")
-            }
-            ValueUtil.CxrStatus.REQUEST_FAILED -> {
-                Log.e(appTag, "Photo capture request failed!")
-                listener?.onPhotoFailed("Photo capture failed")
-            }
-            else -> {
-                Log.e(appTag, "Unknown photo capture status: $status")
-                listener?.onPhotoStatusUpdate("Unknown photo status: $status")
-            }
+        Log.d(appTag, "Take photo request success: $requested")
+
+        if (requested) {
+            Log.i(appTag, "Photo capture request sent successfully - waiting for callback")
+            listener?.onPhotoStatusUpdate("Capturing photo... (${width}x${height}, Q:$quality)")
+        } else {
+            Log.e(appTag, "Photo capture request failed!")
+            listener?.onPhotoFailed("Photo capture failed")
         }
 
         Log.d(appTag, "=== Take Photo Request Complete ===")
-        Log.d(appTag, "Note: Photo result will be delivered via PhotoResultCallback")
+        Log.d(appTag, "Note: Photo result will be delivered via Hi Rokid image callback")
     }
 
     /**
@@ -200,5 +164,6 @@ class AICameraHelper(private val appTag: String = "AICameraHelper") {
             Log.d(appTag, "Releasing camera resources")
             isCameraOpen = false
         }
+        RokidHostConnection.setImageStreamListener(null)
     }
 }

@@ -1,15 +1,18 @@
 package com.patrick.neuroglasses.helpers
 
 import android.content.Context
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.listeners.AudioStreamListener
-import com.rokid.cxr.client.utils.ValueUtil
+import com.example.cxrglobal.callbacks.IAudioStreamCbk
 import java.io.File
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
+import kotlin.math.sqrt
 
 /**
  * Helper class for audio recording operations from Rokid glasses.
@@ -17,14 +20,44 @@ import java.util.Locale
  */
 class AudioHelper(private val context: Context, private val appTag: String = "AudioHelper") {
 
+    enum class StopReason {
+        MANUAL,
+        SILENCE_AFTER_SPEECH,
+        NO_SPEECH_TIMEOUT,
+        REMOTE,
+        ERROR
+    }
+
     // Audio recording state
     var isRecording = false
+        private set
+
+    var lastStopReason: StopReason = StopReason.MANUAL
         private set
 
     // Audio recording variables
     private val audioChunks = mutableListOf<ByteArray>()
     private var currentCodecType: Int = 1 // Default to PCM
+    private var currentStreamType: String = "AI_assistant"
     private var totalAudioBytes: Long = 0
+    private val autoStopHandler = Handler(Looper.getMainLooper())
+    private var autoStopOnSilence = false
+    private var autoStopping = false
+    private var isClosingAudioRecord = false
+    private var recordingStartMs = 0L
+    private var lastSpeechMs = 0L
+    private var hasDetectedSpeech = false
+    private var speechFrameCount = 0
+
+    private companion object {
+        private const val AUTO_STOP_CHECK_INTERVAL_MS = 250L
+        private const val MIN_RECORDING_MS = 900L
+        private const val SILENCE_AFTER_SPEECH_MS = 1500L
+        private const val NO_SPEECH_TIMEOUT_MS = 15000L
+        private const val MIN_SPEECH_FRAMES = 3
+        private const val SPEECH_RMS_THRESHOLD = 650.0
+        private const val SPEECH_PEAK_THRESHOLD = 2000
+    }
 
     // Track the most recently saved audio file path
     var lastSavedAudioPath: String? = null
@@ -49,52 +82,45 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
     /**
      * Audio stream listener to receive audio data from glasses
      */
-    private val audioStreamListener = object : AudioStreamListener {
-        /**
-         * Called when audio stream started.
-         * @param codecType The stream codec type: 1:pcm, 2:opus.
-         * @param streamType The stream type such as "AI_assistant"
-         */
-        override fun onStartAudioStream(codecType: Int, streamType: String?) {
-            Log.d(appTag, "=== Audio Stream Started ===")
-            Log.d(appTag, "Codec type: ${if (codecType == 1) "PCM" else if (codecType == 2) "OPUS" else "Unknown ($codecType)"}")
-            Log.d(appTag, "Stream type: $streamType")
-
-            // Store codec type for file extension
-            currentCodecType = codecType
-
-            // Clear previous audio chunks and reset counter
-            audioChunks.clear()
-            totalAudioBytes = 0
-            Log.i(appTag, "Audio buffer cleared, ready to record")
-
-            listener?.onAudioStreamStarted(codecType, streamType)
+    private val audioStreamListener = object : IAudioStreamCbk {
+        override fun onAudioStreamStateChanged(started: Boolean) {
+            Log.d(appTag, "Audio stream state changed: started=$started")
+            if (started) {
+                markRecordingStarted("Audio recording started")
+            } else if (isRecording) {
+                if (!isClosingAudioRecord) {
+                    Log.i(appTag, "Audio stream stopped remotely")
+                    lastStopReason = StopReason.REMOTE
+                    finishStoppedRecording()
+                }
+            }
         }
 
-        /**
-         * Called when audio stream data is received.
-         * @param data The audio stream data.
-         * @param offset The offset of audio stream data.
-         * @param length The length of audio stream data.
-         */
-        override fun onAudioStream(data: ByteArray?, offset: Int, length: Int) {
-            Log.d(appTag, "Audio data received - Offset: $offset, Length: $length, Data null: ${data == null}")
+        override fun onAudioReceived(data: ByteArray, offset: Int, length: Int) {
+            Log.d(appTag, "Audio data received - Offset: $offset, Length: $length")
 
-            if (data != null && length > 0) {
-                Log.i(appTag, "Audio chunk: $length bytes")
+            if (length <= 0) return
 
-                // Extract the actual audio data from the chunk
-                val audioChunk = ByteArray(length)
-                System.arraycopy(data, offset, audioChunk, 0, length)
+            Log.i(appTag, "Audio chunk: $length bytes")
 
-                // Add to our list of chunks
-                audioChunks.add(audioChunk)
-                totalAudioBytes += length
+            // Extract the actual audio data from the chunk
+            val audioChunk = ByteArray(length)
+            System.arraycopy(data, offset, audioChunk, 0, length)
 
-                Log.d(appTag, "Chunk stored. Total chunks: ${audioChunks.size}, Total bytes: $totalAudioBytes")
+            // Add to our list of chunks
+            audioChunks.add(audioChunk)
+            totalAudioBytes += length
+            updateVoiceActivity(audioChunk)
 
-                listener?.onAudioDataReceived(length, audioChunks.size, totalAudioBytes)
-            }
+            Log.d(appTag, "Chunk stored. Total chunks: ${audioChunks.size}, Total bytes: $totalAudioBytes")
+
+            listener?.onAudioDataReceived(length, audioChunks.size, totalAudioBytes)
+        }
+
+        override fun onAudioError(code: Int, msg: String?) {
+            Log.e(appTag, "Audio stream error: $code $msg")
+            lastStopReason = StopReason.ERROR
+            listener?.onAudioRecordingFailed(msg ?: "Audio stream error $code")
         }
     }
 
@@ -103,7 +129,7 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
      * @param set true: set the listener, false: remove the listener
      */
     fun setAudioStreamListener(set: Boolean) {
-        CxrApi.getInstance().setAudioStreamListener(if (set) audioStreamListener else null)
+        RokidHostConnection.setAudioStreamListener(if (set) audioStreamListener else null)
         Log.d(appTag, "Audio stream listener ${if (set) "set" else "removed"}")
     }
 
@@ -111,38 +137,131 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
      * Open audio recording from glasses
      * @param codecType The stream codec type: 1:pcm, 2:opus
      * @param streamType The stream type identifier (e.g., "AI_assistant")
+     * @param autoStopOnSilence Automatically stop PCM recording after the user stops speaking.
      * @return The status of the open audio record request
      */
-    fun openAudioRecord(codecType: Int = 1, streamType: String = "AI_assistant"): ValueUtil.CxrStatus? {
+    fun openAudioRecord(
+        codecType: Int = 1,
+        streamType: String = "AI_assistant",
+        autoStopOnSilence: Boolean = true
+    ): Boolean {
         Log.d(appTag, "=== Opening Audio Record ===")
         Log.d(appTag, "Codec type: ${if (codecType == 1) "PCM (1)" else if (codecType == 2) "OPUS (2)" else "Unknown ($codecType)"}")
         Log.d(appTag, "Stream type: $streamType")
 
-        val status = CxrApi.getInstance().openAudioRecord(codecType, streamType)
-        Log.d(appTag, "Open audio record status: $status")
+        currentCodecType = codecType
+        currentStreamType = streamType
+        audioChunks.clear()
+        totalAudioBytes = 0
+        this.autoStopOnSilence = autoStopOnSilence && codecType == 1
+        autoStopping = false
+        isClosingAudioRecord = false
+        hasDetectedSpeech = false
+        speechFrameCount = 0
+        lastStopReason = StopReason.MANUAL
+        recordingStartMs = SystemClock.elapsedRealtime()
+        lastSpeechMs = recordingStartMs
 
-        when (status) {
-            ValueUtil.CxrStatus.REQUEST_SUCCEED -> {
-                Log.i(appTag, "Audio recording started successfully")
-                isRecording = true
-                listener?.onAudioRecordingStarted("Audio recording started")
-            }
-            ValueUtil.CxrStatus.REQUEST_WAITING -> {
-                Log.w(appTag, "Audio recording request waiting - previous request still processing")
-                listener?.onAudioStatusUpdate("Audio request pending...")
-            }
-            ValueUtil.CxrStatus.REQUEST_FAILED -> {
-                Log.e(appTag, "Failed to start audio recording")
-                listener?.onAudioRecordingFailed("Audio recording failed")
-            }
-            else -> {
-                Log.w(appTag, "Unknown audio recording status: $status")
-                listener?.onAudioStatusUpdate("Unknown audio status")
-            }
+        val started = RokidHostConnection.startAudioStream(codecType)
+        Log.d(appTag, "Open audio record success: $started")
+
+        if (started) {
+            markRecordingStarted("Audio recording started")
+            scheduleAutoStopCheck()
+        } else {
+            Log.e(appTag, "Failed to start audio recording")
+            listener?.onAudioRecordingFailed("Audio recording failed")
         }
 
         Log.d(appTag, "=== Open Audio Record Complete ===")
-        return status
+        return started
+    }
+
+    private fun markRecordingStarted(message: String) {
+        if (isRecording) return
+        Log.i(appTag, "Audio recording started successfully")
+        Log.d(appTag, "Codec type: ${if (currentCodecType == 1) "PCM" else if (currentCodecType == 2) "OPUS" else "Unknown ($currentCodecType)"}")
+        Log.d(appTag, "Stream type: $currentStreamType")
+        isRecording = true
+        listener?.onAudioStreamStarted(currentCodecType, currentStreamType)
+        listener?.onAudioRecordingStarted(message)
+    }
+
+    private val autoStopRunnable = object : Runnable {
+        override fun run() {
+            if (!isRecording || !autoStopOnSilence || autoStopping) return
+
+            val now = SystemClock.elapsedRealtime()
+            val elapsed = now - recordingStartMs
+            val quietFor = now - lastSpeechMs
+            val shouldStop = if (hasDetectedSpeech) {
+                elapsed >= MIN_RECORDING_MS && quietFor >= SILENCE_AFTER_SPEECH_MS
+            } else {
+                elapsed >= NO_SPEECH_TIMEOUT_MS
+            }
+
+            if (shouldStop) {
+                autoStopping = true
+                val reason = if (hasDetectedSpeech) {
+                    lastStopReason = StopReason.SILENCE_AFTER_SPEECH
+                    "Silence detected after speech"
+                } else {
+                    lastStopReason = StopReason.NO_SPEECH_TIMEOUT
+                    "No speech detected"
+                }
+                Log.i(appTag, "$reason; stopping audio recording")
+                listener?.onAudioStatusUpdate(reason)
+                closeAudioRecord(currentStreamType)
+                return
+            }
+
+            autoStopHandler.postDelayed(this, AUTO_STOP_CHECK_INTERVAL_MS)
+        }
+    }
+
+    private fun scheduleAutoStopCheck() {
+        autoStopHandler.removeCallbacks(autoStopRunnable)
+        if (autoStopOnSilence) {
+            autoStopHandler.postDelayed(autoStopRunnable, AUTO_STOP_CHECK_INTERVAL_MS)
+        }
+    }
+
+    private fun cancelAutoStopCheck() {
+        autoStopHandler.removeCallbacks(autoStopRunnable)
+        autoStopping = false
+    }
+
+    private fun updateVoiceActivity(audioChunk: ByteArray) {
+        if (!autoStopOnSilence || currentCodecType != 1) return
+        if (isLikelySpeech(audioChunk)) {
+            speechFrameCount++
+            if (speechFrameCount >= MIN_SPEECH_FRAMES) {
+                hasDetectedSpeech = true
+                lastSpeechMs = SystemClock.elapsedRealtime()
+            }
+        }
+    }
+
+    private fun isLikelySpeech(audioChunk: ByteArray): Boolean {
+        if (audioChunk.size < 2) return false
+
+        var index = 0
+        var samples = 0
+        var peak = 0
+        var sumSquares = 0.0
+
+        while (index + 1 < audioChunk.size) {
+            val sample = ((audioChunk[index].toInt() and 0xFF) or (audioChunk[index + 1].toInt() shl 8)).toShort().toInt()
+            val magnitude = abs(sample)
+            if (magnitude > peak) peak = magnitude
+            sumSquares += sample.toDouble() * sample.toDouble()
+            samples++
+            index += 2
+        }
+
+        if (samples == 0) return false
+        val rms = sqrt(sumSquares / samples)
+        return rms >= SPEECH_RMS_THRESHOLD || peak >= SPEECH_PEAK_THRESHOLD
     }
 
     /**
@@ -279,49 +398,55 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
      * @param streamType The stream type identifier (must match the one used in openAudioRecord)
      * @return The status of the close audio record request
      */
-    fun closeAudioRecord(streamType: String = "AI_assistant"): ValueUtil.CxrStatus? {
+    fun closeAudioRecord(streamType: String = "AI_assistant"): Boolean {
         Log.d(appTag, "=== Closing Audio Record ===")
         Log.d(appTag, "Stream type: $streamType")
+        if (!autoStopping) {
+            lastStopReason = StopReason.MANUAL
+        }
+        cancelAutoStopCheck()
 
-        val status = CxrApi.getInstance().closeAudioRecord(streamType)
-        Log.d(appTag, "Close audio record status: $status")
+        isClosingAudioRecord = true
+        val stopped = RokidHostConnection.stopAudioStream()
+        isClosingAudioRecord = false
+        Log.d(appTag, "Close audio record success: $stopped")
 
-        when (status) {
-            ValueUtil.CxrStatus.REQUEST_SUCCEED -> {
-                Log.i(appTag, "Audio recording stopped successfully")
-                isRecording = false
-
-                // Save the recorded audio to file
-                val savedFilePath = saveAudioToFile()
-
-                if (savedFilePath != null) {
-                    Log.i(appTag, "Audio file notification: $savedFilePath")
-                } else {
-                    if (audioChunks.isEmpty()) {
-                        Log.w(appTag, "No audio data recorded")
-                    } else {
-                        Log.e(appTag, "Failed to save audio file")
-                    }
-                }
-
-                listener?.onAudioRecordingStopped(savedFilePath)
-            }
-            ValueUtil.CxrStatus.REQUEST_WAITING -> {
-                Log.w(appTag, "Audio stop request waiting - previous request still processing")
-                listener?.onAudioStatusUpdate("Audio stop request pending...")
-            }
-            ValueUtil.CxrStatus.REQUEST_FAILED -> {
-                Log.e(appTag, "Failed to stop audio recording")
-                listener?.onAudioRecordingFailed("Audio stop failed")
-            }
-            else -> {
-                Log.w(appTag, "Unknown audio stop status: $status")
-                listener?.onAudioStatusUpdate("Unknown audio stop status")
-            }
+        if (stopped) {
+            Log.i(appTag, "Audio recording stopped successfully")
+            finishStoppedRecording()
+        } else {
+            Log.e(appTag, "Failed to stop audio recording")
+            listener?.onAudioRecordingFailed("Audio stop failed")
         }
 
         Log.d(appTag, "=== Close Audio Record Complete ===")
-        return status
+        return stopped
+    }
+
+    private fun finishStoppedRecording() {
+        cancelAutoStopCheck()
+        isRecording = false
+
+        val savedFilePath = if (lastStopReason == StopReason.NO_SPEECH_TIMEOUT) {
+            Log.i(appTag, "No-speech timeout reached; discarding buffered audio")
+            clearAudioCache()
+            null
+        } else {
+            // Save the recorded audio to file
+            saveAudioToFile()
+        }
+
+        if (savedFilePath != null) {
+            Log.i(appTag, "Audio file notification: $savedFilePath")
+        } else {
+            if (audioChunks.isEmpty()) {
+                Log.w(appTag, "No audio data recorded")
+            } else {
+                Log.e(appTag, "Failed to save audio file")
+            }
+        }
+
+        listener?.onAudioRecordingStopped(savedFilePath)
     }
 
     /**
@@ -367,6 +492,7 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
             closeAudioRecord()
         }
         setAudioStreamListener(false)
+        cancelAutoStopCheck()
         audioChunks.clear()
         totalAudioBytes = 0
     }

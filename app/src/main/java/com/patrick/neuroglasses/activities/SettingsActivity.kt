@@ -40,12 +40,12 @@ class SettingsActivity : AppCompatActivity() {
         const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
         const val DEFAULT_API_TIMEOUT = 15
-        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools proaktiv für Anrufe, SMS, Navigation, Wetter, Websuche, Erinnerungen, Kalender, E-Mail, Apps, Teilen, Akku und Fotos, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn eine Pflichtangabe fehlt."
+        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools nur, wenn der Nutzer eindeutig eine Handlung verlangt, z. B. anrufen, SMS senden, navigieren, Wetter abrufen, suchen, erinnern, Kalender, E-Mail, App öffnen, teilen, Akku prüfen oder ein Foto aufnehmen. Bei Anrufen und SMS ist ein Kontaktname ein gültiger Empfänger: frage nicht nach der Telefonnummer, sondern nutze das Telefon/SMS-Tool mit dem Namen. Bei kurzen Tests wie 'test' bestätigst du nur knapp und öffnest keine Apps."
         const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
         const val DEFAULT_VLM_MAX_TOKENS = 1024
         const val DEFAULT_ASR_MODEL = "whisper-large-v3"
-        const val DEFAULT_TTS_MODEL = "playai-tts"
-        const val DEFAULT_TTS_VOICE = "Arista-PlayAI"
+        const val DEFAULT_TTS_MODEL = "android-system-tts"
+        const val DEFAULT_TTS_VOICE = "de-DE"
 
         // Helper functions to get configuration values
         fun getApiBaseUrl(context: Context): String {
@@ -85,12 +85,18 @@ class SettingsActivity : AppCompatActivity() {
 
         fun getTtsModel(context: Context): String {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            return prefs.getString(KEY_TTS_MODEL, DEFAULT_TTS_MODEL) ?: DEFAULT_TTS_MODEL
+            val stored = prefs.getString(KEY_TTS_MODEL, DEFAULT_TTS_MODEL) ?: DEFAULT_TTS_MODEL
+            return if (stored == "playai-tts" || stored == "canopylabs/orpheus-v1-english") {
+                DEFAULT_TTS_MODEL
+            } else {
+                stored
+            }
         }
 
         fun getTtsVoice(context: Context): String {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            return prefs.getString(KEY_TTS_VOICE, DEFAULT_TTS_VOICE) ?: DEFAULT_TTS_VOICE
+            val stored = prefs.getString(KEY_TTS_VOICE, DEFAULT_TTS_VOICE) ?: DEFAULT_TTS_VOICE
+            return if (stored == "Arista-PlayAI" || stored == "hannah") DEFAULT_TTS_VOICE else stored
         }
     }
 
@@ -134,8 +140,8 @@ class SettingsActivity : AppCompatActivity() {
         vlmModelEditText.setText(prefs.getString(KEY_VLM_MODEL, DEFAULT_VLM_MODEL))
         vlmMaxTokensEditText.setText(prefs.getInt(KEY_VLM_MAX_TOKENS, DEFAULT_VLM_MAX_TOKENS).toString())
         asrModelEditText.setText(prefs.getString(KEY_ASR_MODEL, DEFAULT_ASR_MODEL))
-        ttsModelEditText.setText(prefs.getString(KEY_TTS_MODEL, DEFAULT_TTS_MODEL))
-        ttsVoiceEditText.setText(prefs.getString(KEY_TTS_VOICE, DEFAULT_TTS_VOICE))
+        ttsModelEditText.setText(getTtsModel(this))
+        ttsVoiceEditText.setText(getTtsVoice(this))
     }
 
     private fun saveSettings() {

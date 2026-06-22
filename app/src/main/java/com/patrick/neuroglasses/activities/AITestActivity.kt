@@ -1,6 +1,9 @@
 package com.patrick.neuroglasses.activities
 
+import android.content.Intent
 import android.graphics.Bitmap
+import android.app.KeyguardManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import android.view.View
@@ -18,11 +21,14 @@ import com.patrick.neuroglasses.R
 import com.patrick.neuroglasses.helpers.AICameraHelper
 import com.patrick.neuroglasses.helpers.AudioHelper
 import com.patrick.neuroglasses.helpers.CustomSceneHelper
+import com.patrick.neuroglasses.helpers.Message
 import com.patrick.neuroglasses.helpers.OpenAIHelper
+import com.patrick.neuroglasses.helpers.RokidHostConnection
 import com.patrick.neuroglasses.helpers.StreamingAudioPlayer
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.listeners.AiEventListener
+import com.patrick.neuroglasses.helpers.SystemTtsPlayer
+import com.patrick.neuroglasses.services.RokidConnectionService
 import java.io.File
+import java.util.Locale
 
 /**
  * AI Chat Configuration Activity
@@ -58,6 +64,7 @@ class AITestActivity : AppCompatActivity() {
     private lateinit var openAIHelper: OpenAIHelper
     private lateinit var customSceneHelper: CustomSceneHelper
     private lateinit var streamingAudioPlayer: StreamingAudioPlayer
+    private lateinit var systemTtsPlayer: SystemTtsPlayer
 
     // Data
     private val predefinedInstructions = mutableListOf<String>()
@@ -68,14 +75,37 @@ class AITestActivity : AppCompatActivity() {
     private var capturedImage: Bitmap? = null
     private var recordedAudioFile: File? = null
     private var lastResultText: String? = null
+    private var currentRequestUsesAsr = false
+    private var isAwaitingPhotoForCurrentRequest = false
+    private var pendingInstructionForPhoto: String? = null
+    private var currentInstructionText: String = ""
+    private var hasOpenedStreamingView = false
+    private var isConversationActive = false
+    private var isClosingConversation = false
+    private var ignoreNextAudioStop = false
+    private var audioStartAttempts = 0
+    private val sessionConversationMessages = mutableListOf<Message>()
 
     // Streaming state
     private var streamingBuffer = StringBuilder()
     private var currentDisplayedCharCount = 0
     private var isStreaming = false
 
+    companion object {
+        const val EXTRA_START_CONVERSATION = "com.patrick.neuroglasses.START_CONVERSATION"
+        @Volatile var isVisible = false
+
+        private const val MAX_AUDIO_START_ATTEMPTS = 6
+        private const val AUDIO_START_RETRY_DELAY_MS = 350L
+        private const val MAX_SESSION_HISTORY_MESSAGES = 20
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
         setContentView(R.layout.activity_second)
 
         // Initialize UI components
@@ -91,6 +121,33 @@ class AITestActivity : AppCompatActivity() {
         setupListeners()
 
         updateStatus("Bereit. Drücke die KI-Taste an der Brille.")
+        handleStartConversationIntent(intent)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleStartConversationIntent(intent)
+    }
+
+    override fun onStart() {
+        super.onStart()
+        isVisible = true
+    }
+
+    override fun onStop() {
+        isVisible = false
+        super.onStop()
+    }
+
+    private fun handleStartConversationIntent(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_START_CONVERSATION, false) != true) return
+        processingStatusTextView.post {
+            if (!isFinishing && !isDestroyed) {
+                Log.d(appTag, "Starting conversation from glasses foreground service")
+                onAiKeyPressed()
+            }
+        }
     }
 
     private fun initializeViews() {
@@ -132,6 +189,7 @@ class AITestActivity : AppCompatActivity() {
                     capturedImageView.visibility = View.VISIBLE
                     updateProcessingStatus("Bild aufgenommen: ${width}x${height}")
                     Log.i(appTag, "Photo captured successfully: ${width}x${height}, $dataSize bytes")
+                    handlePhotoCaptureFinished(photoCaptured = true)
                 }
             }
 
@@ -140,6 +198,7 @@ class AITestActivity : AppCompatActivity() {
                     updateProcessingStatus("Bildaufnahme fehlgeschlagen: $message")
                     Toast.makeText(this@AITestActivity, "Bildaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Photo capture failed: $message")
+                    handlePhotoCaptureFinished(photoCaptured = false)
                 }
             }
         })
@@ -164,13 +223,27 @@ class AITestActivity : AppCompatActivity() {
             override fun onAudioRecordingFailed(message: String) {
                 runOnUiThread {
                     updateProcessingStatus("Audioaufnahme fehlgeschlagen: $message")
-                    Toast.makeText(this@AITestActivity, "Audioaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Audioaufnahme fehlgeschlagen: $message")
+                    if (!isConversationActive || isClosingConversation) {
+                        Toast.makeText(this@AITestActivity, "Audioaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                    }
                 }
             }
 
             override fun onAudioRecordingStopped(savedFilePath: String?) {
                 runOnUiThread {
+                    if (ignoreNextAudioStop || isClosingConversation) {
+                        ignoreNextAudioStop = false
+                        Log.d(appTag, "Ignoring audio stop during conversation close")
+                        return@runOnUiThread
+                    }
+
+                    if (audioHelper.lastStopReason == AudioHelper.StopReason.NO_SPEECH_TIMEOUT) {
+                        Log.i(appTag, "Conversation timed out without speech")
+                        closeConversation("Nach 15 Sekunden ohne Sprache beendet.")
+                        return@runOnUiThread
+                    }
+
                     if (savedFilePath != null) {
                         recordedAudioFile = File(savedFilePath)
                         updateProcessingStatus("Audio gespeichert: ${recordedAudioFile?.name}")
@@ -181,8 +254,11 @@ class AITestActivity : AppCompatActivity() {
                     } else {
                         updateProcessingStatus("Kein Audio aufgenommen")
                         Log.w(appTag, "No audio data recorded")
-                        // Still process request even without audio
-                        processAiRequest()
+                        if (isConversationActive) {
+                            restartConversationListening("Ich habe nichts gehört. Sprich bitte nochmal.")
+                        } else {
+                            processAiRequest()
+                        }
                     }
                 }
             }
@@ -200,42 +276,54 @@ class AITestActivity : AppCompatActivity() {
         openAIHelper.setListener(object : OpenAIHelper.OpenAIListener {
             override fun onAsrComplete(text: String) {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     updateProcessingStatus("Spracherkennung: $text")
                     Log.i(appTag, "ASR completed: $text")
-                    // Call OpenAI with ASR text (using streaming)
-                    sendToOpenAI(text)
+                    handleInstructionReady(text)
                 }
             }
 
             override fun onAsrFailed(error: String) {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     updateProcessingStatus("Spracherkennung fehlgeschlagen: $error")
-                    Toast.makeText(this@AITestActivity, "Spracherkennung fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Spracherkennung fehlgeschlagen: $error")
+                    restartConversationListening("Ich habe das nicht verstanden. Sprich bitte nochmal.")
                 }
             }
 
             override fun onOpenAIStreamingStarted() {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     updateProcessingStatus("Antwort-Streaming gestartet…")
                     Log.i(appTag, "OpenAI streaming started")
                     isStreaming = true
                     streamingBuffer.clear()
                     currentDisplayedCharCount = 0
-
-                    // Open the custom view to prepare for streaming display
-                    customSceneHelper.displayTextResult("")
+                    if (hasOpenedStreamingView) {
+                        customSceneHelper.updateTextResult("Denke…")
+                    } else {
+                        hasOpenedStreamingView = true
+                        customSceneHelper.displayTextResult("Denke…")
+                    }
                 }
             }
 
             override fun onOpenAIStreamingChunk(chunk: String, isComplete: Boolean) {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     if (chunk.isNotEmpty()) {
                         // Add chunk to buffer
                         streamingBuffer.append(chunk)
                         currentDisplayedCharCount += chunk.length
 
                         Log.d(appTag, "Received chunk: '$chunk' (${chunk.length} chars, total: $currentDisplayedCharCount)")
+
+                        if (!hasOpenedStreamingView) {
+                            hasOpenedStreamingView = true
+                            customSceneHelper.displayTextResult(streamingBuffer.toString())
+                            return@runOnUiThread
+                        }
 
                         // Get the configured chunk size from UI
                         val maxCharsPerDisplay = chunkSizeEditText.text.toString().toIntOrNull() ?: 350
@@ -270,65 +358,117 @@ class AITestActivity : AppCompatActivity() {
                 runOnUiThread {
                     updateProcessingStatus("KI-Antwort erhalten")
                     Log.i(appTag, "OpenAI response: $response")
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
 
                     // Store the response
                     lastResultText = response
+                    rememberConversationTurn(currentInstructionText, response)
 
                     // Check if TTS is enabled and streaming is complete
-                    if (useTtsCheckBox.isChecked && !isStreaming) {
+                    if (useTtsCheckBox.isChecked && !isStreaming && shouldSpeakResponse(response)) {
                         // Convert response to speech
                         updateProcessingStatus("Wandle in Sprache um…")
-                        val audioDir = getExternalFilesDir("tts_audio") ?: filesDir
-                        openAIHelper.callTtsAPI(response, audioDir)
+                        Log.d(appTag, "sendTtsContent sent=${RokidHostConnection.sendTtsContent(response)}")
+                        if (usesSystemTts()) {
+                            systemTtsPlayer.speak(response, SettingsActivity.getTtsVoice(this@AITestActivity))
+                        } else {
+                            val audioDir = getExternalFilesDir("tts_audio") ?: filesDir
+                            openAIHelper.callTtsAPI(response, audioDir, streaming = false)
+                        }
+                    } else {
+                        restartConversationListening()
                     }
                 }
             }
 
             override fun onAssistantToolCall(toolName: String, arguments: Map<String, String>): String? {
+                runOnUiThread {
+                    if (toolNeedsUnlockedPhone(toolName)) {
+                        dismissKeyguardForHandsFreeTool(toolName)
+                    }
+                    val message = "Führe ${toolDisplayName(toolName)} aus…"
+                    updateProcessingStatus(message)
+                    if (hasOpenedStreamingView) {
+                        customSceneHelper.updateTextResult(message)
+                    } else {
+                        hasOpenedStreamingView = true
+                        customSceneHelper.displayTextResult(message)
+                    }
+                }
                 return when (toolName) {
                     "snap_glasses_photo" -> {
+                        if (!includeImageCheckBox.isChecked) {
+                            return "Brillenfoto ist deaktiviert. Antworte ohne neues Foto."
+                        }
                         runOnUiThread {
                             updateProcessingStatus("Brillenfoto wird aufgenommen…")
                             aiCameraHelper.takePhoto()
                         }
                         "Freihändige Fotoaufnahme mit der Rokid-Brillenkamera gestartet. Verwende das Bild für die nächste KI-Anfrage, sobald es verfügbar ist."
                     }
+                    "stop_conversation" -> {
+                        runOnUiThread {
+                            closeConversation("Konversation beendet.")
+                        }
+                        "Conversation stopped."
+                    }
                     else -> null
+                }
+            }
+
+            override fun onAssistantToolResult(toolName: String, result: String) {
+                runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
+                    val message = "${toolDisplayName(toolName)}: ${localizeToolResult(result).take(180)}"
+                    updateProcessingStatus(message)
+                    if (hasOpenedStreamingView) {
+                        customSceneHelper.updateTextResult(message)
+                    } else {
+                        hasOpenedStreamingView = true
+                        customSceneHelper.displayTextResult(message)
+                    }
                 }
             }
 
             override fun onOpenAIFailed(error: String) {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     updateProcessingStatus("KI-Anfrage fehlgeschlagen: $error")
                     Toast.makeText(this@AITestActivity, "KI-Anfrage fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "KI-Anfrage fehlgeschlagen: $error")
                     isStreaming = false
+                    if (isConversationActive && !isClosingConversation) {
+                        restartConversationListening("KI-Anfrage fehlgeschlagen. Sprich bitte nochmal.")
+                    }
                 }
             }
 
             override fun onTtsComplete(audioFile: File) {
                 runOnUiThread {
-                    updateProcessingStatus("Sprachausgabe erzeugt")
-                    Log.i(appTag, "TTS complete: ${audioFile.absolutePath}")
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
+                    updateProcessingStatus("Sprachausgabe erzeugt (${audioFile.length()} bytes)")
+                    Log.i(appTag, "TTS complete: ${audioFile.absolutePath} (${audioFile.length()} bytes)")
 
-                    // Set audio file in custom scene helper for potential later use
-                    customSceneHelper.setAudioFile(audioFile)
-
-                    // Note: Audio is already playing via streaming, this is just the complete file notification
-                    Log.d(appTag, "Complete TTS audio file saved: ${audioFile.absolutePath}")
+                    streamingAudioPlayer.playFile(audioFile)
                 }
             }
 
             override fun onTtsFailed(error: String) {
                 runOnUiThread {
-                    updateProcessingStatus("TTS failed: $error")
-                    Toast.makeText(this@AITestActivity, "Sprachausgabe fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
+                    updateProcessingStatus("Sprachausgabe nicht verfügbar: $error")
+                    customSceneHelper.updateTextResult("Sprachausgabe nicht verfügbar:\n${error.take(140)}")
+                    RokidHostConnection.notifyTtsAudioFinished()
                     Log.e(appTag, "TTS failed: $error")
+                    if (isConversationActive && !isClosingConversation) {
+                        restartConversationListening("Sprachausgabe nicht verfügbar. Sprich weiter.")
+                    }
                 }
             }
 
             override fun onTtsStreamingStarted() {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     updateProcessingStatus("Audio-Streaming gestartet…")
                     Log.i(appTag, "TTS streaming started")
 
@@ -339,6 +479,7 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onTtsStreamingChunk(audioChunk: ByteArray, isComplete: Boolean) {
                 runOnUiThread {
+                    if (!isConversationActive || isClosingConversation) return@runOnUiThread
                     if (audioChunk.isNotEmpty()) {
                         // Add chunk to streaming player
                         streamingAudioPlayer.addChunk(audioChunk)
@@ -367,8 +508,7 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onSceneOpenFailed(errorCode: Int) {
                 runOnUiThread {
-                    updateProcessingStatus("Anzeige auf der Brille fehlgeschlagen: $errorCode")
-                    Toast.makeText(this@AITestActivity, "Anzeige auf der Brille fehlgeschlagen: $errorCode", Toast.LENGTH_LONG).show()
+                    Log.w(appTag, "Anzeige auf der Brille meldete Fehler: $errorCode")
                 }
             }
 
@@ -390,27 +530,136 @@ class AITestActivity : AppCompatActivity() {
         streamingAudioPlayer = StreamingAudioPlayer(appTag)
         streamingAudioPlayer.setListener(object : StreamingAudioPlayer.PlaybackListener {
             override fun onPlaybackStarted() {
-                runOnUiThread {
-                    updateProcessingStatus("Audiowiedergabe gestartet")
-                    Log.i(appTag, "Streaming audio playback started")
-                }
+                handleSpeechPlaybackStarted("Streaming audio playback started")
             }
 
             override fun onPlaybackCompleted() {
-                runOnUiThread {
-                    updateProcessingStatus("Audiowiedergabe abgeschlossen")
-                    Log.i(appTag, "Streaming audio playback completed")
-                }
+                handleSpeechPlaybackCompleted("Streaming audio playback completed")
             }
 
             override fun onPlaybackError(error: String) {
-                runOnUiThread {
-                    updateProcessingStatus("Audiowiedergabe-Fehler: $error")
-                    Toast.makeText(this@AITestActivity, "Audiowiedergabe-Fehler: $error", Toast.LENGTH_SHORT).show()
-                    Log.e(appTag, "Streaming audio playback error: $error")
-                }
+                handleSpeechPlaybackError(error, "Streaming audio playback error")
             }
         })
+
+        systemTtsPlayer = SystemTtsPlayer(this, appTag)
+        systemTtsPlayer.setListener(object : SystemTtsPlayer.Listener {
+            override fun onPlaybackStarted() {
+                handleSpeechPlaybackStarted("Android system TTS playback started")
+            }
+
+            override fun onPlaybackCompleted() {
+                handleSpeechPlaybackCompleted("Android system TTS playback completed")
+            }
+
+            override fun onPlaybackError(error: String) {
+                handleSpeechPlaybackError(error, "Android system TTS playback error")
+            }
+        })
+    }
+
+    private fun usesSystemTts(): Boolean =
+        SettingsActivity.getTtsModel(this).equals(SettingsActivity.DEFAULT_TTS_MODEL, ignoreCase = true)
+
+    private fun toolNeedsUnlockedPhone(toolName: String): Boolean =
+        toolName in setOf(
+            "place_phone_call",
+            "send_sms",
+            "start_navigation",
+            "play_youtube_music",
+            "open_rokid_translator",
+            "create_calendar_event",
+            "send_email",
+            "open_app",
+            "share_text",
+            "open_accessibility_settings"
+        )
+
+    private fun dismissKeyguardForHandsFreeTool(toolName: String) {
+        val keyguardManager = getSystemService(KeyguardManager::class.java) ?: return
+        if (!keyguardManager.isKeyguardLocked) return
+
+        Log.d(appTag, "Requesting keyguard dismissal for ${toolDisplayName(toolName)}")
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            keyguardManager.requestDismissKeyguard(this, null)
+        }
+    }
+
+    private fun toolDisplayName(toolName: String): String = when (toolName) {
+        "place_phone_call" -> "Anruf"
+        "send_sms" -> "SMS"
+        "find_contact_phone" -> "Kontakt-Suche"
+        "start_navigation" -> "Navigation"
+        "play_youtube_music" -> "Musik"
+        "open_rokid_translator" -> "Rokid-Übersetzer"
+        "get_gps_location" -> "Standort"
+        "get_weather" -> "Wetter"
+        "web_search" -> "Suche"
+        "set_timer" -> "Timer"
+        "create_reminder" -> "Erinnerung"
+        "list_reminders" -> "Erinnerungen"
+        "create_calendar_event" -> "Kalender"
+        "send_email" -> "E-Mail"
+        "open_app" -> "App"
+        "share_text" -> "Teilen"
+        "get_battery_status" -> "Akku"
+        "open_accessibility_settings" -> "Bedienungshilfen"
+        "snap_glasses_photo" -> "Foto"
+        "stop_conversation" -> "Stopp"
+        else -> toolName
+    }
+
+    private fun localizeToolResult(result: String): String = when {
+        result.startsWith("Started ", ignoreCase = true) -> "gestartet"
+        result.startsWith("SMS sent", ignoreCase = true) -> "gesendet"
+        result.startsWith("Found ", ignoreCase = true) -> result
+        result.startsWith("Could not", ignoreCase = true) -> "fehlgeschlagen: $result"
+        result.contains("permission", ignoreCase = true) -> "Berechtigung fehlt: $result"
+        else -> result
+    }
+
+    private fun rememberConversationTurn(userText: String, assistantText: String) {
+        val cleanUserText = userText.trim()
+        val cleanAssistantText = assistantText.trim()
+        if (cleanUserText.isBlank() || cleanAssistantText.isBlank()) return
+
+        sessionConversationMessages += Message(role = "user", content = cleanUserText)
+        sessionConversationMessages += Message(role = "assistant", content = cleanAssistantText)
+        while (sessionConversationMessages.size > MAX_SESSION_HISTORY_MESSAGES) {
+            sessionConversationMessages.removeAt(0)
+        }
+    }
+
+    private fun handleSpeechPlaybackStarted(logMessage: String) {
+        runOnUiThread {
+            updateProcessingStatus("Audiowiedergabe gestartet")
+            Log.i(appTag, logMessage)
+        }
+    }
+
+    private fun handleSpeechPlaybackCompleted(logMessage: String) {
+        runOnUiThread {
+            updateProcessingStatus("Audiowiedergabe abgeschlossen")
+            Log.i(appTag, logMessage)
+            RokidHostConnection.notifyTtsAudioFinished()
+            if (isConversationActive && !isClosingConversation) {
+                restartConversationListening()
+            }
+        }
+    }
+
+    private fun handleSpeechPlaybackError(error: String, logPrefix: String) {
+        runOnUiThread {
+            updateProcessingStatus("Audiowiedergabe-Fehler: $error")
+            customSceneHelper.updateTextResult("Audiowiedergabe fehlgeschlagen:\n${error.take(140)}")
+            RokidHostConnection.notifyTtsAudioFinished()
+            Log.e(appTag, "$logPrefix: $error")
+            if (isConversationActive && !isClosingConversation) {
+                restartConversationListening("Audiowiedergabe fehlgeschlagen. Sprich weiter.")
+            } else {
+                Toast.makeText(this@AITestActivity, "Audiowiedergabe-Fehler: $error", Toast.LENGTH_SHORT).show()
+            }
+        }
     }
 
     private fun setupInstructions() {
@@ -457,11 +706,15 @@ class AITestActivity : AppCompatActivity() {
         }
 
         // AI event listener
-        CxrApi.getInstance().setAiEventListener(object : AiEventListener {
+        RokidConnectionService.start(this)
+        RokidHostConnection.setInterruptAiWake(true)
+        RokidHostConnection.connect(this)
+        RokidHostConnection.setInterruptAiWake(true)
+        RokidHostConnection.setAiEventListener(object : RokidHostConnection.AiEventListener {
             override fun onAiKeyDown() {
                 runOnUiThread {
-                    Log.d(appTag, "AI key pressed - starting request")
-                    isAiSceneOpen = true
+                    Log.d(appTag, "AI key pressed - starting conversation")
+                    RokidHostConnection.setInterruptAiWake(true)
                     onAiKeyPressed()
                 }
             }
@@ -473,11 +726,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onAiExit() {
                 runOnUiThread {
                     Log.d(appTag, "AI scene exited")
-                    isAiSceneOpen = false
-                    // Stop audio recording if active
-                    if (audioHelper.isRecording) {
-                        audioHelper.closeAudioRecord("AI_assistant")
-                    }
+                    closeConversation("Konversation beendet.")
                 }
             }
         })
@@ -488,27 +737,38 @@ class AITestActivity : AppCompatActivity() {
      * This starts the AI request process
      */
     private fun onAiKeyPressed() {
-        updateStatus("KI-Anfrage wird verarbeitet…")
+        if (isConversationActive && !isClosingConversation) {
+            Log.d(appTag, "Conversation already active")
+            if (!audioHelper.isRecording && !isStreaming && !streamingAudioPlayer.isPlaying()) {
+                restartConversationListening()
+            }
+            return
+        }
+
+        isConversationActive = true
+        isClosingConversation = false
+        ignoreNextAudioStop = false
+        audioStartAttempts = 0
+        sessionConversationMessages.clear()
+        isAiSceneOpen = true
+        updateStatus("Neuro hört zu…")
         showProcessingUI(true)
+        currentRequestUsesAsr = useAsrCheckBox.isChecked
+        Log.d(appTag, "setCommunicationDevice sent=${RokidHostConnection.setCommunicationDevice()}")
 
         // Stop any ongoing audio playback from previous request
         streamingAudioPlayer.stop()
         customSceneHelper.stopAudio()
+        customSceneHelper.closeCustomView()
 
-        // Reset state
-        capturedImage = null
-        recordedAudioFile = null
-        capturedImageView.visibility = View.GONE
+        resetCurrentTurn()
 
-        // Always start audio recording (SDK requirement)
-        startAudioRecording()
-
-        // Capture image if configured
-        if (includeImageCheckBox.isChecked) {
-            updateProcessingStatus("Bild wird aufgenommen…")
-            aiCameraHelper.takePhoto()
+        if (currentRequestUsesAsr) {
+            openListeningView()
+            startAudioRecording()
         } else {
-            updateProcessingStatus("Bildaufnahme übersprungen (nicht aktiviert)")
+            updateProcessingStatus("Spracheingabe deaktiviert")
+            showInstructionSelectionDialog()
         }
     }
 
@@ -519,9 +779,176 @@ class AITestActivity : AppCompatActivity() {
         if (!audioHelper.isRecording) {
             Log.i(appTag, "Starting audio recording")
             audioHelper.clearAudioCache()
-            audioHelper.openAudioRecord(codecType = 1, streamType = "AI_assistant")
-            updateProcessingStatus("Recording audio...")
+            val started = audioHelper.openAudioRecord(codecType = 1, streamType = "AI_assistant", autoStopOnSilence = true)
+            if (started) {
+                audioStartAttempts = 0
+                updateProcessingStatus("Sprich jetzt…")
+            } else if (isConversationActive) {
+                audioStartAttempts++
+                if (audioStartAttempts < MAX_AUDIO_START_ATTEMPTS) {
+                    updateProcessingStatus("Audio wird verbunden…")
+                    processingStatusTextView.postDelayed({
+                        if (isConversationActive && !isClosingConversation && !audioHelper.isRecording) {
+                            startAudioRecording()
+                        }
+                    }, AUDIO_START_RETRY_DELAY_MS)
+                } else {
+                    audioStartAttempts = 0
+                    closeConversation("Audioaufnahme konnte nicht gestartet werden.")
+                }
+            }
         }
+    }
+
+    private fun resetCurrentTurn() {
+        isAwaitingPhotoForCurrentRequest = false
+        pendingInstructionForPhoto = null
+        currentInstructionText = ""
+        hasOpenedStreamingView = false
+        capturedImage = null
+        recordedAudioFile = null
+        capturedImageView.visibility = View.GONE
+    }
+
+    private fun openListeningView() {
+        hasOpenedStreamingView = true
+        customSceneHelper.displayTextResult("Ich höre zu…")
+    }
+
+    private fun restartConversationListening(message: String = "Sprich weiter…") {
+        if (!isConversationActive || isClosingConversation) return
+        if (!useAsrCheckBox.isChecked) {
+            closeConversation("Konversation beendet. Spracheingabe ist deaktiviert.")
+            return
+        }
+        if (audioHelper.isRecording) return
+
+        currentRequestUsesAsr = true
+        resetCurrentTurn()
+        audioStartAttempts = 0
+        updateStatus("Konversation läuft")
+        updateProcessingStatus(message)
+        if (hasOpenedStreamingView) {
+            customSceneHelper.updateTextResult(message)
+        } else {
+            openListeningView()
+        }
+        startAudioRecording()
+    }
+
+    private fun closeConversation(message: String) {
+        if (isClosingConversation) return
+
+        Log.i(appTag, "Closing conversation: $message")
+        isClosingConversation = true
+        isConversationActive = false
+        isAiSceneOpen = false
+        isAwaitingPhotoForCurrentRequest = false
+        pendingInstructionForPhoto = null
+        currentInstructionText = ""
+        hasOpenedStreamingView = false
+        isStreaming = false
+        audioStartAttempts = 0
+        sessionConversationMessages.clear()
+
+        streamingAudioPlayer.stop()
+        systemTtsPlayer.stop()
+        customSceneHelper.stopAudio()
+
+        if (audioHelper.isRecording) {
+            ignoreNextAudioStop = true
+            audioHelper.closeAudioRecord("AI_assistant")
+        } else {
+            audioHelper.clearAudioCache()
+        }
+
+        customSceneHelper.closeCustomView()
+        Log.d(appTag, "clearCommunicationDevice sent=${RokidHostConnection.clearCommunicationDevice()}")
+        RokidHostConnection.finishAiSession()
+        showProcessingUI(false)
+        updateStatus(message)
+        isClosingConversation = false
+    }
+
+    private fun handlePhotoCaptureFinished(photoCaptured: Boolean) {
+        if (!isAwaitingPhotoForCurrentRequest) return
+
+        isAwaitingPhotoForCurrentRequest = false
+        val pendingInstruction = pendingInstructionForPhoto
+        pendingInstructionForPhoto = null
+
+        if (pendingInstruction != null) {
+            if (!photoCaptured) capturedImage = null
+            sendToOpenAI(pendingInstruction)
+        }
+    }
+
+    private fun handleInstructionReady(instruction: String) {
+        val cleanInstruction = instruction.trim()
+        if (cleanInstruction.isBlank()) {
+            restartConversationListening("Ich habe nichts verstanden. Sprich bitte nochmal.")
+            return
+        }
+
+        if (isStopInstruction(cleanInstruction)) {
+            closeConversation("Konversation beendet.")
+            return
+        }
+
+        if (shouldCaptureImageForInstruction(cleanInstruction)) {
+            pendingInstructionForPhoto = cleanInstruction
+            isAwaitingPhotoForCurrentRequest = true
+            updateProcessingStatus("Bild wird aufgenommen…")
+            aiCameraHelper.takePhoto()
+            return
+        }
+
+        sendToOpenAI(cleanInstruction)
+    }
+
+    private fun isStopInstruction(instruction: String): Boolean {
+        val normalized = instruction.lowercase(Locale.ROOT)
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        val exactStops = setOf(
+            "stop",
+            "stopp",
+            "ende",
+            "beenden",
+            "abbrechen",
+            "cancel",
+            "exit",
+            "quit",
+            "tschüss",
+            "tschuess",
+            "goodbye",
+            "fertig"
+        )
+        if (normalized in exactStops) return true
+
+        val stopPhrases = listOf(
+            "hör auf",
+            "hoer auf",
+            "stoppe die konversation",
+            "beende die konversation",
+            "konversation beenden",
+            "neuro stop",
+            "neuro stopp",
+            "mach zu"
+        )
+        return stopPhrases.any { normalized.contains(it) }
+    }
+
+    private fun shouldCaptureImageForInstruction(instruction: String): Boolean {
+        if (!includeImageCheckBox.isChecked) return false
+
+        val text = instruction.lowercase()
+        val visualKeywords = listOf(
+            "bild", "foto", "photo", "kamera", "camera", "siehst", "sehen", "look", "see",
+            "beschreib", "describe", "szene", "scene", "objekt", "object", "erkenne",
+            "recognize", "scan", "lies", "read", "text im bild", "übersetze den text"
+        )
+        return visualKeywords.any { text.contains(it) }
     }
 
     /**
@@ -529,9 +956,7 @@ class AITestActivity : AppCompatActivity() {
      * Called after audio recording is stopped
      */
     private fun processAiRequest() {
-        val useAsr = useAsrCheckBox.isChecked
-
-        if (useAsr) {
+        if (currentRequestUsesAsr) {
             // Use ASR to get text from audio
             processWithASR()
         } else {
@@ -547,8 +972,12 @@ class AITestActivity : AppCompatActivity() {
         updateProcessingStatus("Processing voice with ASR...")
 
         if (recordedAudioFile == null) {
-            Toast.makeText(this, "Kein Audio aufgenommen", Toast.LENGTH_SHORT).show()
             updateProcessingStatus("Error: No audio available")
+            if (isConversationActive) {
+                restartConversationListening("Ich habe nichts gehört. Sprich bitte nochmal.")
+            } else {
+                Toast.makeText(this, "Kein Audio aufgenommen", Toast.LENGTH_SHORT).show()
+            }
             return
         }
 
@@ -571,12 +1000,12 @@ class AITestActivity : AppCompatActivity() {
             .setItems(predefinedInstructions.toTypedArray()) { _, which ->
                 val selectedInstruction = predefinedInstructions[which]
                 updateProcessingStatus("Instruction: $selectedInstruction")
-                sendToOpenAI(selectedInstruction)
+                handleInstructionReady(selectedInstruction)
             }
             .setNegativeButton("Cancel") { dialog, _ ->
                 dialog.dismiss()
                 updateProcessingStatus("Cancelled")
-                showProcessingUI(false)
+                closeConversation("Konversation abgebrochen.")
             }
             .show()
     }
@@ -585,13 +1014,29 @@ class AITestActivity : AppCompatActivity() {
      * Send request to OpenAI with instruction and optional image
      */
     private fun sendToOpenAI(instruction: String) {
+        if (!isConversationActive || isClosingConversation) return
         updateProcessingStatus("Sending to AI...")
+        currentInstructionText = instruction
 
-        val hasImage = capturedImage != null && includeImageCheckBox.isChecked
-        val imageToSend = if (hasImage) capturedImage else null
+        val imageToSend = capturedImage
 
         // Call OpenAI API using streaming helper
-        openAIHelper.callOpenAIStreaming(instruction, imageToSend)
+        openAIHelper.callOpenAIStreaming(
+            instruction = instruction,
+            image = imageToSend,
+            allowGlassesPhotoTool = false,
+            includePersistedHistory = false,
+            persistConversation = false,
+            conversationHistory = sessionConversationMessages.toList()
+        )
+    }
+
+    private fun shouldSpeakResponse(response: String): Boolean {
+        val instruction = currentInstructionText.trim().lowercase()
+        if (instruction in setOf("test", "testing", "probe", "check", "ping")) return false
+        if (response.isBlank()) return false
+        if (response.contains("TTS API call failed", ignoreCase = true)) return false
+        return true
     }
 
     /**
@@ -663,8 +1108,9 @@ class AITestActivity : AppCompatActivity() {
         openAIHelper.release()
         customSceneHelper.release()
         streamingAudioPlayer.release()
+        systemTtsPlayer.release()
 
         // Remove listeners
-        CxrApi.getInstance().setAiEventListener(null)
+        RokidHostConnection.setAiEventListener(null)
     }
 }

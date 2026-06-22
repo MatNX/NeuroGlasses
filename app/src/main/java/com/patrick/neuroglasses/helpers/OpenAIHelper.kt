@@ -1,14 +1,19 @@
 package com.patrick.neuroglasses.helpers
 
+import android.annotation.SuppressLint
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.app.KeyguardManager
 import android.net.Uri
+import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.CalendarContract
 import android.provider.Settings
 import android.provider.ContactsContract
+import android.telephony.PhoneNumberUtils
 import android.telephony.SmsManager
+import android.telecom.TelecomManager
 import android.location.LocationManager
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
@@ -127,7 +132,9 @@ data class AsrResponse(
 data class TtsRequest(
     val model: String,
     val input: String,
-    val voice: String
+    val voice: String,
+    @SerializedName("response_format")
+    val responseFormat: String = "wav"
 )
 
 data class PersistedChatMessage(
@@ -153,6 +160,28 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
 
+    private companion object {
+        private const val MAX_TOOL_ROUNDS = 3
+        private const val MAX_TTS_INPUT_CHARS = 200
+        private const val MIN_TTS_AUDIO_BYTES = 44
+    }
+
+    private data class ContactPhone(
+        val displayName: String,
+        val number: String
+    )
+
+    private data class PhoneTarget(
+        val original: String,
+        val number: String?,
+        val displayName: String? = null,
+        val contactPermissionMissing: Boolean = false
+    )
+
+    private data class ToolResolutionResult(
+        val messages: List<Message>,
+        val results: List<String>
+    )
 
     // Get configuration from SharedPreferences
     private fun getApiBaseUrl(): String = SettingsActivity.getApiBaseUrl(context).trimEnd('/')
@@ -314,6 +343,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         fun onAssistantToolCall(toolName: String, arguments: Map<String, String>): String? = null
 
         /**
+         * Called after a tool call finishes so the UI can show progress before the final answer.
+         */
+        fun onAssistantToolResult(toolName: String, result: String) {}
+
+        /**
          * Called when OpenAI API call fails
          * @param error Error message
          */
@@ -429,7 +463,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
 
-    private fun assistantTools(): List<AssistantTool> {
+    private fun assistantTools(
+        instruction: String,
+        allowGlassesPhotoTool: Boolean,
+        includeChatTools: Boolean
+    ): List<AssistantTool> {
         fun objectSchema(required: List<String>, properties: Map<String, Map<String, Any>>): Map<String, Any> = mapOf(
             "type" to "object",
             "required" to required,
@@ -439,19 +477,29 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         fun stringProp(description: String): Map<String, Any> = mapOf("type" to "string", "description" to description)
 
-        return listOf(
+        val tools = listOf(
             AssistantTool(function = ToolFunction(
                 name = "place_phone_call",
-                description = "Hands-free: immediately place a phone call to a number or contact name when CALL_PHONE permission is granted; otherwise report that permission is needed.",
-                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Phone number or contact name.")))
+                description = "Hands-free: place a phone call. A contact name is enough; do not ask for a phone number when the user supplied a name. The app resolves contact names and falls back to the dialer if CALL_PHONE permission is missing.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Phone number or contact name; names are valid recipients.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "send_sms",
-                description = "Hands-free: send an SMS to a number or contact name when SEND_SMS permission is granted.",
+                description = "Hands-free: send an SMS. A contact name is enough; do not ask for a phone number when the user supplied a name. The app resolves contact names and falls back to the SMS composer if direct sending is unavailable.",
                 parameters = objectSchema(listOf("recipient", "message"), mapOf(
-                    "recipient" to stringProp("Phone number or contact name."),
+                    "recipient" to stringProp("Phone number or contact name; names are valid recipients."),
                     "message" to stringProp("Message body to send.")
                 ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "find_contact_phone",
+                description = "Look up a contact name in the phone contacts and return the best matching phone number before calling or texting.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Contact name to look up.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "stop_conversation",
+                description = "Close the active NeuroGlasses conversation when the user explicitly says stop, cancel, goodbye, or end the session.",
+                parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
                 name = "start_navigation",
@@ -576,6 +624,48 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 ))
             ))
         )
+
+        return tools.filter { tool ->
+            when (tool.function.name) {
+                "new_chat", "list_chats", "switch_chat", "rename_chat" -> includeChatTools
+                "snap_glasses_photo" -> allowGlassesPhotoTool
+                "open_rokid_translator" -> hasAnyKeyword(
+                    instruction,
+                    "open translator", "open the translator", "start translator", "launch translator",
+                    "öffne übersetzer", "öffne den übersetzer", "starte übersetzer",
+                    "starte den übersetzer", "öffne rokid translator", "starte rokid translator"
+                )
+                "open_app" -> hasAnyKeyword(instruction, "öffne", "open", "starte", "start", "launch", "app")
+                else -> true
+            }
+        }
+    }
+
+    private fun shouldResolveTools(instruction: String): Boolean {
+        val normalized = instruction.trim().lowercase(Locale.ROOT)
+        if (normalized.isBlank()) return false
+        if (isProbeInstruction(instruction)) return false
+
+        return hasAnyKeyword(
+            normalized,
+            "ruf", "anruf", "call", "sms", "nachricht", "message", "navig", "route", "maps",
+            "musik", "youtube", "wetter", "weather", "suche", "search", "web", "timer",
+            "erinner", "remind", "kalender", "termin", "calendar", "mail", "email", "e-mail",
+            "öffne", "open", "starte", "app", "teile", "share", "akku", "battery",
+            "foto", "photo", "bild", "camera", "kamera", "übersetz", "translate", "translator",
+            "chat", "liste chats", "neuer chat", "stop", "stopp", "beende", "beenden",
+            "abbrechen", "cancel", "tschüss", "tschuess", "goodbye"
+        )
+    }
+
+    private fun isProbeInstruction(instruction: String): Boolean =
+        instruction.trim().lowercase(Locale.ROOT) in setOf(
+            "test", "testing", "probe", "check", "ping", "hi", "hallo", "hello"
+        )
+
+    private fun hasAnyKeyword(text: String, vararg keywords: String): Boolean {
+        val normalized = text.lowercase(Locale.ROOT)
+        return keywords.any { normalized.contains(it.lowercase(Locale.ROOT)) }
     }
 
     private fun executeAssistantTool(toolCall: ToolCall): String {
@@ -583,11 +673,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         listener?.onAssistantToolCall(toolCall.function.name, args)?.let { return it }
 
         fun arg(name: String): String = args[name].orEmpty()
-        fun resolvePhone(recipient: String): String = if (recipient.any { it.isDigit() }) recipient else lookupContactPhone(recipient) ?: recipient
 
         return when (toolCall.function.name) {
-            "place_phone_call" -> placePhoneCall(resolvePhone(arg("recipient")))
-            "send_sms" -> sendSms(resolvePhone(arg("recipient")), arg("message"))
+            "place_phone_call" -> placePhoneCall(arg("recipient"))
+            "send_sms" -> sendSms(arg("recipient"), arg("message"))
+            "find_contact_phone" -> findContactPhone(arg("recipient"))
+            "stop_conversation" -> "Conversation stopped."
             "start_navigation" -> launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${Uri.encode(arg("destination"))}")), "turn-by-turn navigation")
             "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
@@ -619,52 +710,196 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return parsed.mapNotNull { (key, value) -> key?.toString()?.let { it to value?.toString().orEmpty() } }.toMap()
     }
 
+    private fun buildToolResultFallback(results: List<String>): String {
+        if (results.isEmpty()) return ""
+        val lastResult = results.last().substringAfter(":").trim()
+        return when {
+            lastResult.startsWith("Started ", ignoreCase = true) -> "Erledigt: ${lastResult.removePrefix("Started ").removeSuffix(" hands-free.")} gestartet."
+            lastResult.startsWith("Could not", ignoreCase = true) -> "Das hat leider nicht geklappt: $lastResult"
+            lastResult.contains("permission", ignoreCase = true) -> "Dafür fehlt noch eine Berechtigung: $lastResult"
+            else -> lastResult
+        }
+    }
+
     private fun launchIntent(intent: Intent, label: String): String = try {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
         "Started $label hands-free."
     } catch (e: Exception) {
         Log.e(appTag, "Could not start $label", e)
-        "Could not start $label: ${e.message}"
+        val lockedSuffix = if (isDeviceLocked()) " The phone is locked; unlock it and try again if Android blocked the target app." else ""
+        "Could not start $label: ${e.message}.$lockedSuffix"
     }
 
     private fun hasPermission(permission: String): Boolean = context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
-    private fun lookupContactPhone(name: String): String? = try {
+    private fun isDeviceLocked(): Boolean =
+        context.getSystemService(KeyguardManager::class.java)?.isKeyguardLocked == true
+
+    private fun lookupContactPhone(name: String): ContactPhone? {
+        val query = normalizeContactText(name)
+        if (query.isBlank()) return null
         if (!hasPermission(Manifest.permission.READ_CONTACTS)) return null
-        val projection = arrayOf(ContactsContract.CommonDataKinds.Phone.NUMBER)
-        val selection = "${ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY} LIKE ?"
-        val selectionArgs = arrayOf("%$name%")
-        context.contentResolver.query(
-            ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
-            projection,
-            selection,
-            selectionArgs,
-            null
-        )?.use { cursor ->
-            if (cursor.moveToFirst()) cursor.getString(0) else null
-        }
-    } catch (e: Exception) {
-        Log.w(appTag, "Contact lookup failed", e)
-        null
-    }
 
-    private fun placePhoneCall(phone: String): String {
-        if (phone.isBlank()) return "I need a contact name or phone number to place a call."
-        if (!hasPermission(Manifest.permission.CALL_PHONE)) return "CALL_PHONE permission is required before I can place calls hands-free."
-        return launchIntent(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phone)}")), "phone call")
-    }
-
-    private fun sendSms(phone: String, message: String): String {
-        if (phone.isBlank() || message.isBlank()) return "I need both a recipient and message before sending SMS."
-        if (!hasPermission(Manifest.permission.SEND_SMS)) return "SEND_SMS permission is required before I can send texts hands-free."
         return try {
-            context.getSystemService(SmsManager::class.java).sendTextMessage(phone, null, message, null, null)
-            "SMS sent to $phone."
+            val projection = arrayOf(
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY,
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME,
+                ContactsContract.CommonDataKinds.Phone.NUMBER
+            )
+            val matches = mutableListOf<Pair<Int, ContactPhone>>()
+            context.contentResolver.query(
+                ContactsContract.CommonDataKinds.Phone.CONTENT_URI,
+                projection,
+                null,
+                null,
+                ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY
+            )?.use { cursor ->
+                val primaryNameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME_PRIMARY)
+                val nameIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                val numberIndex = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                val displayNameIndex = if (primaryNameIndex >= 0) primaryNameIndex else nameIndex
+                if (displayNameIndex < 0 || numberIndex < 0) return@use
+
+                while (cursor.moveToNext()) {
+                    val displayName = cursor.getString(displayNameIndex).orEmpty()
+                    val number = cursor.getString(numberIndex).orEmpty()
+                    if (displayName.isBlank() || number.isBlank()) continue
+
+                    val normalizedName = normalizeContactText(displayName)
+                    val score = contactMatchScore(query, normalizedName) ?: continue
+                    val normalizedNumber = PhoneNumberUtils.normalizeNumber(number).ifBlank { number }
+                    matches += score to ContactPhone(displayName, normalizedNumber)
+                }
+            }
+            matches.sortedWith(compareBy<Pair<Int, ContactPhone>> { it.first }.thenBy { it.second.displayName.length })
+                .firstOrNull()
+                ?.second
         } catch (e: Exception) {
-            Log.e(appTag, "Could not send SMS", e)
-            "Could not send SMS: ${e.message}"
+            Log.w(appTag, "Contact lookup failed", e)
+            null
         }
+    }
+
+    private fun normalizeContactText(value: String): String =
+        value.lowercase(Locale.ROOT)
+            .replace(Regex("[^\\p{L}\\p{N}\\s]+"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+
+    private fun contactMatchScore(query: String, candidate: String): Int? {
+        if (candidate == query) return 0
+        if (candidate.startsWith(query)) return 1
+        if (candidate.contains(query)) return 2
+        val terms = query.split(" ").filter { it.isNotBlank() }
+        if (terms.isNotEmpty() && terms.all { candidate.contains(it) }) return 3
+        return null
+    }
+
+    private fun resolvePhoneTarget(recipient: String): PhoneTarget {
+        val trimmed = recipient.trim()
+        if (trimmed.isBlank()) return PhoneTarget(original = recipient, number = null)
+        if (trimmed.any { it.isDigit() }) {
+            return PhoneTarget(original = recipient, number = PhoneNumberUtils.normalizeNumber(trimmed).ifBlank { trimmed })
+        }
+
+        val contact = lookupContactPhone(trimmed)
+        if (contact != null) {
+            return PhoneTarget(original = recipient, number = contact.number, displayName = contact.displayName)
+        }
+
+        return PhoneTarget(
+            original = recipient,
+            number = null,
+            contactPermissionMissing = !hasPermission(Manifest.permission.READ_CONTACTS)
+        )
+    }
+
+    private fun findContactPhone(recipient: String): String {
+        val target = resolvePhoneTarget(recipient)
+        return when {
+            target.number != null && target.displayName != null -> "Found ${target.displayName}: ${target.number}."
+            target.number != null -> "Recipient is already a phone number: ${target.number}."
+            target.contactPermissionMissing -> "READ_CONTACTS permission is required before I can look up $recipient."
+            else -> "I could not find a phone number for $recipient."
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun placePhoneCall(recipient: String): String {
+        val target = resolvePhoneTarget(recipient)
+        val phone = target.number
+        if (phone.isNullOrBlank()) {
+            return if (target.contactPermissionMissing) {
+                "READ_CONTACTS permission is required before I can find $recipient. Provide a phone number or grant contacts permission."
+            } else {
+                "I could not find a phone number for $recipient."
+            }
+        }
+
+        val label = target.displayName?.let { "phone call to $it" } ?: "phone call"
+        if (hasPermission(Manifest.permission.CALL_PHONE)) {
+            val callUri = Uri.parse("tel:${Uri.encode(phone)}")
+            val telecomManager = context.getSystemService(TelecomManager::class.java)
+            if (telecomManager != null) {
+                runCatching {
+                    telecomManager.placeCall(callUri, Bundle.EMPTY)
+                }.onSuccess {
+                    return "Started $label hands-free."
+                }.onFailure { error ->
+                    Log.e(appTag, "TelecomManager.placeCall failed", error)
+                }
+            }
+
+            return launchIntent(Intent(Intent.ACTION_CALL, callUri), label)
+        }
+
+        val dialResult = launchIntent(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "dialer for $label")
+        return if (dialResult.startsWith("Could not")) {
+            "CALL_PHONE permission is missing and I could not open the dialer: $dialResult"
+        } else {
+            "CALL_PHONE permission is missing, so I opened the dialer for ${target.displayName ?: phone}."
+        }
+    }
+
+    private fun sendSms(recipient: String, message: String): String {
+        if (message.isBlank()) return "I need a message before sending SMS."
+        val target = resolvePhoneTarget(recipient)
+        val phone = target.number
+        if (phone.isNullOrBlank()) {
+            return if (target.contactPermissionMissing) {
+                "READ_CONTACTS permission is required before I can find $recipient. Provide a phone number or grant contacts permission."
+            } else {
+                "I could not find a phone number for $recipient."
+            }
+        }
+
+        if (!hasPermission(Manifest.permission.SEND_SMS)) {
+            return openSmsComposer(phone, message, "SEND_SMS permission is missing, so I opened the SMS composer instead.")
+        }
+
+        return try {
+            val smsManager = context.getSystemService(SmsManager::class.java)
+            val parts = smsManager.divideMessage(message)
+            if (parts.size > 1) {
+                smsManager.sendMultipartTextMessage(phone, null, parts, null, null)
+            } else {
+                smsManager.sendTextMessage(phone, null, message, null, null)
+            }
+            "SMS sent to ${target.displayName ?: phone}."
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not send SMS directly", e)
+            openSmsComposer(phone, message, "Could not send SMS directly (${e.message}); opened the SMS composer instead.")
+        }
+    }
+
+    private fun openSmsComposer(phone: String, message: String, prefix: String): String {
+        val result = launchIntent(
+            Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phone)}"))
+                .putExtra("sms_body", message),
+            "SMS composer"
+        )
+        return if (result.startsWith("Could not")) "$prefix $result" else prefix
     }
 
     private fun playYoutubeMusic(query: String): String {
@@ -690,6 +925,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return "I could not find the Rokid translator app on this phone."
     }
 
+    @SuppressLint("MissingPermission")
     private fun getGpsLocation(): String {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
             return "Location permission is required before I can read GPS hands-free."
@@ -822,7 +1058,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      * @param instruction The user instruction/prompt
      * @param image Optional image to include in the request (for vision models)
      */
-    fun callOpenAIStreaming(instruction: String, image: Bitmap?) {
+    fun callOpenAIStreaming(
+        instruction: String,
+        image: Bitmap?,
+        allowGlassesPhotoTool: Boolean = false,
+        includePersistedHistory: Boolean = true,
+        persistConversation: Boolean = true,
+        conversationHistory: List<Message> = emptyList()
+    ) {
         Log.d(appTag, "OpenAI Streaming API called")
         Log.d(appTag, "Instruction: $instruction")
         Log.d(appTag, "Has image: ${image != null}")
@@ -847,13 +1090,20 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     )
                 }
 
-                val requestChatId = activeChatId()
+                val requestChatId = if (persistConversation) activeChatId() else null
 
                 // Build the messages list with system prompt, persisted chat history, and current user turn.
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze die verfügbaren Tools proaktiv, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn für Aktionen wie Anruf, SMS, Navigation, Kalender oder E-Mail wichtige Angaben fehlen. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val sessionPrompt = if (persistConversation) {
+                    "Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat nur, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                } else if (conversationHistory.isNotEmpty()) {
+                    "Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse aus anderen Konversationen."
+                } else {
+                    "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
+                }
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Frage nur nach, wenn Empfänger oder Nachricht wirklich fehlen. Bei Navigation, Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
                 messagesList.add(
                     Message(
                         role = "system",
@@ -862,7 +1112,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 )
 
                 // Add persisted chat history before the current turn. Image content is not persisted.
-                messagesList.addAll(activeChatHistoryMessages())
+                // Probe utterances are intentionally isolated so "test" cannot inherit an old action context.
+                if (includePersistedHistory && !isProbeInstruction(instruction)) {
+                    messagesList.addAll(activeChatHistoryMessages())
+                }
+                if (conversationHistory.isNotEmpty() && !isProbeInstruction(instruction)) {
+                    messagesList.addAll(conversationHistory.takeLast(20))
+                }
 
                 // Add user message
                 messagesList.add(
@@ -872,7 +1128,26 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     )
                 )
 
-                val toolMessages = resolveToolCallsIfNeeded(messagesList)
+                val toolResolution = if (shouldResolveTools(instruction)) {
+                    resolveToolCallsIfNeeded(
+                        messagesList,
+                        instruction,
+                        allowGlassesPhotoTool,
+                        includeChatTools = persistConversation
+                    )
+                } else {
+                    Log.d(appTag, "Skipping tool planning for non-action instruction: $instruction")
+                    ToolResolutionResult(messagesList, emptyList())
+                }
+                val toolMessages = toolResolution.messages.toMutableList()
+                if (toolResolution.results.isNotEmpty()) {
+                    toolMessages.add(
+                        Message(
+                            role = "user",
+                            content = "Gib jetzt eine knappe deutschsprachige Erfolgsmeldung oder Fehlermeldung zu diesen Tool-Ergebnissen aus. Frage nicht erneut nach bereits aufgelösten Daten:\n${toolResolution.results.joinToString("\n")}"
+                        )
+                    )
+                }
 
                 // Create the request with streaming enabled. Tools are resolved in a prior
                 // non-streaming pass so the final response can stream cleanly to the glasses.
@@ -987,16 +1262,35 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     val finalResponse = fullResponse.toString()
                     if (finalResponse.isNotEmpty()) {
                         Log.d(appTag, "Full streaming response: $finalResponse")
-                        appendChatMessages(
-                            activeChatId().takeIf { it != requestChatId } ?: requestChatId,
-                            listOf(
-                                PersistedChatMessage("user", instruction),
-                                PersistedChatMessage("assistant", finalResponse)
+                        if (persistConversation && requestChatId != null) {
+                            appendChatMessages(
+                                activeChatId().takeIf { it != requestChatId } ?: requestChatId,
+                                listOf(
+                                    PersistedChatMessage("user", instruction),
+                                    PersistedChatMessage("assistant", finalResponse)
+                                )
                             )
-                        )
+                        }
                         listener?.onOpenAIResponse(finalResponse)
                     } else {
-                        Log.w(appTag, "Streaming completed but no content was received")
+                        val fallbackResponse = buildToolResultFallback(toolResolution.results)
+                        if (fallbackResponse.isNotBlank()) {
+                            Log.w(appTag, "Streaming completed empty after tool call; using fallback response: $fallbackResponse")
+                            listener?.onOpenAIStreamingChunk(fallbackResponse, true)
+                            if (persistConversation && requestChatId != null) {
+                                appendChatMessages(
+                                    activeChatId().takeIf { it != requestChatId } ?: requestChatId,
+                                    listOf(
+                                        PersistedChatMessage("user", instruction),
+                                        PersistedChatMessage("assistant", fallbackResponse)
+                                    )
+                                )
+                            }
+                            listener?.onOpenAIResponse(fallbackResponse)
+                        } else {
+                            Log.w(appTag, "Streaming completed but no content was received")
+                            listener?.onOpenAIFailed("Empty response")
+                        }
                     }
                 }
             } catch (e: IOException) {
@@ -1010,55 +1304,70 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
 
-    private fun resolveToolCallsIfNeeded(messagesList: MutableList<Message>): List<Message> {
-        val request = OpenAIRequest(
-            model = getVlmModel(),
-            messages = messagesList,
-            maxTokens = getVlmMaxTokens(),
-            stream = false,
-            tools = assistantTools(),
-            toolChoice = "auto"
-        )
-        val jsonBody = gson.toJson(request)
-        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
-        val httpRequest = Request.Builder()
-            .url(getChatApiUrl())
-            .addHeader("Content-Type", "application/json")
-            .addHeader("Authorization", "Bearer ${getApiToken()}")
-            .post(requestBody)
-            .build()
+    private fun resolveToolCallsIfNeeded(
+        messagesList: MutableList<Message>,
+        instruction: String,
+        allowGlassesPhotoTool: Boolean,
+        includeChatTools: Boolean
+    ): ToolResolutionResult {
+        val tools = assistantTools(instruction, allowGlassesPhotoTool, includeChatTools)
+        val toolResults = mutableListOf<String>()
 
         return try {
-            getClient().newCall(httpRequest).execute().use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
-                    return messagesList
-                }
-                val responseBody = response.body?.string() ?: return messagesList
-                val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
-                val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return messagesList
-                val toolCalls = assistantMessage.toolCalls.orEmpty()
-                if (toolCalls.isEmpty()) {
-                    messagesList.add(assistantMessage)
-                    return messagesList
-                }
+            repeat(MAX_TOOL_ROUNDS) { round ->
+                val request = OpenAIRequest(
+                    model = getVlmModel(),
+                    messages = messagesList,
+                    maxTokens = getVlmMaxTokens(),
+                    stream = false,
+                    tools = tools,
+                    toolChoice = "auto"
+                )
+                val jsonBody = gson.toJson(request)
+                val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+                val httpRequest = Request.Builder()
+                    .url(getChatApiUrl())
+                    .addHeader("Content-Type", "application/json")
+                    .addHeader("Authorization", "Bearer ${getApiToken()}")
+                    .post(requestBody)
+                    .build()
 
-                messagesList.add(assistantMessage)
-                toolCalls.forEach { toolCall ->
-                    val result = executeAssistantTool(toolCall)
-                    messagesList.add(
-                        Message(
-                            role = "tool",
-                            content = result,
-                            toolCallId = toolCall.id
+                getClient().newCall(httpRequest).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
+                        return ToolResolutionResult(messagesList, toolResults)
+                    }
+
+                    val responseBody = response.body?.string() ?: return ToolResolutionResult(messagesList, toolResults)
+                    val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
+                    val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return ToolResolutionResult(messagesList, toolResults)
+                    val toolCalls = assistantMessage.toolCalls.orEmpty()
+                    messagesList.add(assistantMessage)
+
+                    if (toolCalls.isEmpty()) return ToolResolutionResult(messagesList, toolResults)
+
+                    Log.d(appTag, "Executing ${toolCalls.size} tool call(s), round ${round + 1}")
+                    toolCalls.forEach { toolCall ->
+                        val result = executeAssistantTool(toolCall)
+                        toolResults += "${toolCall.function.name}: $result"
+                        listener?.onAssistantToolResult(toolCall.function.name, result)
+                        messagesList.add(
+                            Message(
+                                role = "tool",
+                                content = result,
+                                toolCallId = toolCall.id
+                            )
                         )
-                    )
+                    }
+
+                    if (toolCalls.any { it.function.name == "stop_conversation" }) return ToolResolutionResult(messagesList, toolResults)
                 }
-                messagesList
             }
+            Log.w(appTag, "Tool planning reached max rounds ($MAX_TOOL_ROUNDS); continuing with accumulated tool results")
+            ToolResolutionResult(messagesList, toolResults)
         } catch (e: Exception) {
             Log.e(appTag, "Tool planning failed; continuing without tools", e)
-            messagesList
+            ToolResolutionResult(messagesList, toolResults)
         }
     }
 
@@ -1087,13 +1396,20 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             outputDir.mkdirs()
         }
 
+        val ttsInput = prepareTtsInput(text)
+        if (ttsInput.isBlank()) {
+            listener?.onTtsFailed("No speakable text")
+            return
+        }
+
         Thread {
             try {
                 // Create the TTS request
                 val request = TtsRequest(
                     model = getTtsModel(),
-                    input = text,
-                    voice = getTtsVoice()
+                    input = ttsInput,
+                    voice = getTtsVoice(),
+                    responseFormat = "wav"
                 )
 
                 // Convert request to JSON
@@ -1126,6 +1442,27 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }.start()
     }
 
+    private fun prepareTtsInput(text: String): String {
+        val normalized = text
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        if (normalized.length <= MAX_TTS_INPUT_CHARS) return normalized
+
+        val clipped = normalized.take(MAX_TTS_INPUT_CHARS)
+        val sentenceEnd = listOf(
+            clipped.lastIndexOf('.'),
+            clipped.lastIndexOf('!'),
+            clipped.lastIndexOf('?')
+        ).maxOrNull() ?: -1
+        val wordEnd = clipped.lastIndexOf(' ')
+        val cutIndex = when {
+            sentenceEnd >= 80 -> sentenceEnd + 1
+            wordEnd >= 80 -> wordEnd
+            else -> clipped.length
+        }
+        return clipped.take(cutIndex).trim().ifBlank { clipped.trim() }
+    }
+
     /**
      * Call TTS API in streaming mode
      */
@@ -1139,7 +1476,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
                 Log.e(appTag, "TTS API call failed: ${response.code} - $errorBody")
-                listener?.onTtsFailed("TTS API call failed: ${response.code}")
+                listener?.onTtsFailed("TTS API call failed: ${response.code} ${errorBody.take(160)}")
                 return
             }
 
@@ -1168,7 +1505,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
             // Create file to save complete audio for later use
             val timestamp = System.currentTimeMillis()
-            val audioFile = File(outputDir, "tts_result_$timestamp.mp3")
+            val audioFile = File(outputDir, "tts_result_$timestamp.wav")
             val fileOutputStream = audioFile.outputStream()
 
             try {
@@ -1224,19 +1561,34 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     private fun callTtsAPINonStreaming(httpRequest: Request, outputDir: File) {
         // Execute the request
-        getClient().newCall(httpRequest).execute().use { response ->
+        getClient(isStreaming = true).newCall(httpRequest).execute().use { response ->
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
                 Log.e(appTag, "TTS API call failed: ${response.code} - $errorBody")
-                listener?.onTtsFailed("TTS API call failed: ${response.code}")
+                listener?.onTtsFailed("TTS API call failed: ${response.code} ${errorBody.take(160)}")
+                return
+            }
+
+            val responseBody = response.body
+            if (responseBody == null) {
+                Log.e(appTag, "Empty TTS response body")
+                listener?.onTtsFailed("Empty audio response")
+                return
+            }
+
+            val contentType = responseBody.contentType()?.toString().orEmpty()
+            if (contentType.isNotBlank() && !contentType.startsWith("audio/")) {
+                val responseText = responseBody.string()
+                Log.e(appTag, "TTS API returned non-audio content: $contentType - $responseText")
+                listener?.onTtsFailed("TTS API returned $contentType: ${responseText.take(160)}")
                 return
             }
 
             // Save the audio data to file
-            val audioBytes = response.body?.bytes()
-            if (audioBytes != null && audioBytes.isNotEmpty()) {
+            val audioBytes = responseBody.bytes()
+            if (audioBytes.size > MIN_TTS_AUDIO_BYTES) {
                 val timestamp = System.currentTimeMillis()
-                val audioFile = File(outputDir, "tts_result_$timestamp.mp3")
+                val audioFile = File(outputDir, "tts_result_$timestamp.wav")
 
                 audioFile.outputStream().use { fileOut ->
                     fileOut.write(audioBytes)
@@ -1245,8 +1597,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 Log.d(appTag, "TTS audio saved to: ${audioFile.absolutePath} (${audioBytes.size} bytes)")
                 listener?.onTtsComplete(audioFile)
             } else {
-                Log.e(appTag, "Empty TTS response body")
-                listener?.onTtsFailed("Empty audio response")
+                Log.e(appTag, "TTS response body too small: ${audioBytes.size} bytes")
+                listener?.onTtsFailed("Invalid audio response: ${audioBytes.size} bytes")
             }
         }
     }

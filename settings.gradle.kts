@@ -22,3 +22,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "NeuroGlasses"
 include(":app")
+include(":cxrglobal")

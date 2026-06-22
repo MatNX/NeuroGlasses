@@ -40,16 +40,7 @@ class BluetoothHelper(
         const val REQUEST_CODE_PERMISSIONS = 100
 
         // Required Permissions
-        private val REQUIRED_PERMISSIONS = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.BLUETOOTH,
-            Manifest.permission.BLUETOOTH_ADMIN,
-        ).apply {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                add(Manifest.permission.BLUETOOTH_SCAN)
-                add(Manifest.permission.BLUETOOTH_CONNECT)
-            }
-        }.toTypedArray()
+        private val REQUIRED_PERMISSIONS = AppPermissions.requiredRuntimePermissions()
 
         // Init Status
         enum class INITSTATUS {
@@ -65,6 +56,9 @@ class BluetoothHelper(
     // Bonded Devices
     val bondedDeviceMap: ConcurrentHashMap<String, BluetoothDevice> = ConcurrentHashMap()
 
+    private var isReleased = false
+    private var isScanning = false
+
     // Scanner
     private val scanner by lazy {
         adapter?.bluetoothLeScanner ?: run {
@@ -78,6 +72,7 @@ class BluetoothHelper(
     @SuppressLint("MissingPermission")
     private val bluetoothEnabled: MutableLiveData<Boolean> = MutableLiveData<Boolean>().apply {
         this.observe(context) {
+            if (isReleased) return@observe
             if (this.value == true) {
                 initStatus.invoke(INITSTATUS.INIT_END)
                 startScan()
@@ -128,6 +123,7 @@ class BluetoothHelper(
     // Permission Result
     val permissionResult: MutableLiveData<Boolean> = MutableLiveData<Boolean>().apply {
         this.observe(context) {
+            if (isReleased) return@observe
             if (it == true) {
                 manager =
                     context.getSystemService(AppCompatActivity.BLUETOOTH_SERVICE) as BluetoothManager
@@ -136,6 +132,8 @@ class BluetoothHelper(
             }
         }
     }
+
+    private var isBluetoothStateReceiverRegistered = false
 
     // Scan Listener
     val scanListener = object : ScanCallback() {
@@ -162,20 +160,36 @@ class BluetoothHelper(
     // check permissions
     fun checkPermissions() {
         initStatus.invoke(INITSTATUS.NotStart)
-        context.requestPermissions(REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
-        context.registerReceiver(
-            bluetoothStateListener,
-            IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
-        )
+        val missingPermissions = AppPermissions.missingRuntimePermissions(context)
+        if (missingPermissions.isEmpty()) {
+            permissionResult.postValue(AppPermissions.hasBluetoothPermissions(context))
+        } else {
+            context.requestPermissions(missingPermissions, REQUEST_CODE_PERMISSIONS)
+        }
+        registerBluetoothStateReceiver()
     }
 
     // Release
     @SuppressLint("MissingPermission")
     fun release() {
-        context.unregisterReceiver(bluetoothStateListener)
+        isReleased = true
+        if (isBluetoothStateReceiverRegistered) {
+            runCatching { context.unregisterReceiver(bluetoothStateListener) }
+            isBluetoothStateReceiverRegistered = false
+        }
         stopScan()
-        permissionResult.postValue(false)
-        bluetoothEnabled.postValue(false)
+    }
+
+    private fun registerBluetoothStateReceiver() {
+        if (isBluetoothStateReceiverRegistered) return
+
+        val filter = IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            context.registerReceiver(bluetoothStateListener, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            context.registerReceiver(bluetoothStateListener, filter)
+        }
+        isBluetoothStateReceiverRegistered = true
     }
 
 
@@ -225,22 +239,12 @@ class BluetoothHelper(
     @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun startScan() {
         scanResultMap.clear()
+        refreshBondedDevices()
         val connectedList = getConnectedDevices()
         for (device in connectedList) {
             device.name?.let {
                 if (isRokidCompanionDevice(it)) {
                     bondedDeviceMap[it] = device
-                    deviceFound.invoke()
-                }
-            }
-        }
-
-        adapter?.bondedDevices?.forEach { d ->
-            d.name?.let {
-                if (isRokidCompanionDevice(it)) {
-                    if (bondedDeviceMap[it] == null) {
-                        bondedDeviceMap[it] = d
-                    }
                     deviceFound.invoke()
                 }
             }
@@ -260,8 +264,36 @@ class BluetoothHelper(
                     .build(),
                 scanListener
             )
+            isScanning = true
         } catch (e: Exception) {
             Toast.makeText(context, "Scan Failed ${e.message}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun refreshBondedDevices() {
+        bondedDeviceMap.clear()
+        adapter?.bondedDevices?.forEach { device ->
+            device.name?.let { name ->
+                if (isRokidCompanionDevice(name)) {
+                    bondedDeviceMap[name] = device
+                }
+            }
+        }
+        if (bondedDeviceMap.isNotEmpty()) {
+            deviceFound.invoke()
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    fun findAuthorizedDevice(address: String?, name: String?): BluetoothDevice? {
+        refreshBondedDevices()
+        return bondedDeviceMap.values.firstOrNull { device ->
+            val addressMatches = !address.isNullOrBlank() &&
+                runCatching { device.address.equals(address, ignoreCase = true) }.getOrDefault(false)
+            val nameMatches = !name.isNullOrBlank() &&
+                runCatching { device.name?.equals(name, ignoreCase = true) == true }.getOrDefault(false)
+            addressMatches || nameMatches
         }
     }
 
@@ -273,7 +305,9 @@ class BluetoothHelper(
     // Stop Scan
     @RequiresPermission(Manifest.permission.BLUETOOTH_SCAN)
     fun stopScan() {
-        scanner.stopScan(scanListener)
+        if (!isScanning) return
+        runCatching { scanner.stopScan(scanListener) }
+        isScanning = false
     }
 
     //  Get Connected Devices

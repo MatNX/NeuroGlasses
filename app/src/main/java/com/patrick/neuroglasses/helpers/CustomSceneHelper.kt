@@ -4,16 +4,16 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
+import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
+import com.example.cxrglobal.callbacks.ICustomViewCbk
 import com.patrick.neuroglasses.R
-import com.rokid.cxr.client.extend.CxrApi
-import com.rokid.cxr.client.extend.listeners.CustomViewListener
-import com.rokid.cxr.client.extend.infos.IconInfo
-import com.rokid.cxr.client.utils.ValueUtil
 import java.io.ByteArrayOutputStream
 import java.io.File
 import androidx.core.graphics.scale
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Custom Scene Helper
@@ -54,6 +54,7 @@ class CustomSceneHelper(
     private var isCustomViewListenerSet = false
     private var mediaPlayer: MediaPlayer? = null
     private var audioFileToPlay: File? = null
+    private var lastVisibleSceneEventMs = 0L
 
     // Icon variables
     private var iconsSent = false
@@ -72,30 +73,36 @@ class CustomSceneHelper(
      */
     fun initializeCustomViewListener() {
         if (!isCustomViewListenerSet) {
-            CxrApi.getInstance().setCustomViewListener(object : CustomViewListener {
-                override fun onIconsSent() {
+            RokidHostConnection.setCustomViewListener(object : ICustomViewCbk {
+                override fun onCustomViewIconsSent() {
                     Log.d(appTag, "Custom view icons sent")
                 }
 
-                override fun onOpened() {
+                override fun onCustomViewOpened() {
                     Log.d(appTag, "Custom view opened")
+                    lastVisibleSceneEventMs = SystemClock.elapsedRealtime()
                     listener?.onSceneOpened()
 
                     // Play audio if available
                     audioFileToPlay?.let { playAudio(it) }
                 }
 
-                override fun onOpenFailed(errorCode: Int) {
-                    Log.e(appTag, "Custom view open failed: $errorCode")
-                    listener?.onSceneOpenFailed(errorCode)
+                override fun onCustomViewError(code: Int, msg: String?) {
+                    if (SystemClock.elapsedRealtime() - lastVisibleSceneEventMs < CUSTOM_VIEW_FALSE_ERROR_GRACE_MS) {
+                        Log.w(appTag, "Ignoring custom view error after visible scene/update: $code $msg")
+                        return
+                    }
+                    Log.e(appTag, "Custom view error: $code $msg")
+                    listener?.onSceneOpenFailed(code)
                 }
 
-                override fun onUpdated() {
+                override fun onCustomViewUpdated() {
                     Log.d(appTag, "Custom view updated")
+                    lastVisibleSceneEventMs = SystemClock.elapsedRealtime()
                     listener?.onSceneUpdated()
                 }
 
-                override fun onClosed() {
+                override fun onCustomViewClosed() {
                     Log.d(appTag, "Custom view closed")
                     listener?.onSceneClosed()
                 }
@@ -180,10 +187,10 @@ class CustomSceneHelper(
      * Send AI icon to glasses
      * @return The status of the request
      */
-    private fun sendAiIcon(): ValueUtil.CxrStatus? {
+    private fun sendAiIcon(): Boolean {
         if (iconsSent) {
             Log.d(appTag, "Icons already sent, skipping")
-            return ValueUtil.CxrStatus.REQUEST_SUCCEED
+            return true
         }
 
         try {
@@ -191,7 +198,7 @@ class CustomSceneHelper(
             val bitmap = BitmapFactory.decodeResource(context.resources, R.drawable.ai_icon_small)
             if (bitmap == null) {
                 Log.e(appTag, "Failed to decode AI icon bitmap")
-                return ValueUtil.CxrStatus.REQUEST_FAILED
+                return false
             }
 
             // Resize bitmap to fit within 128x128 requirement if needed
@@ -213,24 +220,29 @@ class CustomSceneHelper(
 
             if (base64Icon == null) {
                 Log.e(appTag, "Failed to convert bitmap to Base64")
-                return ValueUtil.CxrStatus.REQUEST_FAILED
+                return false
             }
 
-            // Create IconInfo and send to glasses
-            val iconInfo = IconInfo(aiIconName, base64Icon)
-            val status = CxrApi.getInstance().sendCustomViewIcons(listOf(iconInfo))
+            val iconsJson = JSONArray()
+                .put(
+                    JSONObject()
+                        .put("name", aiIconName)
+                        .put("data", base64Icon)
+                )
+                .toString()
+            val success = RokidHostConnection.customViewSetIcons(iconsJson)
 
-            if (status == ValueUtil.CxrStatus.REQUEST_SUCCEED) {
+            if (success) {
                 iconsSent = true
                 Log.i(appTag, "AI icon sent successfully")
             } else {
-                Log.e(appTag, "Failed to send AI icon: $status")
+                Log.e(appTag, "Failed to send AI icon")
             }
 
-            return status
+            return success
         } catch (e: Exception) {
             Log.e(appTag, "Error sending AI icon: ${e.message}", e)
-            return ValueUtil.CxrStatus.REQUEST_FAILED
+            return false
         }
     }
 
@@ -256,16 +268,11 @@ class CustomSceneHelper(
      * @param resultText The text to display
      * @return The status of the request
      */
-    fun displayTextResult(resultText: String): ValueUtil.CxrStatus? {
+    fun displayTextResult(resultText: String): Boolean {
         Log.i(appTag, "Displaying text result: $resultText")
 
-        // Escape quotes in the result text for JSON
-        val escapedText = resultText.replace("\"", "\\\"")
-
-        // Send icon first
-        sendAiIcon()
-
-        // Create custom view JSON using RelativeLayout with icon on top left
+        // Keep the text view clear of the icon area; the Rokid renderer can
+        // overlap RelativeLayout children during rapid streaming updates.
         val customViewData = """
             {
                 "type": "RelativeLayout",
@@ -273,36 +280,24 @@ class CustomSceneHelper(
                     "layout_width": "match_parent",
                     "layout_height": "match_parent",
                     "backgroundColor": "#FF000000",
-                    "paddingStart": "20dp",
-                    "paddingTop": "20dp",
-                    "paddingEnd": "20dp",
-                    "paddingBottom": "20dp"
+                    "paddingStart": "24dp",
+                    "paddingTop": "120dp",
+                    "paddingEnd": "24dp",
+                    "paddingBottom": "24dp"
                 },
                 "children": [
-                    {
-                        "type": "ImageView",
-                        "props": {
-                            "id": "iv_ai_icon",
-                            "layout_width": "48dp",
-                            "layout_height": "48dp",
-                            "name": "$aiIconName",
-                            "scaleType": "center_inside",
-                            "layout_alignParentStart": "true",
-                            "layout_alignParentTop": "true"
-                        }
-                    },
                     {
                         "type": "TextView",
                         "props": {
                             "id": "tv_result",
                             "layout_width": "match_parent",
                             "layout_height": "wrap_content",
-                            "text": "$escapedText",
-                            "textSize": "16sp",
+                            "text": ${JSONObject.quote(resultText)},
+                            "textSize": "17sp",
                             "textColor": "#FF00FF00",
                             "textStyle": "bold",
-                            "layout_below": "iv_ai_icon",
-                            "marginTop": "15dp"
+                            "layout_alignParentStart": "true",
+                            "layout_alignParentTop": "true"
                         }
                     }
                 ]
@@ -310,10 +305,13 @@ class CustomSceneHelper(
         """.trimIndent()
 
         // Open custom UI with result
-        val status = CxrApi.getInstance().openCustomView(customViewData)
-        Log.d(appTag, "Open custom view status: $status")
+        val success = RokidHostConnection.customViewOpen(customViewData)
+        Log.d(appTag, "Open custom view success: $success")
+        if (!success) {
+            Log.w(appTag, "customViewOpen returned false; waiting for callback/update before reporting failure")
+        }
 
-        return status
+        return success
     }
 
     /**
@@ -321,11 +319,8 @@ class CustomSceneHelper(
      * @param newText The new text to display
      * @return The status of the request
      */
-    fun updateTextResult(newText: String): ValueUtil.CxrStatus? {
+    fun updateTextResult(newText: String): Boolean {
         Log.i(appTag, "Updating text result: $newText")
-
-        // Escape quotes in the text for JSON
-        val escapedText = newText.replace("\"", "\\\"")
 
         // Create update JSON
         val updateData = """
@@ -334,27 +329,31 @@ class CustomSceneHelper(
                     "action": "update",
                     "id": "tv_result",
                     "props": {
-                        "text": "$escapedText"
+                        "text": ${JSONObject.quote(newText)}
                     }
                 }
             ]
         """.trimIndent()
 
-        val status = CxrApi.getInstance().updateCustomView(updateData)
-        Log.d(appTag, "Update custom view status: $status")
+        val success = RokidHostConnection.customViewUpdate(updateData)
+        Log.d(appTag, "Update custom view success: $success")
+        if (success) {
+            lastVisibleSceneEventMs = SystemClock.elapsedRealtime()
+        }
 
-        return status
+        return success
     }
 
     /**
      * Close the custom view
      * @return The status of the request
      */
-    fun closeCustomView(): ValueUtil.CxrStatus? {
+    fun closeCustomView(): Boolean {
         Log.d(appTag, "Closing custom view")
-        val status = CxrApi.getInstance().closeCustomView()
-        Log.d(appTag, "Close custom view status: $status")
-        return status
+        lastVisibleSceneEventMs = 0L
+        val success = RokidHostConnection.customViewClose()
+        Log.d(appTag, "Close custom view success: $success")
+        return success
     }
 
     /**
@@ -362,10 +361,14 @@ class CustomSceneHelper(
      */
     fun release() {
         stopAudio()
-        CxrApi.getInstance().setCustomViewListener(null)
+        RokidHostConnection.setCustomViewListener(null)
         listener = null
         isCustomViewListenerSet = false
         audioFileToPlay = null
         Log.d(appTag, "CustomSceneHelper released")
+    }
+
+    private companion object {
+        private const val CUSTOM_VIEW_FALSE_ERROR_GRACE_MS = 1200L
     }
 }
