@@ -2,6 +2,8 @@ package com.patrick.neuroglasses.activities
 
 import android.Manifest
 import android.content.Intent
+import android.net.Uri
+import android.provider.ContactsContract
 import android.util.Log
 import android.bluetooth.BluetoothDevice
 import android.content.pm.PackageManager
@@ -39,6 +41,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var navigateButton: Button
     private lateinit var testUIButton: Button
     private lateinit var scanButton: Button
+    private lateinit var contactsButton: Button
+    private lateinit var callButton: Button
+    private lateinit var smsButton: Button
     private lateinit var deviceListAdapter: ArrayAdapter<String>
     private val deviceList = mutableListOf<String>()
     private val deviceMap = mutableMapOf<String, BluetoothDevice>()
@@ -74,6 +79,9 @@ class MainActivity : AppCompatActivity() {
         navigateButton = findViewById(R.id.navigateButton)
         testUIButton = findViewById(R.id.testUIButton)
         scanButton = findViewById(R.id.scanButton)
+        contactsButton = findViewById(R.id.contactsButton)
+        callButton = findViewById(R.id.callButton)
+        smsButton = findViewById(R.id.smsButton)
 
         // Setup device list adapter
         deviceListAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, deviceList)
@@ -99,6 +107,10 @@ class MainActivity : AppCompatActivity() {
             val intent = Intent(this, SettingsActivity::class.java)
             startActivity(intent)
         }
+
+        contactsButton.setOnClickListener { openContacts() }
+        callButton.setOnClickListener { openDialer() }
+        smsButton.setOnClickListener { openSms() }
 
         // Setup scan button
         scanButton.setOnClickListener {
@@ -142,6 +154,21 @@ class MainActivity : AppCompatActivity() {
 
         // Check permissions
         bluetoothHelper.checkPermissions()
+    }
+
+    private fun openContacts() {
+        val intent = Intent(Intent.ACTION_VIEW, ContactsContract.Contacts.CONTENT_URI)
+        startActivity(intent)
+    }
+
+    private fun openDialer() {
+        val intent = Intent(Intent.ACTION_DIAL, Uri.parse("tel:"))
+        startActivity(intent)
+    }
+
+    private fun openSms() {
+        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:"))
+        startActivity(intent)
     }
 
     override fun onRequestPermissionsResult(

@@ -17,7 +17,7 @@
             android:id="@+id/titleTextView"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="API Configuration"
+            android:text="Groq AI Configuration"
             android:textSize="24sp"
             android:textStyle="bold"
             app:layout_constraintEnd_toEndOf="parent"
@@ -25,12 +25,12 @@
             app:layout_constraintTop_toTopOf="parent"
             android:layout_marginTop="16dp" />
 
-        <!-- API Base URL Section -->
+        <!-- Groq API Base URL Section -->
         <TextView
             android:id="@+id/apiBaseUrlLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="API Base URL"
+            android:text="Groq API Base URL"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="24dp"
@@ -42,19 +42,19 @@
             android:id="@+id/apiBaseUrlEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="https://api.example.com/v1"
+            android:hint="https://api.groq.com/openai/v1"
             android:inputType="textUri"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/apiBaseUrlLabel" />
 
-        <!-- API Token Section -->
+        <!-- Groq API Key Section -->
         <TextView
             android:id="@+id/apiTokenLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="API Token"
+            android:text="Groq API Key"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -66,7 +66,7 @@
             android:id="@+id/apiTokenEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Enter your API token"
+            android:hint="Enter your Groq API key"
             android:inputType="textPassword"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"

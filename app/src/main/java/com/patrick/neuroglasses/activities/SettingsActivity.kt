@@ -25,7 +25,7 @@ class SettingsActivity : AppCompatActivity() {
 
     companion object {
         // SharedPreferences keys
-        const val PREFS_NAME = "OpenAISettings"
+        const val PREFS_NAME = "GroqSettings"
         const val KEY_API_BASE_URL = "api_base_url"
         const val KEY_API_TOKEN = "api_token"
         const val KEY_API_TIMEOUT = "api_timeout"
@@ -37,15 +37,15 @@ class SettingsActivity : AppCompatActivity() {
         const val KEY_TTS_VOICE = "tts_voice"
 
         // Default values
-        const val DEFAULT_API_BASE_URL = "https://api.siliconflow.cn/v1"
+        const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
         const val DEFAULT_API_TIMEOUT = 15
-        const val DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistance, trying to answer user's questions."
-        const val DEFAULT_VLM_MODEL = "Qwen/Qwen3-VL-30B-A3B-Instruct"
+        const val DEFAULT_SYSTEM_PROMPT = "You are a helpful AI assistant for Rokid AR glasses. Keep responses brief and glanceable unless the user asks for detail."
+        const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
         const val DEFAULT_VLM_MAX_TOKENS = 1024
-        const val DEFAULT_ASR_MODEL = "TeleAI/TeleSpeechASR"
-        const val DEFAULT_TTS_MODEL = "FunAudioLLM/CosyVoice2-0.5B"
-        const val DEFAULT_TTS_VOICE = "speech:CozyNeuro:d1jud8rk20jc738kdhng:awfuidogpvwibtwohfca"
+        const val DEFAULT_ASR_MODEL = "whisper-large-v3"
+        const val DEFAULT_TTS_MODEL = "playai-tts"
+        const val DEFAULT_TTS_VOICE = "Arista-PlayAI"
 
         // Helper functions to get configuration values
         fun getApiBaseUrl(context: Context): String {
@@ -146,7 +146,7 @@ class SettingsActivity : AppCompatActivity() {
             // Validate and save API base URL
             val apiBaseUrl = apiBaseUrlEditText.text.toString().trim()
             if (apiBaseUrl.isEmpty()) {
-                Toast.makeText(this, "API Base URL cannot be empty", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Groq API Base URL cannot be empty", Toast.LENGTH_SHORT).show()
                 return
             }
             editor.putString(KEY_API_BASE_URL, apiBaseUrl)

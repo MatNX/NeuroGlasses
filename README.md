@@ -26,7 +26,7 @@ NeuroGlasses is an Android app that bridges the gap between AR glasses and vario
 ### Current Limitations
 
 - No chat history support (yet). But this can be implemented in the middleware with Python, with langchain, NeuroAPI integration and other advanced Agentic features
-- Experimental Rokid CRX_M SDK requires re-pairing glasses on each disconnect
+- Rokid CRX_M connection stability is still SDK-dependent, but the app now prefers existing Hi Rokid-authorized bonds before scanning
 - I can't touch the glasses' own OS directly with that SDK. To achieve more customization and better UX I need to apply for a 5-pin dev wire from Rokid, don't have that time now.
 
 ## Requirements
@@ -34,7 +34,7 @@ NeuroGlasses is an Android app that bridges the gap between AR glasses and vario
 - **Android Studio** (latest version recommended)
 - **Android Device** with API level 30 or higher (tested on Galaxy Tab S8 with API 35)
 - **Rokid Glasses** (the ones with green HUD)
-- **OpenAI-compatible API** (e.g., OpenAI, SiliconFlow, etc.)
+- **Groq API key** for chat, vision, ASR, and TTS through Groq's OpenAI-compatible endpoints
 
 ## Installation Guide
 
@@ -58,21 +58,21 @@ NeuroGlasses is an Android app that bridges the gap between AR glasses and vario
 1. Open the NeuroGlasses app on your device
 2. Grant all requested permissions (bluetooth, fine location (required by glasses' SDK, not the app itself)
 
-### Step 3: Pair the Glasses
+### Step 3: Authorize the Glasses
 
-1. **Fold the left leg** of your Rokid glasses
-2. **Click the button on the right leg 3 times** to enter pairing mode
-3. Complete the Bluetooth pairing process on your Android device
+1. Pair and authorize the glasses once in the **Hi Rokid** app.
+2. Open NeuroGlasses and tap **Scan for Devices**.
+3. Select the already-authorized Rokid device from the bonded/available list and connect.
 
-> **Important:** Due to the experimental nature of the glasses' SDK, you need to unpair and re-pair the device every time you disconnect it from the app to ensure correct behavior
+NeuroGlasses now reuses the Hi Rokid-authorized Bluetooth bond, so you should not need to unpair and re-pair the glasses for normal reconnects.
 
 ### Step 4: Configure API Settings
 
 1. In the NeuroGlasses app, navigate to the **Settings** page
-2. Fill in your OpenAI-compatible API information:
-   - **API Base URL** (e.g., `https://api.siliconflow.cn/v1` for SiliconFlow)
-   - **API Key**
-   - **Model names** for VLM ASR, and TTS
+2. Fill in your Groq API information:
+   - **Groq API Base URL** (default: `https://api.groq.com/openai/v1`)
+   - **Groq API Key**
+   - **Model names** for VLM/chat, ASR, and TTS
 3. Configure optional settings:
    - TTS voice selection (Note: this should be left empty for some models, but must be filled for others)
    - Streaming chunk size
@@ -107,11 +107,11 @@ If not using ASR, you can manage predefined instructions:
 
 ## API Compatibility
 
-The app is designed to work with OpenAI-compatible APIs. It has been tested with SiliconFlow platform. Other OpenAI-compatible providers should work, but may require adjustments.
+The app defaults to Groq through Groq's OpenAI-compatible API (`https://api.groq.com/openai/v1`). Chat/vision, ASR, and TTS model names are configurable in Settings.
 
 > Check TTS's "voice" (this field means "reference audio" for Siliconflow) setting carefully if you are use other providers, because a mis-configured "voice" will likely gives empty results but with code 200. 
 
-> Also, the VLM used here is Qwen3VL, other VLs may have different API payload structure, check them and implement your own middleware for API translation if necesary.
+> The default VLM/chat model is a Groq-hosted Llama vision model. Other providers or models may have different payload requirements, so check them and implement your own middleware for API translation if necessary.
 
 ## Technical Architecture
 
@@ -152,7 +152,7 @@ app/src/main/java/com/patrick/neuroglasses/
     ├── AICameraHelper.kt        # Camera capture
     ├── AudioHelper.kt           # Audio recording
     ├── CustomSceneHelper.kt     # HUD display management
-    ├── OpenAIHelper.kt          # API client with streaming
+    ├── OpenAIHelper.kt          # Groq OpenAI-compatible API client with streaming
     └── StreamingAudioPlayer.kt  # Real-time audio playback
 ```
 
@@ -183,5 +183,9 @@ This is an experimental project. Contributions, bug reports, and feature request
 
 - Built with [Rokid AR Glasses SDK](https://ar.rokid.com/). I left some translations of Chinese docs from Rokid's website as Markdown in repo root.
 - App launch icon modified based on Neuro-sama Headquarters' sticker.
+
+### Phone Companion Functions
+
+The main screen includes basic companion shortcuts for **Contacts**, **Call**, and **SMS**. They launch Android's built-in contacts, dialer, and messaging flows so the phone handles account sync, SIM selection, and final user confirmation.
 
 **⚠️ Experimental Software Notice:** This application is in active development and uses experimental SDK features. Expect bugs, crashes, and frequent updates.
