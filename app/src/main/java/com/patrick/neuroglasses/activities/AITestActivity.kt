@@ -90,7 +90,7 @@ class AITestActivity : AppCompatActivity() {
         // Setup listeners
         setupListeners()
 
-        updateStatus("Ready. Press AI key on glasses to start.")
+        updateStatus("Bereit. Drücke die KI-Taste an der Brille.")
     }
 
     private fun initializeViews() {
@@ -130,15 +130,15 @@ class AITestActivity : AppCompatActivity() {
                     showProcessingUI(true)
                     capturedImageView.setImageBitmap(bitmap)
                     capturedImageView.visibility = View.VISIBLE
-                    updateProcessingStatus("Image captured: ${width}x${height}")
+                    updateProcessingStatus("Bild aufgenommen: ${width}x${height}")
                     Log.i(appTag, "Photo captured successfully: ${width}x${height}, $dataSize bytes")
                 }
             }
 
             override fun onPhotoFailed(message: String) {
                 runOnUiThread {
-                    updateProcessingStatus("Image capture failed: $message")
-                    Toast.makeText(this@AITestActivity, "Failed to capture image", Toast.LENGTH_SHORT).show()
+                    updateProcessingStatus("Bildaufnahme fehlgeschlagen: $message")
+                    Toast.makeText(this@AITestActivity, "Bildaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Photo capture failed: $message")
                 }
             }
@@ -153,7 +153,7 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onAudioDataReceived(chunkSize: Int, totalChunks: Int, totalBytes: Long) {
                 runOnUiThread {
-                    updateProcessingStatus("Recording audio: ${totalBytes / 1024} KB")
+                    updateProcessingStatus("Audioaufnahme: ${totalBytes / 1024} KB")
                 }
             }
 
@@ -163,9 +163,9 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onAudioRecordingFailed(message: String) {
                 runOnUiThread {
-                    updateProcessingStatus("Audio recording failed: $message")
-                    Toast.makeText(this@AITestActivity, "Audio recording failed", Toast.LENGTH_SHORT).show()
-                    Log.e(appTag, "Audio recording failed: $message")
+                    updateProcessingStatus("Audioaufnahme fehlgeschlagen: $message")
+                    Toast.makeText(this@AITestActivity, "Audioaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
+                    Log.e(appTag, "Audioaufnahme fehlgeschlagen: $message")
                 }
             }
 
@@ -173,13 +173,13 @@ class AITestActivity : AppCompatActivity() {
                 runOnUiThread {
                     if (savedFilePath != null) {
                         recordedAudioFile = File(savedFilePath)
-                        updateProcessingStatus("Audio saved: ${recordedAudioFile?.name}")
+                        updateProcessingStatus("Audio gespeichert: ${recordedAudioFile?.name}")
                         Log.i(appTag, "Audio recording saved: $savedFilePath")
 
                         // Process the request now that audio is ready
                         processAiRequest()
                     } else {
-                        updateProcessingStatus("No audio recorded")
+                        updateProcessingStatus("Kein Audio aufgenommen")
                         Log.w(appTag, "No audio data recorded")
                         // Still process request even without audio
                         processAiRequest()
@@ -200,7 +200,7 @@ class AITestActivity : AppCompatActivity() {
         openAIHelper.setListener(object : OpenAIHelper.OpenAIListener {
             override fun onAsrComplete(text: String) {
                 runOnUiThread {
-                    updateProcessingStatus("ASR result: $text")
+                    updateProcessingStatus("Spracherkennung: $text")
                     Log.i(appTag, "ASR completed: $text")
                     // Call OpenAI with ASR text (using streaming)
                     sendToOpenAI(text)
@@ -209,15 +209,15 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onAsrFailed(error: String) {
                 runOnUiThread {
-                    updateProcessingStatus("ASR failed: $error")
-                    Toast.makeText(this@AITestActivity, "ASR failed: $error", Toast.LENGTH_SHORT).show()
-                    Log.e(appTag, "ASR failed: $error")
+                    updateProcessingStatus("Spracherkennung fehlgeschlagen: $error")
+                    Toast.makeText(this@AITestActivity, "Spracherkennung fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
+                    Log.e(appTag, "Spracherkennung fehlgeschlagen: $error")
                 }
             }
 
             override fun onOpenAIStreamingStarted() {
                 runOnUiThread {
-                    updateProcessingStatus("Streaming started...")
+                    updateProcessingStatus("Antwort-Streaming gestartet…")
                     Log.i(appTag, "OpenAI streaming started")
                     isStreaming = true
                     streamingBuffer.clear()
@@ -259,16 +259,16 @@ class AITestActivity : AppCompatActivity() {
                     }
 
                     if (isComplete) {
-                        Log.i(appTag, "Streaming completed")
+                        Log.i(appTag, "Streaming abgeschlossen")
                         isStreaming = false
-                        updateProcessingStatus("Streaming completed")
+                        updateProcessingStatus("Streaming abgeschlossen")
                     }
                 }
             }
 
             override fun onOpenAIResponse(response: String) {
                 runOnUiThread {
-                    updateProcessingStatus("AI response received")
+                    updateProcessingStatus("KI-Antwort erhalten")
                     Log.i(appTag, "OpenAI response: $response")
 
                     // Store the response
@@ -277,7 +277,7 @@ class AITestActivity : AppCompatActivity() {
                     // Check if TTS is enabled and streaming is complete
                     if (useTtsCheckBox.isChecked && !isStreaming) {
                         // Convert response to speech
-                        updateProcessingStatus("Converting to speech...")
+                        updateProcessingStatus("Wandle in Sprache um…")
                         val audioDir = getExternalFilesDir("tts_audio") ?: filesDir
                         openAIHelper.callTtsAPI(response, audioDir)
                     }
@@ -288,10 +288,10 @@ class AITestActivity : AppCompatActivity() {
                 return when (toolName) {
                     "snap_glasses_photo" -> {
                         runOnUiThread {
-                            updateProcessingStatus("Taking glasses photo...")
+                            updateProcessingStatus("Brillenfoto wird aufgenommen…")
                             aiCameraHelper.takePhoto()
                         }
-                        "Started a hands-free photo capture with the Rokid glasses camera. Use the captured image for the next AI request once it arrives."
+                        "Freihändige Fotoaufnahme mit der Rokid-Brillenkamera gestartet. Verwende das Bild für die nächste KI-Anfrage, sobald es verfügbar ist."
                     }
                     else -> null
                 }
@@ -299,16 +299,16 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onOpenAIFailed(error: String) {
                 runOnUiThread {
-                    updateProcessingStatus("OpenAI failed: $error")
-                    Toast.makeText(this@AITestActivity, "OpenAI failed: $error", Toast.LENGTH_SHORT).show()
-                    Log.e(appTag, "OpenAI failed: $error")
+                    updateProcessingStatus("KI-Anfrage fehlgeschlagen: $error")
+                    Toast.makeText(this@AITestActivity, "KI-Anfrage fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
+                    Log.e(appTag, "KI-Anfrage fehlgeschlagen: $error")
                     isStreaming = false
                 }
             }
 
             override fun onTtsComplete(audioFile: File) {
                 runOnUiThread {
-                    updateProcessingStatus("Speech generated successfully")
+                    updateProcessingStatus("Sprachausgabe erzeugt")
                     Log.i(appTag, "TTS complete: ${audioFile.absolutePath}")
 
                     // Set audio file in custom scene helper for potential later use
@@ -322,14 +322,14 @@ class AITestActivity : AppCompatActivity() {
             override fun onTtsFailed(error: String) {
                 runOnUiThread {
                     updateProcessingStatus("TTS failed: $error")
-                    Toast.makeText(this@AITestActivity, "Speech generation failed: $error", Toast.LENGTH_SHORT).show()
+                    Toast.makeText(this@AITestActivity, "Sprachausgabe fehlgeschlagen: $error", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "TTS failed: $error")
                 }
             }
 
             override fun onTtsStreamingStarted() {
                 runOnUiThread {
-                    updateProcessingStatus("Streaming audio generation started...")
+                    updateProcessingStatus("Audio-Streaming gestartet…")
                     Log.i(appTag, "TTS streaming started")
 
                     // Initialize streaming audio player
@@ -348,7 +348,7 @@ class AITestActivity : AppCompatActivity() {
                     if (isComplete) {
                         // Finalize streaming
                         streamingAudioPlayer.finalizeStreaming()
-                        updateProcessingStatus("Audio streaming completed")
+                        updateProcessingStatus("Audio-Streaming abgeschlossen")
                         Log.i(appTag, "TTS streaming finalized")
                     }
                 }
@@ -360,15 +360,15 @@ class AITestActivity : AppCompatActivity() {
         customSceneHelper.setListener(object : CustomSceneHelper.CustomSceneListener {
             override fun onSceneOpened() {
                 runOnUiThread {
-                    updateProcessingStatus("Result displayed on glasses")
-                    Toast.makeText(this@AITestActivity, "Result displayed on glasses", Toast.LENGTH_SHORT).show()
+                    updateProcessingStatus("Ergebnis auf der Brille angezeigt")
+                    Toast.makeText(this@AITestActivity, "Ergebnis auf der Brille angezeigt", Toast.LENGTH_SHORT).show()
                 }
             }
 
             override fun onSceneOpenFailed(errorCode: Int) {
                 runOnUiThread {
-                    updateProcessingStatus("Failed to display on glasses: $errorCode")
-                    Toast.makeText(this@AITestActivity, "Failed to display on glasses: $errorCode", Toast.LENGTH_LONG).show()
+                    updateProcessingStatus("Anzeige auf der Brille fehlgeschlagen: $errorCode")
+                    Toast.makeText(this@AITestActivity, "Anzeige auf der Brille fehlgeschlagen: $errorCode", Toast.LENGTH_LONG).show()
                 }
             }
 
@@ -391,22 +391,22 @@ class AITestActivity : AppCompatActivity() {
         streamingAudioPlayer.setListener(object : StreamingAudioPlayer.PlaybackListener {
             override fun onPlaybackStarted() {
                 runOnUiThread {
-                    updateProcessingStatus("Audio playback started")
+                    updateProcessingStatus("Audiowiedergabe gestartet")
                     Log.i(appTag, "Streaming audio playback started")
                 }
             }
 
             override fun onPlaybackCompleted() {
                 runOnUiThread {
-                    updateProcessingStatus("Audio playback completed")
+                    updateProcessingStatus("Audiowiedergabe abgeschlossen")
                     Log.i(appTag, "Streaming audio playback completed")
                 }
             }
 
             override fun onPlaybackError(error: String) {
                 runOnUiThread {
-                    updateProcessingStatus("Audio playback error: $error")
-                    Toast.makeText(this@AITestActivity, "Audio playback error: $error", Toast.LENGTH_SHORT).show()
+                    updateProcessingStatus("Audiowiedergabe-Fehler: $error")
+                    Toast.makeText(this@AITestActivity, "Audiowiedergabe-Fehler: $error", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Streaming audio playback error: $error")
                 }
             }
@@ -415,10 +415,10 @@ class AITestActivity : AppCompatActivity() {
 
     private fun setupInstructions() {
         // Add some default instructions
-        predefinedInstructions.add("What do you see in this image?")
-        predefinedInstructions.add("Describe the scene")
-        predefinedInstructions.add("Identify objects in the image")
-        predefinedInstructions.add("Translate the text in this image")
+        predefinedInstructions.add("Was siehst du auf diesem Bild?")
+        predefinedInstructions.add("Beschreibe die Szene")
+        predefinedInstructions.add("Erkenne Objekte im Bild")
+        predefinedInstructions.add("Übersetze den Text in diesem Bild ins Deutsche")
 
         // Setup adapter
         instructionsAdapter = ArrayAdapter(
@@ -443,9 +443,9 @@ class AITestActivity : AppCompatActivity() {
                 predefinedInstructions.add(newInstruction)
                 instructionsAdapter.notifyDataSetChanged()
                 newInstructionEditText.text.clear()
-                Toast.makeText(this, "Instruction added", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Anweisung hinzugefügt", Toast.LENGTH_SHORT).show()
             } else {
-                Toast.makeText(this, "Please enter an instruction", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Bitte eine Anweisung eingeben", Toast.LENGTH_SHORT).show()
             }
         }
 
@@ -488,7 +488,7 @@ class AITestActivity : AppCompatActivity() {
      * This starts the AI request process
      */
     private fun onAiKeyPressed() {
-        updateStatus("Processing AI request...")
+        updateStatus("KI-Anfrage wird verarbeitet…")
         showProcessingUI(true)
 
         // Stop any ongoing audio playback from previous request
@@ -505,10 +505,10 @@ class AITestActivity : AppCompatActivity() {
 
         // Capture image if configured
         if (includeImageCheckBox.isChecked) {
-            updateProcessingStatus("Capturing image...")
+            updateProcessingStatus("Bild wird aufgenommen…")
             aiCameraHelper.takePhoto()
         } else {
-            updateProcessingStatus("Skipping image capture (not enabled)")
+            updateProcessingStatus("Bildaufnahme übersprungen (nicht aktiviert)")
         }
     }
 
@@ -547,7 +547,7 @@ class AITestActivity : AppCompatActivity() {
         updateProcessingStatus("Processing voice with ASR...")
 
         if (recordedAudioFile == null) {
-            Toast.makeText(this, "No audio recorded", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Kein Audio aufgenommen", Toast.LENGTH_SHORT).show()
             updateProcessingStatus("Error: No audio available")
             return
         }
@@ -608,7 +608,7 @@ class AITestActivity : AppCompatActivity() {
 
         // Display the full result text directly
         customSceneHelper.displayTextResult(resultText)
-        Log.d(appTag, "Result displayed on glasses")
+        Log.d(appTag, "Ergebnis auf der Brille angezeigt")
     }
 
     /**

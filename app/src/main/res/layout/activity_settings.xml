@@ -17,7 +17,7 @@
             android:id="@+id/titleTextView"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="Groq AI Configuration"
+            android:text="Groq AI Konfiguration"
             android:textSize="24sp"
             android:textStyle="bold"
             app:layout_constraintEnd_toEndOf="parent"
@@ -25,12 +25,12 @@
             app:layout_constraintTop_toTopOf="parent"
             android:layout_marginTop="16dp" />
 
-        <!-- Groq API Base URL Section -->
+        <!-- Groq API-Basis-URL Section -->
         <TextView
             android:id="@+id/apiBaseUrlLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Groq API Base URL"
+            android:text="Groq API-Basis-URL"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="24dp"
@@ -49,12 +49,12 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/apiBaseUrlLabel" />
 
-        <!-- Groq API Key Section -->
+        <!-- Groq API-Schlüssel Section -->
         <TextView
             android:id="@+id/apiTokenLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Groq API Key"
+            android:text="Groq API-Schlüssel"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -66,19 +66,19 @@
             android:id="@+id/apiTokenEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Enter your Groq API key"
+            android:hint="Groq-API-Schlüssel eingeben"
             android:inputType="textPassword"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/apiTokenLabel" />
 
-        <!-- API Timeout Section -->
+        <!-- API-Timeout Section -->
         <TextView
             android:id="@+id/apiTimeoutLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="API Timeout (seconds)"
+            android:text="API-Timeout (Sekunden)"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -97,12 +97,12 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/apiTimeoutLabel" />
 
-        <!-- System Prompt Section -->
+        <!-- System-Prompt Section -->
         <TextView
             android:id="@+id/systemPromptLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="System Prompt"
+            android:text="System-Prompt"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -114,7 +114,7 @@
             android:id="@+id/systemPromptEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="System prompt for AI assistant"
+            android:hint="System-Prompt für den KI-Assistenten"
             android:inputType="textMultiLine"
             android:minLines="3"
             android:gravity="top"
@@ -123,12 +123,12 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/systemPromptLabel" />
 
-        <!-- VLM Model Section -->
+        <!-- VLM-Modell Section -->
         <TextView
             android:id="@+id/vlmModelLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="VLM Model"
+            android:text="VLM-Modell"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -140,19 +140,19 @@
             android:id="@+id/vlmModelEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Model name for vision language"
+            android:hint="Modellname für Bild-/Sprachmodell"
             android:inputType="text"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/vlmModelLabel" />
 
-        <!-- VLM Max Tokens Section -->
+        <!-- Maximale VLM-Tokens Section -->
         <TextView
             android:id="@+id/vlmMaxTokensLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="VLM Max Tokens"
+            android:text="Maximale VLM-Tokens"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -171,12 +171,12 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/vlmMaxTokensLabel" />
 
-        <!-- ASR Model Section -->
+        <!-- STT/ASR-Modell Section -->
         <TextView
             android:id="@+id/asrModelLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="ASR Model"
+            android:text="STT/ASR-Modell"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -188,19 +188,19 @@
             android:id="@+id/asrModelEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Model name for speech recognition"
+            android:hint="Modellname für Spracherkennung"
             android:inputType="text"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/asrModelLabel" />
 
-        <!-- TTS Model Section -->
+        <!-- TTS-Modell Section -->
         <TextView
             android:id="@+id/ttsModelLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="TTS Model"
+            android:text="TTS-Modell"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -212,19 +212,19 @@
             android:id="@+id/ttsModelEditText"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Model name for text-to-speech"
+            android:hint="Modellname für Text-to-Speech"
             android:inputType="text"
             android:minHeight="48dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/ttsModelLabel" />
 
-        <!-- TTS Voice Section -->
+        <!-- TTS-Stimme Section -->
         <TextView
             android:id="@+id/ttsVoiceLabel"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="TTS Voice"
+            android:text="TTS-Stimme"
             android:textSize="16sp"
             android:textStyle="bold"
             android:layout_marginTop="16dp"
@@ -248,7 +248,7 @@
             android:id="@+id/saveButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Save Settings"
+            android:text="Save Einstellungen"
             android:textSize="16sp"
             android:layout_marginTop="24dp"
             android:layout_marginEnd="8dp"
@@ -260,7 +260,7 @@
             android:id="@+id/resetButton"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:text="Reset to Defaults"
+            android:text="Auf Standardwerte zurücksetzen"
             android:textSize="16sp"
             android:layout_marginTop="24dp"
             android:layout_marginStart="8dp"

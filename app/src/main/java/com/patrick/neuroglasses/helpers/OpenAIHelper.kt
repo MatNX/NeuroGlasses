@@ -5,6 +5,8 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.provider.AlarmClock
+import android.provider.CalendarContract
+import android.provider.Settings
 import android.provider.ContactsContract
 import android.telephony.SmsManager
 import android.location.LocationManager
@@ -24,6 +26,7 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
+import java.util.Locale
 
 /**
  * Data classes for OpenAI API request/response
@@ -260,6 +263,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val requestBody = MultipartBody.Builder()
                     .setType(MultipartBody.FORM)
                     .addFormDataPart("model", getAsrModel())
+                    .addFormDataPart("language", "de")
+                    .addFormDataPart("prompt", "Dies ist eine deutschsprachige Sprachsteuerung für eine AR-Brille in Österreich.")
                     .addFormDataPart(
                         "file",
                         audioFile.name,
@@ -391,8 +396,48 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
+                name = "create_calendar_event",
+                description = "Deutschsprachig: Lege einen Kalendertermin per Sprache an. Nutze ISO-ähnliche Zeiten, wenn möglich.",
+                parameters = objectSchema(listOf("title"), mapOf(
+                    "title" to stringProp("Titel des Termins."),
+                    "start" to stringProp("Optionale Startzeit als Text, z. B. 2026-06-22 14:30."),
+                    "end" to stringProp("Optionale Endzeit als Text."),
+                    "location" to stringProp("Optionaler Ort."),
+                    "notes" to stringProp("Optionale Notizen.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "send_email",
+                description = "Deutschsprachig: Öffne eine E-Mail mit Empfänger, Betreff und Text, damit der Nutzer sie sprachgeführt versenden kann.",
+                parameters = objectSchema(listOf("to", "subject", "body"), mapOf(
+                    "to" to stringProp("E-Mail-Adresse des Empfängers."),
+                    "subject" to stringProp("Betreff."),
+                    "body" to stringProp("Nachrichtentext.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "open_app",
+                description = "Deutschsprachig: Öffne eine installierte App anhand von Paketname oder bekanntem App-Namen.",
+                parameters = objectSchema(listOf("app"), mapOf("app" to stringProp("Paketname oder App-Name, z. B. Maps, WhatsApp, Kalender.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "share_text",
+                description = "Deutschsprachig: Teile oder diktiere Text über den Android-Teilen-Dialog.",
+                parameters = objectSchema(listOf("text"), mapOf("text" to stringProp("Zu teilender Text.")))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "get_battery_status",
+                description = "Deutschsprachig: Lies den Akkustand und Ladezustand des Telefons aus.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "open_accessibility_settings",
+                description = "Deutschsprachig: Öffne Bedienungshilfen, falls der Nutzer Freisprech- oder Barrierefreiheitsrechte einrichten will.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
                 name = "snap_glasses_photo",
-                description = "Take a picture with the Rokid glasses camera for hands-free visual context. The activity handles this tool.",
+                description = "Deutschsprachig: Mache freihändig ein Foto mit der Rokid-Brillenkamera als visuellen Kontext. Die Activity verarbeitet dieses Tool.",
                 parameters = objectSchema(emptyList(), emptyMap())
             ))
         )
@@ -417,6 +462,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "set_timer" -> setTimer(arg("seconds").toIntOrNull() ?: 0, arg("label"))
             "create_reminder" -> createReminder(arg("text"), arg("when"))
             "list_reminders" -> listReminders()
+            "create_calendar_event" -> createCalendarEvent(arg("title"), arg("start"), arg("end"), arg("location"), arg("notes"))
+            "send_email" -> sendEmail(arg("to"), arg("subject"), arg("body"))
+            "open_app" -> openApp(arg("app"))
+            "share_text" -> shareText(arg("text"))
+            "get_battery_status" -> getBatteryStatus()
+            "open_accessibility_settings" -> launchIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), "Bedienungshilfen")
             else -> "Unknown tool: ${toolCall.function.name}"
         }
     }
@@ -570,6 +621,60 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (reminders.isEmpty()) "No reminders saved." else reminders.joinToString("\n")
     }
 
+    private fun sendEmail(to: String, subject: String, body: String): String {
+        if (to.isBlank()) return "Ich brauche eine E-Mail-Adresse."
+        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:${Uri.encode(to)}"))
+            .putExtra(Intent.EXTRA_SUBJECT, subject)
+            .putExtra(Intent.EXTRA_TEXT, body)
+        return launchIntent(intent, "E-Mail-Entwurf")
+    }
+
+    private fun openApp(app: String): String {
+        if (app.isBlank()) return "Ich brauche einen App-Namen."
+        val normalized = app.lowercase(Locale.ROOT)
+        val aliases = mapOf(
+            "maps" to "com.google.android.apps.maps",
+            "google maps" to "com.google.android.apps.maps",
+            "whatsapp" to "com.whatsapp",
+            "kalender" to "com.google.android.calendar",
+            "calendar" to "com.google.android.calendar",
+            "youtube" to "com.google.android.youtube",
+            "gmail" to "com.google.android.gm"
+        )
+        val packageName = aliases[normalized] ?: app
+        val intent = context.packageManager.getLaunchIntentForPackage(packageName)
+            ?: return "Ich konnte $app auf diesem Telefon nicht finden."
+        return launchIntent(intent, app)
+    }
+
+    private fun shareText(text: String): String {
+        if (text.isBlank()) return "Ich brauche Text zum Teilen."
+        val sendIntent = Intent(Intent.ACTION_SEND)
+            .setType("text/plain")
+            .putExtra(Intent.EXTRA_TEXT, text)
+        return launchIntent(Intent.createChooser(sendIntent, "Text teilen"), "Teilen")
+    }
+
+    private fun getBatteryStatus(): String {
+        val batteryIntent = context.registerReceiver(null, android.content.IntentFilter(Intent.ACTION_BATTERY_CHANGED))
+        val level = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_LEVEL, -1) ?: -1
+        val scale = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_SCALE, -1) ?: -1
+        val status = batteryIntent?.getIntExtra(android.os.BatteryManager.EXTRA_STATUS, -1) ?: -1
+        val percent = if (level >= 0 && scale > 0) (level * 100 / scale) else -1
+        val charging = status == android.os.BatteryManager.BATTERY_STATUS_CHARGING || status == android.os.BatteryManager.BATTERY_STATUS_FULL
+        return if (percent >= 0) "Akkustand: $percent%, lädt: ${if (charging) "ja" else "nein"}." else "Akkustand ist nicht verfügbar."
+    }
+
+    private fun createCalendarEvent(title: String, start: String, end: String, location: String, notes: String): String {
+        if (title.isBlank()) return "Ich brauche einen Termintitel."
+        val intent = Intent(Intent.ACTION_INSERT)
+            .setData(CalendarContract.Events.CONTENT_URI)
+            .putExtra(CalendarContract.Events.TITLE, title)
+            .putExtra(CalendarContract.Events.EVENT_LOCATION, location)
+            .putExtra(CalendarContract.Events.DESCRIPTION, listOf(notes, start.takeIf { it.isNotBlank() }?.let { "Start: $it" }, end.takeIf { it.isNotBlank() }?.let { "Ende: $it" }).filterNotNull().joinToString("\n"))
+        return launchIntent(intent, "Kalendertermin")
+    }
+
     /**
      * Call OpenAI API for chat completion with streaming
      * @param instruction The user instruction/prompt
@@ -604,7 +709,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt()
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze die verfügbaren Tools proaktiv, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn für Aktionen wie Anruf, SMS, Navigation, Kalender oder E-Mail wichtige Angaben fehlen."
                 messagesList.add(
                     Message(
                         role = "system",
