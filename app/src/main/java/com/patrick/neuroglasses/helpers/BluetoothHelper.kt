@@ -228,7 +228,7 @@ class BluetoothHelper(
         val connectedList = getConnectedDevices()
         for (device in connectedList) {
             device.name?.let {
-                if (it.contains("Glasses", false)) {
+                if (isRokidCompanionDevice(it)) {
                     bondedDeviceMap[it] = device
                     deviceFound.invoke()
                 }
@@ -237,12 +237,12 @@ class BluetoothHelper(
 
         adapter?.bondedDevices?.forEach { d ->
             d.name?.let {
-                if (it.contains("Glasses", false)) {
+                if (isRokidCompanionDevice(it)) {
                     if (bondedDeviceMap[it] == null) {
                         bondedDeviceMap[it] = d
                     }
+                    deviceFound.invoke()
                 }
-                deviceFound.invoke()
             }
         }
 
@@ -251,13 +251,23 @@ class BluetoothHelper(
                 listOf<ScanFilter>(
                     ScanFilter.Builder()
                         .setServiceUuid(ParcelUuid.fromString("00009100-0000-1000-8000-00805f9b34fb"))//Rokid Glasses Service
+                        .build(),
+                    ScanFilter.Builder()
+                        .setDeviceName("Rokid")
                         .build()
-                ), ScanSettings.Builder().build(),
+                ), ScanSettings.Builder()
+                    .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                    .build(),
                 scanListener
             )
         } catch (e: Exception) {
             Toast.makeText(context, "Scan Failed ${e.message}", Toast.LENGTH_SHORT).show()
         }
+    }
+
+    private fun isRokidCompanionDevice(name: String): Boolean {
+        val companionNames = listOf("Rokid", "Glasses", "Air", "Max", "AR")
+        return companionNames.any { name.contains(it, ignoreCase = true) }
     }
 
     // Stop Scan

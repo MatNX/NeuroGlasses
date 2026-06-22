@@ -79,7 +79,7 @@ data class TtsRequest(
 )
 
 /**
- * OpenAI Helper
+ * Groq AI Helper
  * Handles AI-related API calls including ASR (speech-to-text) and OpenAI chat completion
  */
 class OpenAIHelper(private val context: Context, private val appTag: String = "OpenAIHelper") {
@@ -87,7 +87,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private val gson = Gson()
 
     // Get configuration from SharedPreferences
-    private fun getApiBaseUrl(): String = SettingsActivity.getApiBaseUrl(context)
+    private fun getApiBaseUrl(): String = SettingsActivity.getApiBaseUrl(context).trimEnd('/')
     private fun getApiToken(): String = SettingsActivity.getApiToken(context)
     private fun getApiTimeout(): Int = SettingsActivity.getApiTimeout(context)
     private fun getSystemPrompt(): String = SettingsActivity.getSystemPrompt(context)
