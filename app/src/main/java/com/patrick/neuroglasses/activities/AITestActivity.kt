@@ -284,6 +284,19 @@ class AITestActivity : AppCompatActivity() {
                 }
             }
 
+            override fun onAssistantToolCall(toolName: String, arguments: Map<String, String>): String? {
+                return when (toolName) {
+                    "snap_glasses_photo" -> {
+                        runOnUiThread {
+                            updateProcessingStatus("Taking glasses photo...")
+                            aiCameraHelper.takePhoto()
+                        }
+                        "Started a hands-free photo capture with the Rokid glasses camera. Use the captured image for the next AI request once it arrives."
+                    }
+                    else -> null
+                }
+            }
+
             override fun onOpenAIFailed(error: String) {
                 runOnUiThread {
                     updateProcessingStatus("OpenAI failed: $error")
