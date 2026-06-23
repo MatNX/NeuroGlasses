@@ -71,6 +71,7 @@ class AITestActivity : AppCompatActivity() {
     private var imageCaptureRequested = false
     private var imageCaptureFinished = true
     private var pendingInstruction: String? = null
+    private var pendingInstructionNeedsImage = false
 
     // Streaming state
     private var streamingBuffer = StringBuilder()
@@ -622,7 +623,21 @@ class AITestActivity : AppCompatActivity() {
      * Send request to OpenAI with instruction and optional image
      */
     private fun sendToOpenAI(instruction: String) {
+        if (shouldEndConversation(instruction)) {
+            endConversationPolitely()
+            return
+        }
+
         pendingInstruction = instruction
+        pendingInstructionNeedsImage = shouldCaptureImageForIntent(instruction)
+
+        if (pendingInstructionNeedsImage && imageCaptureFinished) {
+            imageCaptureRequested = true
+            imageCaptureFinished = false
+            updateProcessingStatus("Bild wird für deine Frage aufgenommen…")
+            aiCameraHelper.takePhoto()
+        }
+
         sendPendingInstructionIfReady()
     }
 
@@ -634,14 +649,53 @@ class AITestActivity : AppCompatActivity() {
             return
         }
 
+        val shouldSendImage = pendingInstructionNeedsImage || includeImageCheckBox.isChecked
+        val hasImage = capturedImage != null && shouldSendImage
         pendingInstruction = null
-        updateProcessingStatus("Sende an KI${if (capturedImage != null && includeImageCheckBox.isChecked) " mit Bild" else ""}…")
+        pendingInstructionNeedsImage = false
+        updateProcessingStatus("Sende an KI${if (hasImage) " mit Bild" else ""}…")
 
-        val hasImage = capturedImage != null && includeImageCheckBox.isChecked
         val imageToSend = if (hasImage) capturedImage else null
 
         // Call OpenAI API using streaming helper
         openAIHelper.callOpenAIStreaming(instruction, imageToSend)
+    }
+
+    private fun shouldCaptureImageForIntent(instruction: String): Boolean {
+        val text = instruction.lowercase()
+        val visualHints = listOf(
+            "wie viele finger", "wieviele finger", "finger", "halte ich hoch",
+            "was sehe ich", "was siehst du", "schau", "sieh", "bild", "foto",
+            "kamera", "lies", "lesen", "text", "schild", "objekt", "farbe",
+            "erkenne", "beschreibe", "vor mir", "um mich", "das hier"
+        )
+        return visualHints.any { it in text }
+    }
+
+    private fun shouldEndConversation(instruction: String): Boolean {
+        val text = instruction.lowercase().trim().trim('.', '!', '?', ',')
+        val goodbyePhrases = listOf(
+            "tschüss", "tschuess", "auf wiedersehen", "bis dann", "bis später",
+            "bis spaeter", "servus", "ciao", "goodbye", "bye", "beende das gespräch",
+            "beende das gespraech", "gespräch beenden", "gespraech beenden"
+        )
+        return goodbyePhrases.any { text == it || text.startsWith("$it ") }
+    }
+
+    private fun endConversationPolitely() {
+        runOnUiThread {
+            updateStatus("Gespräch beendet")
+            updateProcessingStatus("Auf Wiedersehen!")
+            Toast.makeText(this, "Auf Wiedersehen!", Toast.LENGTH_SHORT).show()
+            if (audioHelper.isRecording) {
+                audioHelper.closeAudioRecord("AI_assistant")
+            }
+            streamingAudioPlayer.stop()
+            customSceneHelper.stopAudio()
+            customSceneHelper.closeCustomView()
+            showProcessingUI(false)
+            finish()
+        }
     }
 
     /**

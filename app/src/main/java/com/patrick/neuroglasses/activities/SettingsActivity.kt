@@ -40,7 +40,7 @@ class SettingsActivity : AppCompatActivity() {
         const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
         const val DEFAULT_API_TIMEOUT = 15
-        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools proaktiv für Anrufe, SMS, Navigation, Wetter, Websuche, Erinnerungen, Kalender, E-Mail, Apps, Teilen, Akku und Fotos, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn eine Pflichtangabe fehlt."
+        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Lies die Absicht des Nutzers mit. Antworte kurz, natürlich und freihändig nutzbar. Nutze sichere Tools proaktiv für Anrufe, SMS, Wetter, Websuche, Erinnerungen, Kalender, E-Mail, Apps, Teilen, Akku und Fotos, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Wenn der Nutzer etwas Sichtbares meint, z. B. Finger, Text, Objekte, Farben oder \"was sehe ich\", verwende ein Foto als Kontext. Wenn der Nutzer sich verabschiedet, beende das Gespräch freundlich. Frage nur nach, wenn eine Pflichtangabe fehlt oder eine Aktion unsicher wäre. Führe destruktive oder riskante Aktionen nicht ohne eindeutige Bestätigung aus."
         const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
         const val DEFAULT_VLM_MAX_TOKENS = 1024
         const val DEFAULT_ASR_MODEL = "whisper-large-v3"
