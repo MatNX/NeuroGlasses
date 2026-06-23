@@ -78,6 +78,13 @@ class AITestActivity : AppCompatActivity() {
     private var currentDisplayedCharCount = 0
     private var isStreaming = false
 
+    private fun visibleScrollWindow(text: String, maxChars: Int): String {
+        if (text.length <= maxChars) return text
+        val start = (text.length - maxChars).coerceAtLeast(0)
+        val wordBoundary = text.indexOf(' ', start).takeIf { it in start until text.length } ?: start
+        return "…" + text.substring(wordBoundary).trimStart()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_second)
@@ -249,21 +256,9 @@ class AITestActivity : AppCompatActivity() {
                         val maxCharsPerDisplay = chunkSizeEditText.text.toString().toIntOrNull() ?: 350
                         val validatedMaxChars = if (maxCharsPerDisplay > 0) maxCharsPerDisplay else 350
 
-                        // Check if we need to clear the display
-                        if (currentDisplayedCharCount >= validatedMaxChars) {
-                            Log.i(appTag, "Char limit reached ($currentDisplayedCharCount >= $validatedMaxChars), clearing display")
-                            // Clear the display and reset counter
-                            customSceneHelper.updateTextResult("")
-                            // Clear the buffer and reset counter
-                            streamingBuffer.clear()
-                            streamingBuffer.append(chunk)
-                            currentDisplayedCharCount = chunk.length
-                            // Update with just the new chunk
-                            customSceneHelper.updateTextResult(chunk)
-                        } else {
-                            // Update the display with accumulated text
-                            customSceneHelper.updateTextResult(streamingBuffer.toString())
-                        }
+                        val visibleText = visibleScrollWindow(streamingBuffer.toString(), validatedMaxChars)
+                        currentDisplayedCharCount = visibleText.length
+                        customSceneHelper.updateTextResult(visibleText)
                     }
 
                     if (isComplete) {

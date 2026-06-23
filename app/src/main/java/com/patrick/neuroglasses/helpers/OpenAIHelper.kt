@@ -462,7 +462,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
-                description = "Deutschsprachig: Starte YouTube/YouTube Music oder suche nach gewünschtem Lied, Künstler, Playlist oder Genre.",
+                description = "Deutschsprachig: Spiele den gewünschten Musikwunsch möglichst direkt in YouTube Music oder YouTube ab. Nutze dieses Tool nur bei klarer Wiedergabeabsicht wie 'spiel', 'starte Musik' oder 'hör'.",
                 parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Musikwunsch.")))
             )),
             AssistantTool(function = ToolFunction(
@@ -677,13 +677,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         if (query.isBlank()) return "Ich brauche ein Lied, einen Künstler, eine Playlist oder ein Genre zum Abspielen."
         val encoded = Uri.encode(query)
         val intents = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com/search?q=$encoded")).setPackage("com.google.android.apps.youtube.music"),
+            Intent(Intent.ACTION_SEARCH).setPackage("com.google.android.apps.youtube.music").putExtra("query", query),
             Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://results?search_query=$encoded")).setPackage("com.google.android.youtube"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com/search?q=$encoded")),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded"))
+            Intent(Intent.ACTION_SEARCH).setPackage("com.google.android.youtube").putExtra("query", query),
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded&sp=EgIQAQ%253D%253D")),
+            Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com/search?q=$encoded"))
         )
         intents.forEach { intent ->
-            val result = launchIntent(intent, "YouTube-Musiksuche nach $query")
-            if (!result.contains("konnte nicht gestartet werden")) return result
+            if (intent.action == Intent.ACTION_VIEW) intent.addCategory(Intent.CATEGORY_BROWSABLE)
+            val result = launchIntent(intent, "YouTube-Wiedergabe für $query")
+            if (!result.contains("konnte nicht gestartet werden")) return "$result Falls YouTube nur die Suche öffnet, tippe das erste Ergebnis an; direkte Autoplay-Steuerung ist appabhängig."
         }
         return "YouTube oder YouTube Music konnte nicht gestartet werden."
     }

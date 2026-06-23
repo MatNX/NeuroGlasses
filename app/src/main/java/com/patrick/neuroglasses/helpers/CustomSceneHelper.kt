@@ -259,14 +259,26 @@ class CustomSceneHelper(
     fun displayTextResult(resultText: String): ValueUtil.CxrStatus? {
         Log.i(appTag, "Displaying text result: $resultText")
 
-        // Escape quotes in the result text for JSON
-        val escapedText = resultText.replace("\"", "\\\"")
-
-        // Send icon first
+        // Send icon first. Reset the flag if the SDK asks for icons again; opening the
+        // view still continues so text is never blocked by an icon transfer failure.
         sendAiIcon()
 
-        // Create custom view JSON using RelativeLayout with icon on top left
-        val customViewData = """
+        // The Rokid custom view SDK supports only LinearLayout/RelativeLayout. We keep
+        // the text in a full-height pane next to the icon so long responses are clipped
+        // from the bottom instead of pushing the beginning off screen. Streaming updates
+        // below act as a manual scroll window.
+        val customViewData = buildCustomViewJson(resultText)
+
+        // Open custom UI with result
+        val status = CxrApi.getInstance().openCustomView(customViewData)
+        Log.d(appTag, "Open custom view status: $status")
+
+        return status
+    }
+
+    private fun buildCustomViewJson(text: String): String {
+        val escapedText = jsonEscape(text)
+        return """
             {
                 "type": "RelativeLayout",
                 "props": {
@@ -296,24 +308,34 @@ class CustomSceneHelper(
                         "props": {
                             "id": "tv_result",
                             "layout_width": "match_parent",
-                            "layout_height": "wrap_content",
+                            "layout_height": "match_parent",
                             "text": "$escapedText",
                             "textSize": "16sp",
                             "textColor": "#FF00FF00",
                             "textStyle": "bold",
-                            "layout_below": "iv_ai_icon",
-                            "marginTop": "15dp"
+                            "gravity": "top",
+                            "layout_toEndOf": "iv_ai_icon",
+                            "layout_alignParentTop": "true",
+                            "layout_alignParentBottom": "true",
+                            "marginStart": "15dp"
                         }
                     }
                 ]
             }
         """.trimIndent()
+    }
 
-        // Open custom UI with result
-        val status = CxrApi.getInstance().openCustomView(customViewData)
-        Log.d(appTag, "Open custom view status: $status")
-
-        return status
+    private fun jsonEscape(text: String): String = buildString {
+        text.forEach { char ->
+            when (char) {
+                '\\' -> append("\\\\")
+                '"' -> append("\\\"")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                else -> append(char)
+            }
+        }
     }
 
     /**
@@ -324,8 +346,7 @@ class CustomSceneHelper(
     fun updateTextResult(newText: String): ValueUtil.CxrStatus? {
         Log.i(appTag, "Updating text result: $newText")
 
-        // Escape quotes in the text for JSON
-        val escapedText = newText.replace("\"", "\\\"")
+        val escapedText = jsonEscape(newText)
 
         // Create update JSON
         val updateData = """
