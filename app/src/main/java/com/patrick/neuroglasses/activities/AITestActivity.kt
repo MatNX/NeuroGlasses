@@ -29,7 +29,6 @@ import com.patrick.neuroglasses.helpers.StreamingAudioPlayer
 import com.patrick.neuroglasses.helpers.SystemTtsPlayer
 import com.patrick.neuroglasses.services.RokidConnectionService
 import java.io.File
-import java.util.Locale
 
 /**
  * AI Chat Configuration Activity
@@ -425,16 +424,19 @@ class AITestActivity : AppCompatActivity() {
                             return "Brillenfoto ist deaktiviert. Antworte ohne neues Foto."
                         }
                         runOnUiThread {
+                            pendingInstructionForPhoto = currentInstructionText
+                            isAwaitingPhotoForCurrentRequest = true
+                            capturedImage = null
                             updateProcessingStatus("Brillenfoto wird aufgenommen…")
                             aiCameraHelper.takePhoto()
                         }
-                        "Freihändige Fotoaufnahme mit der Rokid-Brillenkamera gestartet. Verwende das Bild für die nächste KI-Anfrage, sobald es verfügbar ist."
+                        OpenAIHelper.DEFERRED_PHOTO_TOOL_RESULT
                     }
                     "stop_conversation" -> {
                         runOnUiThread {
                             closeConversation("Konversation beendet.")
                         }
-                        "Conversation stopped."
+                        OpenAIHelper.LOCAL_TOOL_HANDLED_RESULT
                     }
                     else -> null
                 }
@@ -923,8 +925,13 @@ class AITestActivity : AppCompatActivity() {
         pendingInstructionForPhoto = null
 
         if (pendingInstruction != null) {
+            val imageToSend = if (photoCaptured) capturedImage else null
             if (!photoCaptured) capturedImage = null
-            sendToOpenAI(pendingInstruction)
+            sendToOpenAI(
+                instruction = pendingInstruction,
+                image = imageToSend,
+                allowPhotoTool = false
+            )
         }
     }
 
@@ -935,67 +942,7 @@ class AITestActivity : AppCompatActivity() {
             return
         }
 
-        if (isStopInstruction(cleanInstruction)) {
-            closeConversation("Konversation beendet.")
-            return
-        }
-
-        if (shouldCaptureImageForInstruction(cleanInstruction)) {
-            pendingInstructionForPhoto = cleanInstruction
-            isAwaitingPhotoForCurrentRequest = true
-            updateProcessingStatus("Bild wird aufgenommen…")
-            aiCameraHelper.takePhoto()
-            return
-        }
-
         sendToOpenAI(cleanInstruction)
-    }
-
-    private fun isStopInstruction(instruction: String): Boolean {
-        val normalized = instruction.lowercase(Locale.ROOT)
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        val exactStops = setOf(
-            "stop",
-            "stopp",
-            "ende",
-            "beenden",
-            "abbrechen",
-            "cancel",
-            "exit",
-            "quit",
-            "tschüss",
-            "tschuess",
-            "goodbye",
-            "fertig"
-        )
-        if (normalized in exactStops) return true
-
-        val stopPhrases = listOf(
-            "hör auf",
-            "hoer auf",
-            "stoppe die konversation",
-            "beende die konversation",
-            "konversation beenden",
-            "neuro stop",
-            "neuro stopp",
-            "mach zu"
-        )
-        return stopPhrases.any { normalized.contains(it) }
-    }
-
-    private fun shouldCaptureImageForInstruction(instruction: String): Boolean {
-        if (!includeImageCheckBox.isChecked) return false
-
-        val text = instruction.lowercase()
-        val visualKeywords = listOf(
-            "bild", "foto", "photo", "kamera", "camera", "siehst", "sehen", "look", "see",
-            "beschreib", "describe", "szene", "scene", "objekt", "object", "erkenne",
-            "recognize", "scan", "lies", "read", "text im bild", "übersetze den text",
-            "snap", "snapshot", "aufnahme", "aufnehmen", "mach ein bild", "mach ein foto",
-            "analysiere das bild", "analyze the photo", "analyze the picture"
-        )
-        return visualKeywords.any { text.contains(it) }
     }
 
     /**
@@ -1090,18 +1037,20 @@ class AITestActivity : AppCompatActivity() {
     /**
      * Send request to OpenAI with instruction and optional image
      */
-    private fun sendToOpenAI(instruction: String) {
+    private fun sendToOpenAI(
+        instruction: String,
+        image: Bitmap? = null,
+        allowPhotoTool: Boolean = includeImageCheckBox.isChecked
+    ) {
         if (!isConversationActive || isClosingConversation) return
         updateProcessingStatus("Sending to AI...")
         currentInstructionText = instruction
 
-        val imageToSend = capturedImage
-
         // Call OpenAI API using streaming helper
         openAIHelper.callOpenAIStreaming(
             instruction = instruction,
-            image = imageToSend,
-            allowGlassesPhotoTool = false,
+            image = image,
+            allowGlassesPhotoTool = allowPhotoTool && image == null,
             includePersistedHistory = false,
             persistConversation = false,
             conversationHistory = sessionConversationMessages.toList()
@@ -1109,8 +1058,6 @@ class AITestActivity : AppCompatActivity() {
     }
 
     private fun shouldSpeakResponse(response: String): Boolean {
-        val instruction = currentInstructionText.trim().lowercase()
-        if (instruction in setOf("test", "testing", "probe", "check", "ping")) return false
         if (response.isBlank()) return false
         if (response.contains("TTS API call failed", ignoreCase = true)) return false
         return true

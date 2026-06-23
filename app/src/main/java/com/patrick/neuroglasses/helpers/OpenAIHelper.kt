@@ -169,7 +169,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
     @Volatile private var activeAsrCall: Call? = null
 
-    private companion object {
+    companion object {
+        const val DEFERRED_PHOTO_TOOL_RESULT = "__neuroglasses_deferred_photo__"
+        const val LOCAL_TOOL_HANDLED_RESULT = "__neuroglasses_local_tool_handled__"
+
         private const val MAX_TOOL_ROUNDS = 3
         private const val MAX_TTS_INPUT_CHARS = 200
         private const val MIN_TTS_AUDIO_BYTES = 44
@@ -196,7 +199,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private data class ToolResolutionResult(
         val messages: List<Message>,
-        val results: List<String>
+        val results: List<String>,
+        val deferred: Boolean = false
+    )
+
+    private data class ChatRequestContext(
+        val request: OpenAIRequest,
+        val toolResults: List<String>,
+        val requestChatId: String?,
+        val hasImage: Boolean,
+        val deferred: Boolean = false
     )
 
     // Get configuration from SharedPreferences
@@ -508,7 +520,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
 
     private fun assistantTools(
-        instruction: String,
         allowGlassesPhotoTool: Boolean,
         includeChatTools: Boolean
     ): List<AssistantTool> {
@@ -542,7 +553,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "stop_conversation",
-                description = "Close the active NeuroGlasses conversation when the user explicitly says stop, cancel, goodbye, or end the session.",
+                description = "Close the active NeuroGlasses conversation when the user clearly wants to stop, cancel, say goodbye, or end the session. Do not use this for ordinary conversation.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
@@ -666,7 +677,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "snap_glasses_photo",
-                description = "Deutschsprachig: Mache freihändig ein Foto mit der Rokid-Brillenkamera als visuellen Kontext. Die Activity verarbeitet dieses Tool.",
+                description = "Capture a fresh Rokid glasses camera photo as visual context. Use this whenever the user asks about the current view, scene, objects, people, hands, counts, colors, visible text, translation of visible text, or anything that needs eyesight. Do not answer visual questions from memory when no image is attached.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
@@ -701,56 +712,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             when (tool.function.name) {
                 "new_chat", "list_chats", "switch_chat", "rename_chat" -> includeChatTools
                 "snap_glasses_photo" -> allowGlassesPhotoTool
-                "open_rokid_native_app" -> hasAnyKeyword(
-                    instruction,
-                    "rokid", "brille", "brillen", "glasses", "native", "launcher", "manager",
-                    "kamera", "camera", "galerie", "gallery", "browser", "settings", "einstellungen",
-                    "bluetooth", "systeminfo", "system info", "brightness", "helligkeit", "volume",
-                    "lautstärke", "lautstaerke", "teleprompter", "word tips", "wordtips",
-                    "musik", "music", "lyrics", "recorder", "aufnahme", "audio"
-                )
-                "open_rokid_translator" -> hasAnyKeyword(
-                    instruction,
-                    "open translator", "open the translator", "start translator", "launch translator",
-                    "öffne übersetzer", "öffne den übersetzer", "starte übersetzer",
-                    "starte den übersetzer", "öffne rokid translator", "starte rokid translator",
-                    "übersetz", "translate", "translation", "rt translation", "live translation",
-                    "voice translation", "sprachübersetzung", "echtzeitübersetzung"
-                )
-                "open_app" -> hasAnyKeyword(instruction, "öffne", "open", "starte", "start", "launch", "app")
                 else -> true
             }
         }
-    }
-
-    private fun shouldResolveTools(instruction: String): Boolean {
-        val normalized = instruction.trim().lowercase(Locale.ROOT)
-        if (normalized.isBlank()) return false
-        if (isProbeInstruction(instruction)) return false
-
-        return hasAnyKeyword(
-            normalized,
-            "ruf", "anruf", "call", "sms", "nachricht", "message", "navig", "route", "maps",
-            "musik", "youtube", "video", "lied", "song", "spiel", "spiele", "abspielen", "play",
-            "wetter", "weather", "suche", "search", "web", "timer",
-            "erinner", "remind", "kalender", "termin", "calendar", "mail", "email", "e-mail",
-            "öffne", "open", "starte", "app", "teile", "share", "akku", "battery",
-            "foto", "photo", "bild", "camera", "kamera", "übersetz", "translate", "translator",
-            "helligkeit", "brightness", "lautstärke", "lautstaerke", "volume", "teleprompter",
-            "word tips", "wordtips", "recorder", "aufnahme",
-            "chat", "liste chats", "neuer chat", "stop", "stopp", "beende", "beenden",
-            "abbrechen", "cancel", "tschüss", "tschuess", "goodbye"
-        )
-    }
-
-    private fun isProbeInstruction(instruction: String): Boolean =
-        instruction.trim().lowercase(Locale.ROOT) in setOf(
-            "test", "testing", "probe", "check", "ping", "hi", "hallo", "hello"
-        )
-
-    private fun hasAnyKeyword(text: String, vararg keywords: String): Boolean {
-        val normalized = text.lowercase(Locale.ROOT)
-        return keywords.any { normalized.contains(it.lowercase(Locale.ROOT)) }
     }
 
     private fun executeAssistantTool(toolCall: ToolCall, instruction: String): String {
@@ -806,6 +770,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             else -> lastResult
         }
     }
+
+    private fun visionInstruction(instruction: String): String =
+        "Beantworte die Nutzerfrage anhand des angehängten Kamerabildes. " +
+            "Prüfe das Bild selbst und nutze keine früheren Beschreibungen als Ersatz für das Bild. " +
+            "Wenn die Frage nach Anzahl, Farbe, Text, Übersetzung oder Details fragt, antworte direkt aus dem Bild. " +
+            "Wenn ein Detail nicht sicher erkennbar ist, sag das knapp. Nutzerfrage: $instruction"
 
     private fun launchIntent(intent: Intent, label: String): String = try {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
@@ -1580,94 +1550,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         Thread {
             try {
-                // Build the message content
-                val contentList = mutableListOf<Content>()
-
-                // Add text instruction
-                contentList.add(Content(type = "text", text = instruction))
-
-                // Add image if provided
-                if (image != null) {
-                    val base64Image = bitmapToBase64(image)
-                    val imageDataUrl = "data:image/png;base64,$base64Image"
-                    contentList.add(
-                        Content(
-                            type = "image_url",
-                            imageUrl = ImageUrl(url = imageDataUrl)
-                        )
-                    )
-                }
-
-                val requestChatId = if (persistConversation) activeChatId() else null
-
-                // Build the messages list with system prompt, persisted chat history, and current user turn.
-                val messagesList = mutableListOf<Message>()
-
-                // Add system message
-                val sessionPrompt = if (persistConversation) {
-                    "Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat nur, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
-                } else if (conversationHistory.isNotEmpty()) {
-                    "Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse aus anderen Konversationen."
-                } else {
-                    "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
-                }
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
-                messagesList.add(
-                    Message(
-                        role = "system",
-                        content = listOf(Content(type = "text", text = systemPrompt))
-                    )
+                val chatContext = buildChatRequestContext(
+                    instruction = instruction,
+                    image = image,
+                    allowGlassesPhotoTool = allowGlassesPhotoTool,
+                    includePersistedHistory = includePersistedHistory,
+                    persistConversation = persistConversation,
+                    conversationHistory = conversationHistory
                 )
-
-                // Add persisted chat history before the current turn. Image content is not persisted.
-                // Probe utterances are intentionally isolated so "test" cannot inherit an old action context.
-                if (includePersistedHistory && !isProbeInstruction(instruction)) {
-                    messagesList.addAll(activeChatHistoryMessages())
+                if (chatContext.deferred) {
+                    Log.d(appTag, "Assistant tool deferred this request; waiting for local follow-up")
+                    return@Thread
                 }
-                if (conversationHistory.isNotEmpty() && !isProbeInstruction(instruction)) {
-                    messagesList.addAll(conversationHistory.takeLast(20))
-                }
-
-                // Add user message
-                messagesList.add(
-                    Message(
-                        role = "user",
-                        content = contentList
-                    )
-                )
-
-                val toolResolution = if (shouldResolveTools(instruction)) {
-                    resolveToolCallsIfNeeded(
-                        messagesList,
-                        instruction,
-                        allowGlassesPhotoTool,
-                        includeChatTools = persistConversation
-                    )
-                } else {
-                    Log.d(appTag, "Skipping tool planning for non-action instruction: $instruction")
-                    ToolResolutionResult(messagesList, emptyList())
-                }
-                val toolMessages = toolResolution.messages.toMutableList()
-                if (toolResolution.results.isNotEmpty()) {
-                    toolMessages.add(
-                        Message(
-                            role = "user",
-                            content = "Gib jetzt eine knappe deutschsprachige Erfolgsmeldung oder Fehlermeldung zu diesen Tool-Ergebnissen aus. Frage nicht erneut nach bereits aufgelösten Daten:\n${toolResolution.results.joinToString("\n")}"
-                        )
-                    )
-                }
-
-                // Create the request with streaming enabled. Tools are resolved in a prior
-                // non-streaming pass so the final response can stream cleanly to the glasses.
-                val request = OpenAIRequest(
-                    model = getVlmModel(),
-                    messages = toolMessages,
-                    maxTokens = getVlmMaxTokens(),
-                    stream = true
-                )
 
                 // Convert request to JSON
-                val jsonBody = gson.toJson(request)
+                val jsonBody = gson.toJson(chatContext.request)
                 Log.d(appTag, "Request JSON: $jsonBody")
 
                 // Create HTTP request
@@ -1687,6 +1584,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "API call failed: ${response.code} - $errorBody")
+                        val retryResponse = recoverImageResponseWithoutStreaming(chatContext, "Streaming API call failed")
+                        if (retryResponse.isNotBlank()) {
+                            deliverChatResponse(
+                                response = retryResponse,
+                                chatContext = chatContext,
+                                instruction = instruction,
+                                persistConversation = persistConversation,
+                                emitStreamingChunk = true
+                            )
+                            return@Thread
+                        }
                         listener?.onOpenAIFailed("API call failed: ${response.code}")
                         return@Thread
                     }
@@ -1695,12 +1603,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     val source = response.body?.source()
                     if (source == null) {
                         Log.e(appTag, "Empty response body")
+                        val retryResponse = recoverImageResponseWithoutStreaming(chatContext, "Streaming response body was empty")
+                        if (retryResponse.isNotBlank()) {
+                            deliverChatResponse(
+                                response = retryResponse,
+                                chatContext = chatContext,
+                                instruction = instruction,
+                                persistConversation = persistConversation,
+                                emitStreamingChunk = true
+                            )
+                            return@Thread
+                        }
                         listener?.onOpenAIFailed("Empty response")
                         return@Thread
                     }
 
                     val fullResponse = StringBuilder()
-                    okio.Buffer()
 
                     // Parse Server-Sent Events with buffered reading to avoid blocking on newlines
                     try {
@@ -1762,6 +1680,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                         }
                     } catch (_: java.net.SocketTimeoutException) {
                         Log.e(appTag, "Streaming read timeout - this may indicate the server is not sending data in SSE format")
+                        val retryResponse = recoverImageResponseWithoutStreaming(chatContext, "Streaming read timed out")
+                        if (retryResponse.isNotBlank()) {
+                            deliverChatResponse(
+                                response = retryResponse,
+                                chatContext = chatContext,
+                                instruction = instruction,
+                                persistConversation = persistConversation,
+                                emitStreamingChunk = true
+                            )
+                            return@Thread
+                        }
                         listener?.onOpenAIFailed("Streaming timeout: server may not be sending proper SSE format")
                         return@Thread
                     }
@@ -1770,31 +1699,36 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     val finalResponse = fullResponse.toString().trim()
                     if (finalResponse.isNotBlank()) {
                         Log.d(appTag, "Full streaming response: $finalResponse")
-                        if (persistConversation && requestChatId != null) {
-                            appendChatMessages(
-                                activeChatId().takeIf { it != requestChatId } ?: requestChatId,
-                                listOf(
-                                    PersistedChatMessage("user", instruction),
-                                    PersistedChatMessage("assistant", finalResponse)
-                                )
-                            )
-                        }
-                        listener?.onOpenAIResponse(finalResponse)
+                        deliverChatResponse(
+                            response = finalResponse,
+                            chatContext = chatContext,
+                            instruction = instruction,
+                            persistConversation = persistConversation,
+                            emitStreamingChunk = false
+                        )
                     } else {
-                        val fallbackResponse = buildToolResultFallback(toolResolution.results)
+                        val retryResponse = recoverImageResponseWithoutStreaming(chatContext, "Streaming completed without text")
+                        if (retryResponse.isNotBlank()) {
+                            deliverChatResponse(
+                                response = retryResponse,
+                                chatContext = chatContext,
+                                instruction = instruction,
+                                persistConversation = persistConversation,
+                                emitStreamingChunk = true
+                            )
+                            return@Thread
+                        }
+
+                        val fallbackResponse = buildToolResultFallback(chatContext.toolResults)
                         if (fallbackResponse.isNotBlank()) {
                             Log.w(appTag, "Streaming completed empty after tool call; using fallback response: $fallbackResponse")
-                            listener?.onOpenAIStreamingChunk(fallbackResponse, true)
-                            if (persistConversation && requestChatId != null) {
-                                appendChatMessages(
-                                    activeChatId().takeIf { it != requestChatId } ?: requestChatId,
-                                    listOf(
-                                        PersistedChatMessage("user", instruction),
-                                        PersistedChatMessage("assistant", fallbackResponse)
-                                    )
-                                )
-                            }
-                            listener?.onOpenAIResponse(fallbackResponse)
+                            deliverChatResponse(
+                                response = fallbackResponse,
+                                chatContext = chatContext,
+                                instruction = instruction,
+                                persistConversation = persistConversation,
+                                emitStreamingChunk = true
+                            )
                         } else {
                             Log.w(appTag, "Streaming completed but no content was received")
                             val genericFallback = "Ich habe gerade keine verwertbare Antwort erhalten. Bitte versuch es nochmal."
@@ -1813,6 +1747,179 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }.start()
     }
 
+    private fun buildChatRequestContext(
+        instruction: String,
+        image: Bitmap?,
+        allowGlassesPhotoTool: Boolean,
+        includePersistedHistory: Boolean,
+        persistConversation: Boolean,
+        conversationHistory: List<Message>
+    ): ChatRequestContext {
+        val hasImage = image != null
+        val contentList = mutableListOf<Content>()
+
+        if (image != null) {
+            val base64Image = bitmapToBase64(image)
+            val imageDataUrl = "data:image/png;base64,$base64Image"
+            contentList.add(
+                Content(
+                    type = "image_url",
+                    imageUrl = ImageUrl(url = imageDataUrl)
+                )
+            )
+            contentList.add(Content(type = "text", text = visionInstruction(instruction)))
+        } else {
+            contentList.add(Content(type = "text", text = instruction))
+        }
+
+        val requestChatId = if (persistConversation) activeChatId() else null
+        val messagesList = mutableListOf<Message>()
+        val sessionPrompt = when {
+            hasImage ->
+                "Diese Anfrage enthält ein frisches Kamerabild. Verwende dieses Bild als primäre Quelle und ziehe keine älteren Bildbeschreibungen oder Tool-Ergebnisse heran."
+            persistConversation ->
+                "Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat nur, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+            conversationHistory.isNotEmpty() ->
+                "Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse aus anderen Konversationen."
+            else ->
+                "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
+        }
+        val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Entscheide semantisch, ob ein Tool nötig ist; verlasse dich nicht auf Wortlisten. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Wenn der Nutzer etwas über die aktuelle Sicht, ein Bild, sichtbare Details, Objekte, Hände, Anzahlen, Farben, Schilder, Text oder Übersetzung von sichtbarem Text wissen will und noch kein Bild angehängt ist, nutze snap_glasses_photo. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
+        messagesList.add(Message(role = "system", content = systemPrompt))
+
+        val includeHistoryForRequest = !hasImage
+        if (includeHistoryForRequest) {
+            if (includePersistedHistory) {
+                messagesList.addAll(activeChatHistoryMessages())
+            }
+            if (conversationHistory.isNotEmpty()) {
+                messagesList.addAll(conversationHistory.takeLast(20))
+            }
+        } else if (hasImage) {
+            Log.d(appTag, "Skipping chat history for fresh image request")
+        }
+
+        messagesList.add(Message(role = "user", content = contentList))
+
+        val toolResolution = if (!hasImage) {
+            resolveToolCallsIfNeeded(
+                messagesList,
+                instruction,
+                allowGlassesPhotoTool,
+                includeChatTools = persistConversation
+            )
+        } else {
+            val reason = if (hasImage) "image request" else "text request"
+            Log.d(appTag, "Skipping tool planning for $reason: $instruction")
+            ToolResolutionResult(messagesList, emptyList())
+        }
+
+        val toolMessages = toolResolution.messages.toMutableList()
+        if (toolResolution.results.isNotEmpty()) {
+            toolMessages.add(
+                Message(
+                    role = "user",
+                    content = "Gib jetzt eine knappe deutschsprachige Erfolgsmeldung oder Fehlermeldung zu diesen Tool-Ergebnissen aus. Frage nicht erneut nach bereits aufgelösten Daten:\n${toolResolution.results.joinToString("\n")}"
+                )
+            )
+        }
+
+        val request = OpenAIRequest(
+            model = getVlmModel(),
+            messages = toolMessages,
+            maxTokens = getVlmMaxTokens(),
+            stream = true
+        )
+
+        return ChatRequestContext(
+            request = request,
+            toolResults = toolResolution.results,
+            requestChatId = requestChatId,
+            hasImage = hasImage,
+            deferred = toolResolution.deferred
+        )
+    }
+
+    private fun recoverImageResponseWithoutStreaming(chatContext: ChatRequestContext, reason: String): String {
+        if (!chatContext.hasImage) return ""
+        Log.w(appTag, "$reason; retrying image request without streaming")
+        return try {
+            callOpenAINonStreaming(chatContext.request)
+        } catch (e: Exception) {
+            Log.e(appTag, "Non-streaming image retry failed", e)
+            ""
+        }
+    }
+
+    private fun callOpenAINonStreaming(request: OpenAIRequest): String {
+        val nonStreamingRequest = request.copy(stream = false, tools = null, toolChoice = null)
+        val jsonBody = gson.toJson(nonStreamingRequest)
+        Log.d(appTag, "Non-streaming retry request JSON: $jsonBody")
+
+        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+        val httpRequest = Request.Builder()
+            .url(getChatApiUrl())
+            .addHeader("Content-Type", "application/json")
+            .addHeader("Authorization", "Bearer ${getApiToken()}")
+            .post(requestBody)
+            .build()
+
+        getClient().newCall(httpRequest).execute().use { response ->
+            if (!response.isSuccessful) {
+                val errorBody = response.body?.string() ?: "Unknown error"
+                Log.e(appTag, "Non-streaming retry failed: ${response.code} - $errorBody")
+                return ""
+            }
+
+            val responseBody = response.body?.string().orEmpty()
+            if (responseBody.isBlank()) {
+                Log.e(appTag, "Non-streaming retry returned an empty body")
+                return ""
+            }
+
+            val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
+            val message = chatResponse.choices.firstOrNull()?.message
+            return messageContentToText(message?.content).trim()
+        }
+    }
+
+    private fun messageContentToText(content: Any?): String = when (content) {
+        null -> ""
+        is String -> content
+        is Content -> content.text.orEmpty()
+        is List<*> -> content.joinToString("") { messageContentToText(it) }
+        is Map<*, *> -> {
+            val text = content["text"]?.toString().orEmpty()
+            if (text.isNotBlank()) text else content["refusal"]?.toString().orEmpty()
+        }
+        else -> content.toString()
+    }
+
+    private fun deliverChatResponse(
+        response: String,
+        chatContext: ChatRequestContext,
+        instruction: String,
+        persistConversation: Boolean,
+        emitStreamingChunk: Boolean
+    ) {
+        val finalResponse = response.trim()
+        if (finalResponse.isBlank()) return
+
+        if (emitStreamingChunk) {
+            listener?.onOpenAIStreamingChunk(finalResponse, true)
+        }
+        if (persistConversation && chatContext.requestChatId != null) {
+            appendChatMessages(
+                activeChatId().takeIf { it != chatContext.requestChatId } ?: chatContext.requestChatId,
+                listOf(
+                    PersistedChatMessage("user", instruction),
+                    PersistedChatMessage("assistant", finalResponse)
+                )
+            )
+        }
+        listener?.onOpenAIResponse(finalResponse)
+    }
+
 
     private fun resolveToolCallsIfNeeded(
         messagesList: MutableList<Message>,
@@ -1820,7 +1927,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         allowGlassesPhotoTool: Boolean,
         includeChatTools: Boolean
     ): ToolResolutionResult {
-        val tools = assistantTools(instruction, allowGlassesPhotoTool, includeChatTools)
+        val tools = assistantTools(allowGlassesPhotoTool, includeChatTools)
         val toolResults = mutableListOf<String>()
 
         return try {
@@ -1859,6 +1966,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     Log.d(appTag, "Executing ${toolCalls.size} tool call(s), round ${round + 1}")
                     toolCalls.forEach { toolCall ->
                         val result = executeAssistantTool(toolCall, instruction)
+                        if (result == DEFERRED_PHOTO_TOOL_RESULT || result == LOCAL_TOOL_HANDLED_RESULT) {
+                            Log.d(appTag, "Tool ${toolCall.function.name} handled locally; deferring final assistant response")
+                            return ToolResolutionResult(messagesList, toolResults, deferred = true)
+                        }
                         toolResults += "${toolCall.function.name}: $result"
                         listener?.onAssistantToolResult(toolCall.function.name, result)
                         messagesList.add(
