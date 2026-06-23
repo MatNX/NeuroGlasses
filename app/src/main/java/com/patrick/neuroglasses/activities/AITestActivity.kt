@@ -68,6 +68,9 @@ class AITestActivity : AppCompatActivity() {
     private var capturedImage: Bitmap? = null
     private var recordedAudioFile: File? = null
     private var lastResultText: String? = null
+    private var imageCaptureRequested = false
+    private var imageCaptureFinished = true
+    private var pendingInstruction: String? = null
 
     // Streaming state
     private var streamingBuffer = StringBuilder()
@@ -132,6 +135,8 @@ class AITestActivity : AppCompatActivity() {
                     capturedImageView.visibility = View.VISIBLE
                     updateProcessingStatus("Bild aufgenommen: ${width}x${height}")
                     Log.i(appTag, "Photo captured successfully: ${width}x${height}, $dataSize bytes")
+                    imageCaptureFinished = true
+                    sendPendingInstructionIfReady()
                 }
             }
 
@@ -140,6 +145,8 @@ class AITestActivity : AppCompatActivity() {
                     updateProcessingStatus("Bildaufnahme fehlgeschlagen: $message")
                     Toast.makeText(this@AITestActivity, "Bildaufnahme fehlgeschlagen", Toast.LENGTH_SHORT).show()
                     Log.e(appTag, "Photo capture failed: $message")
+                    imageCaptureFinished = true
+                    sendPendingInstructionIfReady()
                 }
             }
         })
@@ -506,6 +513,9 @@ class AITestActivity : AppCompatActivity() {
         // Reset state
         capturedImage = null
         recordedAudioFile = null
+        pendingInstruction = null
+        imageCaptureRequested = includeImageCheckBox.isChecked
+        imageCaptureFinished = !imageCaptureRequested
         capturedImageView.visibility = View.GONE
 
         // Always start audio recording (SDK requirement)
@@ -612,7 +622,20 @@ class AITestActivity : AppCompatActivity() {
      * Send request to OpenAI with instruction and optional image
      */
     private fun sendToOpenAI(instruction: String) {
-        updateProcessingStatus("Sending to AI...")
+        pendingInstruction = instruction
+        sendPendingInstructionIfReady()
+    }
+
+    private fun sendPendingInstructionIfReady() {
+        val instruction = pendingInstruction ?: return
+
+        if (imageCaptureRequested && !imageCaptureFinished) {
+            updateProcessingStatus("Warte auf Bildaufnahme…")
+            return
+        }
+
+        pendingInstruction = null
+        updateProcessingStatus("Sende an KI${if (capturedImage != null && includeImageCheckBox.isChecked) " mit Bild" else ""}…")
 
         val hasImage = capturedImage != null && includeImageCheckBox.isChecked
         val imageToSend = if (hasImage) capturedImage else null

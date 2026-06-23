@@ -885,7 +885,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 )
 
                 shouldStopAssistantTurn = false
-                val toolMessages = resolveToolCallsIfNeeded(messagesList)
+                val toolMessages = if (image != null) {
+                    // Vision requests must carry the actual image data in the final chat turn.
+                    // Do not run a separate tool-planning chat call first, because some
+                    // providers/models drop or cannot inspect image content there and then the
+                    // streamed answer can incorrectly claim that no image data was received.
+                    messagesList
+                } else {
+                    resolveToolCallsIfNeeded(messagesList)
+                }
                 if (shouldStopAssistantTurn) {
                     Log.i(appTag, "Assistant turn stopped after launching external app")
                     return@Thread
