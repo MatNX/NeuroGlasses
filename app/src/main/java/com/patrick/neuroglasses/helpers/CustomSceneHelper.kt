@@ -55,6 +55,7 @@ class CustomSceneHelper(
     private var mediaPlayer: MediaPlayer? = null
     private var audioFileToPlay: File? = null
     private var lastVisibleSceneEventMs = 0L
+    private var suppressSceneClosedUntilMs = 0L
 
     // Icon variables
     private var iconsSent = false
@@ -104,6 +105,13 @@ class CustomSceneHelper(
 
                 override fun onCustomViewClosed() {
                     Log.d(appTag, "Custom view closed")
+                    val hadVisibleScene = lastVisibleSceneEventMs > 0L
+                    lastVisibleSceneEventMs = 0L
+                    if (!hadVisibleScene && shouldSuppressSceneClosedCallback()) {
+                        Log.d(appTag, "Ignoring app-initiated custom view close")
+                        return
+                    }
+                    suppressSceneClosedUntilMs = 0L
                     listener?.onSceneClosed()
                 }
             })
@@ -270,6 +278,7 @@ class CustomSceneHelper(
      */
     fun displayTextResult(resultText: String): Boolean {
         Log.i(appTag, "Displaying text result: $resultText")
+        sendAiIcon()
 
         // Keep the text view clear of the icon area; the Rokid renderer can
         // overlap RelativeLayout children during rapid streaming updates.
@@ -280,12 +289,24 @@ class CustomSceneHelper(
                     "layout_width": "match_parent",
                     "layout_height": "match_parent",
                     "backgroundColor": "#FF000000",
-                    "paddingStart": "24dp",
-                    "paddingTop": "120dp",
+                    "paddingStart": "20dp",
+                    "paddingTop": "24dp",
                     "paddingEnd": "24dp",
                     "paddingBottom": "24dp"
                 },
                 "children": [
+                    {
+                        "type": "ImageView",
+                        "props": {
+                            "id": "iv_neuro_icon",
+                            "layout_width": "64dp",
+                            "layout_height": "64dp",
+                            "name": "$aiIconName",
+                            "scaleType": "center_inside",
+                            "layout_alignParentTop": "true",
+                            "layout_alignParentStart": "true"
+                        }
+                    },
                     {
                         "type": "TextView",
                         "props": {
@@ -293,11 +314,13 @@ class CustomSceneHelper(
                             "layout_width": "match_parent",
                             "layout_height": "wrap_content",
                             "text": ${JSONObject.quote(resultText)},
-                            "textSize": "17sp",
+                            "textSize": "14sp",
                             "textColor": "#FF00FF00",
                             "textStyle": "bold",
-                            "layout_alignParentStart": "true",
-                            "layout_alignParentTop": "true"
+                            "layout_toEndOf": "iv_neuro_icon",
+                            "layout_alignParentEnd": "true",
+                            "layout_alignTop": "iv_neuro_icon",
+                            "marginStart": "16dp"
                         }
                     }
                 ]
@@ -348,12 +371,26 @@ class CustomSceneHelper(
      * Close the custom view
      * @return The status of the request
      */
-    fun closeCustomView(): Boolean {
+    fun closeCustomView(suppressSceneClosedCallback: Boolean = true): Boolean {
         Log.d(appTag, "Closing custom view")
         lastVisibleSceneEventMs = 0L
+        val requestedAtMs = SystemClock.elapsedRealtime()
+        if (suppressSceneClosedCallback) {
+            suppressSceneClosedUntilMs = requestedAtMs + APP_CLOSE_EVENT_SUPPRESSION_MS
+        }
         val success = RokidHostConnection.customViewClose()
+        if (!success && suppressSceneClosedCallback) {
+            suppressSceneClosedUntilMs = requestedAtMs + APP_CLOSE_EVENT_FALSE_SUPPRESSION_MS
+        }
         Log.d(appTag, "Close custom view success: $success")
         return success
+    }
+
+    private fun shouldSuppressSceneClosedCallback(): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        val shouldSuppress = suppressSceneClosedUntilMs > 0L && now <= suppressSceneClosedUntilMs
+        suppressSceneClosedUntilMs = 0L
+        return shouldSuppress
     }
 
     /**
@@ -364,11 +401,14 @@ class CustomSceneHelper(
         RokidHostConnection.setCustomViewListener(null)
         listener = null
         isCustomViewListenerSet = false
+        iconsSent = false
         audioFileToPlay = null
         Log.d(appTag, "CustomSceneHelper released")
     }
 
     private companion object {
         private const val CUSTOM_VIEW_FALSE_ERROR_GRACE_MS = 1200L
+        private const val APP_CLOSE_EVENT_SUPPRESSION_MS = 1000L
+        private const val APP_CLOSE_EVENT_FALSE_SUPPRESSION_MS = 250L
     }
 }

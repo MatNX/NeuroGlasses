@@ -2,13 +2,17 @@ package com.patrick.neuroglasses.helpers
 
 import android.annotation.SuppressLint
 import android.Manifest
+import android.app.AlarmManager
+import android.app.SearchManager
 import android.content.Context
 import android.content.Intent
 import android.app.KeyguardManager
+import android.app.PendingIntent
 import android.net.Uri
 import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.CalendarContract
+import android.provider.MediaStore
 import android.provider.Settings
 import android.provider.ContactsContract
 import android.telephony.PhoneNumberUtils
@@ -22,6 +26,7 @@ import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.patrick.neuroglasses.activities.SettingsActivity
+import com.patrick.neuroglasses.receivers.ReminderReceiver
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
@@ -31,6 +36,9 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
+import java.text.DateFormat
+import java.util.Calendar
+import java.util.Date
 import java.util.Locale
 import java.util.UUID
 
@@ -159,11 +167,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+    @Volatile private var activeAsrCall: Call? = null
 
     private companion object {
         private const val MAX_TOOL_ROUNDS = 3
         private const val MAX_TTS_INPUT_CHARS = 200
         private const val MIN_TTS_AUDIO_BYTES = 44
+        private const val MIN_ASR_TIMEOUT_SECONDS = 30L
+        private const val ROKID_SPRITE_LAUNCHER_PACKAGE = "com.rokid.os.sprite.launcher"
     }
 
     private data class ContactPhone(
@@ -176,6 +187,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val number: String?,
         val displayName: String? = null,
         val contactPermissionMissing: Boolean = false
+    )
+
+    private data class ReminderClockTime(
+        val hour: Int,
+        val minute: Int
     )
 
     private data class ToolResolutionResult(
@@ -401,6 +417,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
 
         Thread {
+            var call: Call? = null
             try {
                 // Create multipart form data request
                 val requestBody = MultipartBody.Builder()
@@ -424,8 +441,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
                 Log.d(appTag, "Sending ASR request for file: ${audioFile.name} (${audioFile.length()} bytes)")
 
-                // Execute the request
-                getClient().newCall(request).execute().use { response ->
+                // Execute the request with a total call timeout so ASR cannot hang silently.
+                val requestCall = getAsrClient().newCall(request)
+                call = requestCall
+                activeAsrCall?.cancel()
+                activeAsrCall = requestCall
+                requestCall.execute().use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "ASR API call failed: ${response.code} - $errorBody")
@@ -454,12 +475,35 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 }
             } catch (e: IOException) {
                 Log.e(appTag, "Network error during ASR: ${e.message}", e)
-                listener?.onAsrFailed("Network error: ${e.message}")
+                if (call?.isCanceled() == true) {
+                    listener?.onAsrFailed("ASR cancelled")
+                } else {
+                    listener?.onAsrFailed("Network error: ${e.message}")
+                }
             } catch (e: Exception) {
                 Log.e(appTag, "Error calling ASR API: ${e.message}", e)
                 listener?.onAsrFailed("Error: ${e.message}")
+            } finally {
+                if (activeAsrCall == call) activeAsrCall = null
             }
         }.start()
+    }
+
+    fun cancelAsrRequest(reason: String = "ASR cancelled") {
+        Log.d(appTag, "Cancelling ASR request: $reason")
+        activeAsrCall?.cancel()
+        activeAsrCall = null
+    }
+
+    private fun getAsrClient(): OkHttpClient {
+        val timeoutSeconds = maxOf(getApiTimeout().toLong(), MIN_ASR_TIMEOUT_SECONDS)
+        return getClient()
+            .newBuilder()
+            .callTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .connectTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .readTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
+            .build()
     }
 
 
@@ -502,18 +546,45 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
+                name = "open_rokid_native_app",
+                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, camera, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. For navigation with a destination, use start_navigation so the destination can be forwarded.",
+                parameters = objectSchema(listOf("app"), mapOf(
+                    "app" to mapOf(
+                        "type" to "string",
+                        "description" to "Native glasses app to open.",
+                        "enum" to listOf(
+                            "translator",
+                            "navigation",
+                            "camera",
+                            "gallery",
+                            "settings",
+                            "bluetooth_settings",
+                            "system_info",
+                            "brightness",
+                            "volume",
+                            "teleprompter",
+                            "music",
+                            "recorder",
+                            "browser",
+                            "launcher",
+                            "manager"
+                        )
+                    )
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
                 name = "start_navigation",
-                description = "Start turn-by-turn navigation to a destination, preferring a maps app that can begin navigation directly.",
-                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Address, landmark, or business name.")))
+                description = "Open Rokid glasses-side navigation/maps for a destination and forward that target through the Rokid Nav command channel. Prefer this native glasses launch over phone Google Maps whenever the user asks for navigation, route guidance, maps, or directions.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Exact address, landmark, business name, or destination phrase the user wants to navigate to.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
-                description = "Start YouTube/YouTube Music playback or search for a requested song, artist, playlist, or genre.",
-                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Music query to play.")))
+                description = "Start the YouTube app with a requested video, song, artist, playlist, or search query. Prefer YouTube video playback/search over YouTube Music.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("YouTube video or search query to start.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_rokid_translator",
-                description = "Open the native Rokid real-time translator app/scene if it is installed on the companion phone.",
+                description = "Open the native Rokid/glasses-side real-time translator or translation app through Hi Rokid CXR-L. Use this for translate/übersetzen requests, not Google Translate on the phone.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
@@ -533,15 +604,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "set_timer",
-                description = "Create a hands-free Android timer.",
+                description = "Create a hands-free Android timer. Preserve the user's natural duration in duration when unsure; never send 0 seconds unless the user explicitly requested 0.",
                 parameters = objectSchema(listOf("seconds"), mapOf(
                     "seconds" to mapOf("type" to "integer", "description" to "Timer duration in seconds."),
+                    "duration" to stringProp("Optional natural language timer duration, e.g. '5 Minuten', 'in 30 seconds'."),
                     "label" to stringProp("Optional timer label.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "create_reminder",
-                description = "Store an in-app reminder that can be listed later by the assistant.",
+                description = "Create a reminder. If the user gives a usable time, the app saves it and also tries Android timer, alarm, or calendar intents.",
                 parameters = objectSchema(listOf("text"), mapOf(
                     "text" to stringProp("Reminder text."),
                     "when" to stringProp("Optional natural language due time." )
@@ -629,11 +701,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             when (tool.function.name) {
                 "new_chat", "list_chats", "switch_chat", "rename_chat" -> includeChatTools
                 "snap_glasses_photo" -> allowGlassesPhotoTool
+                "open_rokid_native_app" -> hasAnyKeyword(
+                    instruction,
+                    "rokid", "brille", "brillen", "glasses", "native", "launcher", "manager",
+                    "kamera", "camera", "galerie", "gallery", "browser", "settings", "einstellungen",
+                    "bluetooth", "systeminfo", "system info", "brightness", "helligkeit", "volume",
+                    "lautstärke", "lautstaerke", "teleprompter", "word tips", "wordtips",
+                    "musik", "music", "lyrics", "recorder", "aufnahme", "audio"
+                )
                 "open_rokid_translator" -> hasAnyKeyword(
                     instruction,
                     "open translator", "open the translator", "start translator", "launch translator",
                     "öffne übersetzer", "öffne den übersetzer", "starte übersetzer",
-                    "starte den übersetzer", "öffne rokid translator", "starte rokid translator"
+                    "starte den übersetzer", "öffne rokid translator", "starte rokid translator",
+                    "übersetz", "translate", "translation", "rt translation", "live translation",
+                    "voice translation", "sprachübersetzung", "echtzeitübersetzung"
                 )
                 "open_app" -> hasAnyKeyword(instruction, "öffne", "open", "starte", "start", "launch", "app")
                 else -> true
@@ -649,10 +731,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return hasAnyKeyword(
             normalized,
             "ruf", "anruf", "call", "sms", "nachricht", "message", "navig", "route", "maps",
-            "musik", "youtube", "wetter", "weather", "suche", "search", "web", "timer",
+            "musik", "youtube", "video", "lied", "song", "spiel", "spiele", "abspielen", "play",
+            "wetter", "weather", "suche", "search", "web", "timer",
             "erinner", "remind", "kalender", "termin", "calendar", "mail", "email", "e-mail",
             "öffne", "open", "starte", "app", "teile", "share", "akku", "battery",
             "foto", "photo", "bild", "camera", "kamera", "übersetz", "translate", "translator",
+            "helligkeit", "brightness", "lautstärke", "lautstaerke", "volume", "teleprompter",
+            "word tips", "wordtips", "recorder", "aufnahme",
             "chat", "liste chats", "neuer chat", "stop", "stopp", "beende", "beenden",
             "abbrechen", "cancel", "tschüss", "tschuess", "goodbye"
         )
@@ -668,7 +753,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return keywords.any { normalized.contains(it.lowercase(Locale.ROOT)) }
     }
 
-    private fun executeAssistantTool(toolCall: ToolCall): String {
+    private fun executeAssistantTool(toolCall: ToolCall, instruction: String): String {
         val args = parseToolArguments(toolCall.function.arguments)
         listener?.onAssistantToolCall(toolCall.function.name, args)?.let { return it }
 
@@ -679,13 +764,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "send_sms" -> sendSms(arg("recipient"), arg("message"))
             "find_contact_phone" -> findContactPhone(arg("recipient"))
             "stop_conversation" -> "Conversation stopped."
-            "start_navigation" -> launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${Uri.encode(arg("destination"))}")), "turn-by-turn navigation")
+            "open_rokid_native_app" -> openRokidNativeApp(arg("app"))
+            "start_navigation" -> openRokidNavigation(arg("destination"))
             "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
             "get_weather" -> getWeather(arg("location"))
             "web_search" -> webSearch(arg("query"))
-            "set_timer" -> setTimer(arg("seconds").toIntOrNull() ?: 0, arg("label"))
+            "set_timer" -> setTimer(resolveTimerSeconds(arg("seconds"), arg("duration"), arg("label"), instruction), arg("label").ifBlank { instruction })
             "create_reminder" -> createReminder(arg("text"), arg("when"))
             "list_reminders" -> listReminders()
             "create_calendar_event" -> createCalendarEvent(arg("title"), arg("start"), arg("end"), arg("location"), arg("notes"))
@@ -903,26 +989,201 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun playYoutubeMusic(query: String): String {
-        if (query.isBlank()) return "I need a song, artist, playlist, or genre to play."
+        if (query.isBlank()) return "I need a YouTube video, song, artist, playlist, or search query."
+        val videoId = extractYoutubeVideoId(query) ?: resolveYoutubeVideoId(query)
         val encoded = Uri.encode(query)
-        val intents = listOf(
-            Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://results?search_query=$encoded")).setPackage("com.google.android.youtube"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://music.youtube.com/search?q=$encoded")),
-            Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded"))
-        )
+        val watchUrl = videoId?.let { "https://m.youtube.com/watch?v=$it&autoplay=1" }
+        val searchUrl = "https://www.youtube.com/results?search_query=$encoded"
+        val targetUrl = watchUrl ?: searchUrl
+        val firefoxIntents = firefoxPackages().map { packageName ->
+            Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).setPackage(packageName)
+        }
+        val intents = buildList {
+            addAll(firefoxIntents)
+            if (videoId != null) {
+                add(Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)))
+            } else {
+                add(
+                    Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                        .setPackage("com.google.android.youtube")
+                        .putExtra(SearchManager.QUERY, query)
+                        .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/video")
+                )
+                add(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)))
+            }
+        }
+        val label = if (videoId != null) "YouTube video in Firefox" else "YouTube search in Firefox"
         intents.forEach { intent ->
-            val result = launchIntent(intent, "YouTube music search for $query")
+            val result = launchIntent(intent, label)
             if (!result.startsWith("Could not")) return result
         }
-        return "Could not start YouTube or YouTube Music."
+        return "Could not start YouTube video/search for $query."
     }
 
-    private fun openRokidTranslator(): String {
-        val packageNames = listOf("com.rokid.translate", "com.rokid.translator", "com.rokid.glass.translator", "com.rokid.ai.translate")
-        packageNames.forEach { packageName ->
-            context.packageManager.getLaunchIntentForPackage(packageName)?.let { return launchIntent(it, "Rokid real-time translator") }
+    private fun firefoxPackages(): List<String> = listOf(
+        "org.mozilla.firefox",
+        "org.mozilla.firefox_beta",
+        "org.mozilla.fenix",
+        "org.mozilla.firefox_nightly",
+        "org.mozilla.focus"
+    )
+
+    private fun resolveYoutubeVideoId(query: String): String? {
+        val url = "https://www.youtube.com/results?search_query=${URLEncoder.encode(query, "UTF-8")}"
+        val html = fetchText(url, "YouTube search page")
+        if (html.startsWith("Could not", ignoreCase = true)) return null
+        val patterns = listOf(
+            Regex(""""videoId"\s*:\s*"([A-Za-z0-9_-]{11})""""),
+            Regex("""/watch\?v=([A-Za-z0-9_-]{11})""")
+        )
+        return patterns.firstNotNullOfOrNull { pattern ->
+            pattern.find(html)?.groupValues?.getOrNull(1)
         }
-        return "I could not find the Rokid translator app on this phone."
+    }
+
+    private fun extractYoutubeVideoId(input: String): String? {
+        val cleanInput = input.trim()
+        if (Regex("^[A-Za-z0-9_-]{11}$").matches(cleanInput)) return cleanInput
+
+        val uri = runCatching { Uri.parse(cleanInput) }.getOrNull()
+        uri?.getQueryParameter("v")?.takeIf { Regex("^[A-Za-z0-9_-]{11}$").matches(it) }?.let { return it }
+
+        val patterns = listOf(
+            Regex("""youtu\.be/([A-Za-z0-9_-]{11})"""),
+            Regex("""youtube\.com/(?:shorts|embed|live)/([A-Za-z0-9_-]{11})""")
+        )
+        return patterns.firstNotNullOfOrNull { pattern ->
+            pattern.find(cleanInput)?.groupValues?.getOrNull(1)
+        }
+    }
+
+    private fun openRokidTranslator(): String = openRokidNativeApp("translator")
+
+    private fun openRokidNavigation(destination: String): String {
+        val launchResult = RokidHostConnection.openGlassApp(rokidNavigationTargets())
+        if (!launchResult.success) return launchResult.detail
+
+        val cleanDestination = destination.trim()
+        return if (cleanDestination.isNotBlank()) {
+            val commandResult = RokidHostConnection.sendNavigationDestination(cleanDestination)
+            if (commandResult.success) {
+                "Opened ${launchResult.label} on the glasses and sent destination: $cleanDestination."
+            } else {
+                "Opened ${launchResult.label} on the glasses, but could not send destination '$cleanDestination': ${commandResult.detail}"
+            }
+        } else {
+            "Opened ${launchResult.label} on the glasses."
+        }
+    }
+
+    private fun openRokidNativeApp(app: String): String {
+        val normalized = app.trim().lowercase(Locale.ROOT)
+        val targets = when {
+            normalized in setOf("translator", "translate", "translation", "übersetzer", "uebersetzer", "übersetzung", "rt translation", "live translation") ->
+                rokidTranslatorTargets()
+            normalized in setOf("navigation", "maps", "map", "route", "directions", "navigate", "navi", "smartlife") ->
+                rokidNavigationTargets()
+            normalized in setOf("camera", "kamera", "photo", "foto") ->
+                spriteLauncherTarget("Rokid Camera", ".page.camera.CameraPageActivity") +
+                    glassTargets("Rokid Camera", "com.rokid.camera", "com.rokid.glass.camera", "com.rokid.ai.camera")
+            normalized in setOf("gallery", "galerie", "photos", "bilder") ->
+                spriteLauncherTarget("Rokid Gallery", ".page.gallery.StorageImageShowActivity") +
+                    glassTargets("Rokid Gallery", "com.rokid.gallery", "com.rokid.glass.gallery", "com.rokid.photos")
+            normalized in setOf("settings", "einstellungen", "manager") ->
+                spriteLauncherTarget("Rokid Settings", ".setting.SettingPageActivity") +
+                    glassTargets("Rokid Settings", "com.rokid.settings", "com.rokid.glass.settings", "com.android.settings") +
+                    glassTargets("Rokid Manager", "com.example.advancedsettingsmanager")
+            normalized in setOf("bluetooth_settings", "bluetooth", "bt", "bluetooth settings", "bluetooth-einstellungen") ->
+                spriteLauncherTarget("Rokid Bluetooth Settings", ".setting.bluetooth.SettingBluetoothActivity")
+            normalized in setOf("system_info", "systeminfo", "system info", "info", "geräteinfo", "geraeteinfo") ->
+                spriteLauncherTarget("Rokid System Info", ".setting.info.SettingSystemInfoActivity")
+            normalized in setOf("brightness", "helligkeit", "display brightness") ->
+                spriteLauncherTarget("Rokid Brightness", ".page.brightness.SettingBrightnessActivity")
+            normalized in setOf("volume", "lautstärke", "lautstaerke", "sound", "audio volume") ->
+                spriteLauncherTarget("Rokid Volume", ".page.volume.SettingVolumeActivity")
+            normalized in setOf("teleprompter", "wordtips", "word tips", "worttipps", "spickzettel") ->
+                spriteLauncherTarget("Rokid Word Tips", ".page.wordtips.WordTipsPageActivity")
+            normalized in setOf("music", "musik", "lyrics", "songtext", "songtexte") ->
+                spriteLauncherTarget("Rokid Music", ".page.music.MusicPageActivity")
+            normalized in setOf("recorder", "audio_recorder", "audio recorder", "aufnahme", "audioaufnahme", "recording") ->
+                spriteLauncherTarget("Rokid Audio Recorder", ".page.audio.AudioPageActivity")
+            normalized in setOf("browser", "web") ->
+                glassTargets("Rokid Browser", "com.rokid.browser", "com.rokid.glass.browser") +
+                    glassTargets("Dew Browser", "kr.pe.eung.ekweb")
+            normalized in setOf("launcher", "home", "start") ->
+                spriteLauncherTarget("Rokid Home", ".main.SpriteMainActivity") +
+                    glassTargets("Rokid Launcher", "com.rokid.launcher", "com.rokid.glass.launcher")
+            else -> emptyList()
+        }
+        if (targets.isEmpty()) {
+            return "Unknown Rokid native app '$app'. Supported: translator, navigation, camera, gallery, settings, bluetooth_settings, system_info, brightness, volume, teleprompter, music, recorder, browser, launcher."
+        }
+
+        val result = RokidHostConnection.openGlassApp(targets)
+        return if (result.success) {
+            "Opened ${result.label} on the glasses."
+        } else {
+            result.detail
+        }
+    }
+
+    private fun rokidTranslatorTargets(): List<RokidHostConnection.GlassAppTarget> =
+        spriteLauncherTarget("Rokid Translate", ".page.translate.TranslatePageActivity") +
+            glassTargets(
+            "Rokid Real-Time Translation",
+            "com.rokid.translate",
+            "com.rokid.translator",
+            "com.rokid.glass.translator",
+            "com.rokid.ai.translate",
+            "com.rokid.voice.translation",
+            "com.rokid.translation"
+        ) + glassTargets("EK Trans", "kr.pe.eung.ektranslator")
+
+    private fun rokidNavigationTargets(): List<RokidHostConnection.GlassAppTarget> =
+        spriteLauncherTarget(
+            "Rokid Navigation",
+            ".page.navigation.NavigationOverseaPageActivity",
+            ".page.navigation.NavigationPageActivity"
+        ) + glassTargets(
+            "Rokid Navigation",
+            "com.rokid.navigation",
+            "com.rokid.maps",
+            "com.rokid.map",
+            "com.rokid.glass.navigation",
+            "com.rokid.glass.maps",
+            "com.rokid.ai.navigation",
+            "com.rokid.ar.navigation"
+        ) + glassTargets("Rokid SmartLife", "com.rokidsmartlife") +
+            glassTargets("Rokid GMaps", "com.anezium.rokidgmaps.glasses")
+
+    private fun spriteLauncherTarget(label: String, vararg relativeActivityNames: String): List<RokidHostConnection.GlassAppTarget> =
+        listOf(
+            RokidHostConnection.GlassAppTarget(
+                label = label,
+                packageName = ROKID_SPRITE_LAUNCHER_PACKAGE,
+                activityNames = relativeActivityNames
+                    .flatMap { activityNameVariants(ROKID_SPRITE_LAUNCHER_PACKAGE, it) }
+                    .distinct()
+            )
+        )
+
+    private fun glassTargets(label: String, vararg packageNames: String): List<RokidHostConnection.GlassAppTarget> =
+        packageNames.distinct().map { packageName ->
+            RokidHostConnection.GlassAppTarget(
+                label = label,
+                packageName = packageName,
+                activityNames = listOf("", "$packageName.MainActivity", "$packageName.main.MainActivity")
+            )
+        }
+
+    private fun activityNameVariants(packageName: String, activityName: String): List<String> {
+        val trimmed = activityName.trim()
+        if (trimmed.isBlank()) return emptyList()
+        return if (trimmed.startsWith(".")) {
+            listOf(packageName + trimmed, trimmed)
+        } else {
+            listOf(trimmed)
+        }
     }
 
     @SuppressLint("MissingPermission")
@@ -960,8 +1221,41 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val abstract = parsed["AbstractText"]?.toString().orEmpty()
         val heading = parsed["Heading"]?.toString().orEmpty()
         val related = (parsed["RelatedTopics"] as? List<*>)?.firstOrNull()?.let { it as? Map<*, *> }?.get("Text")?.toString().orEmpty()
-        return listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n").ifBlank { "No instant answer found for $query." }
+        val instantAnswer = listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n")
+        if (instantAnswer.isNotBlank()) return instantAnswer.take(900)
+
+        val htmlUrl = "https://html.duckduckgo.com/html/?q=${URLEncoder.encode(query, "UTF-8")}"
+        val html = fetchText(htmlUrl, "web search results")
+        if (html.startsWith("Could not", ignoreCase = true)) return html
+        val results = parseDuckDuckGoHtmlResults(html)
+        return results.ifEmpty { listOf("No useful web-search result found for $query.") }
+            .take(3)
+            .joinToString("\n")
     }
+
+    private fun parseDuckDuckGoHtmlResults(html: String): List<String> {
+        val resultPattern = Regex(
+            """(?s)<a[^>]+class="result__a"[^>]*>(.*?)</a>.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>""",
+            RegexOption.IGNORE_CASE
+        )
+        return resultPattern.findAll(html).mapNotNull { match ->
+            val title = htmlToPlainText(match.groupValues[1])
+            val snippet = htmlToPlainText(match.groupValues[2])
+            listOf(title, snippet).filter { it.isNotBlank() }.joinToString(": ").takeIf { it.isNotBlank() }
+        }.toList()
+    }
+
+    private fun htmlToPlainText(html: String): String =
+        html
+            .replace(Regex("<.*?>"), " ")
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#x27;", "'")
+            .replace("&#39;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace(Regex("\\s+"), " ")
+            .trim()
 
     private fun fetchText(url: String, label: String): String = try {
         val request = Request.Builder().url(url).get().build()
@@ -970,6 +1264,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
     } catch (e: Exception) {
         "Could not fetch $label: ${e.message}"
+    }
+
+    private fun resolveTimerSeconds(seconds: String, duration: String, label: String, instruction: String): Int {
+        val explicitSeconds = seconds.toIntOrNull()
+        if (explicitSeconds != null && explicitSeconds > 0) return explicitSeconds
+
+        return sequenceOf(duration, label, instruction)
+            .mapNotNull { parseRelativeReminderSeconds(it) }
+            .firstOrNull { it > 0 }
+            ?: 0
     }
 
     private fun setTimer(seconds: Int, label: String): String {
@@ -987,7 +1291,211 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val existing = prefs.getStringSet("items", emptySet()).orEmpty().toMutableSet()
         existing.add("${System.currentTimeMillis()}|$text|$dueTime")
         prefs.edit().putStringSet("items", existing).apply()
-        return "Reminder saved: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
+
+        val savedMessage = "Reminder saved: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
+        val androidResult = scheduleAndroidReminder(text, dueTime)
+        return listOf(savedMessage, androidResult).filter { it.isNotBlank() }.joinToString(" ")
+    }
+
+    private fun scheduleAndroidReminder(text: String, dueTime: String): String {
+        val cleanDueTime = dueTime.trim()
+        if (cleanDueTime.isBlank()) return ""
+
+        val triggerAtMillis = parseReminderTriggerAtMillis(cleanDueTime)
+            ?: return "Reminder saved in NeuroGlasses, but I could not understand the time '$cleanDueTime' well enough to schedule a notification."
+
+        return scheduleReminderNotification(text, triggerAtMillis)
+    }
+
+    private fun parseReminderTriggerAtMillis(dueTime: String): Long? {
+        parseRelativeReminderSeconds(dueTime)?.let { seconds ->
+            return System.currentTimeMillis() + seconds * 1000L
+        }
+
+        parseReminderCalendarStartMillis(dueTime)?.let { return it }
+
+        parseClockTime(dueTime)?.let { clockTime ->
+            val calendar = Calendar.getInstance()
+            calendar.set(Calendar.HOUR_OF_DAY, clockTime.hour)
+            calendar.set(Calendar.MINUTE, clockTime.minute)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            if (calendar.timeInMillis <= System.currentTimeMillis()) {
+                calendar.add(Calendar.DAY_OF_YEAR, 1)
+            }
+            return calendar.timeInMillis
+        }
+
+        return null
+    }
+
+    private fun scheduleReminderNotification(text: String, triggerAtMillis: Long): String {
+        return try {
+            val alarmManager = context.getSystemService(AlarmManager::class.java)
+                ?: return "Reminder saved, but Android AlarmManager is unavailable."
+            val notificationId = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt()
+            val intent = Intent(context, ReminderReceiver::class.java)
+                .putExtra(ReminderReceiver.EXTRA_TEXT, text)
+                .putExtra(ReminderReceiver.EXTRA_NOTIFICATION_ID, notificationId)
+            val pendingIntent = PendingIntent.getBroadcast(
+                context,
+                notificationId,
+                intent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            )
+
+            alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, pendingIntent)
+            val formattedTime = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.GERMANY)
+                .format(Date(triggerAtMillis))
+            "Reminder notification scheduled automatically for $formattedTime."
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not schedule reminder notification", e)
+            "Reminder saved, but I could not schedule the notification: ${e.message}"
+        }
+    }
+
+    private fun parseRelativeReminderSeconds(text: String): Int? {
+        val normalized = text.lowercase(Locale.ROOT)
+        val numericMatch = Regex(
+            """\b(?:in\s+)?(\d{1,4})\s*(sekunden?|seconds?|secs?|s|minuten?|minutes?|mins?|m|stunden?|hours?|h|tage?|days?|d)\b""",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        val amount = numericMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
+        val unit = numericMatch?.groupValues?.getOrNull(2)
+        if (amount != null && unit != null) return amount * secondsPerReminderUnit(unit)
+
+        val oneUnitMatch = Regex(
+            """\b(?:in\s+)?ein(?:e|er|em|en)?\s+(sekunde|second|minute|minuten|stunde|stunden|hour|tag|tage|day)\b""",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        val oneUnit = oneUnitMatch?.groupValues?.getOrNull(1)
+        oneUnit?.let { return secondsPerReminderUnit(it) }
+
+        val wordMatch = Regex(
+            """\b(?:in\s+)?([a-zäöüß]+)\s+(sekunden?|seconds?|secs?|minuten?|minutes?|mins?|stunden?|hours?|tage?|days?)\b""",
+            RegexOption.IGNORE_CASE
+        ).find(normalized)
+        val wordAmount = wordMatch?.groupValues?.getOrNull(1)?.let { parseSmallNumberWord(it) }
+        val wordUnit = wordMatch?.groupValues?.getOrNull(2)
+        if (wordAmount != null && wordUnit != null) return wordAmount * secondsPerReminderUnit(wordUnit)
+
+        return null
+    }
+
+    private fun parseSmallNumberWord(word: String): Int? =
+        when (word.lowercase(Locale.ROOT)) {
+            "ein", "eine", "einer", "eins", "one" -> 1
+            "zwei", "two" -> 2
+            "drei", "three" -> 3
+            "vier", "four" -> 4
+            "fünf", "fuenf", "funf", "five" -> 5
+            "sechs", "six" -> 6
+            "sieben", "seven" -> 7
+            "acht", "eight" -> 8
+            "neun", "nine" -> 9
+            "zehn", "ten" -> 10
+            "elf", "eleven" -> 11
+            "zwölf", "zwoelf", "twelve" -> 12
+            "fünfzehn", "fuenfzehn", "fifteen" -> 15
+            "zwanzig", "twenty" -> 20
+            "dreißig", "dreissig", "thirty" -> 30
+            "vierzig", "forty" -> 40
+            "fünfzig", "fuenfzig", "fifty" -> 50
+            "sechzig", "sixty" -> 60
+            else -> null
+        }
+
+    private fun secondsPerReminderUnit(unit: String): Int {
+        val normalizedUnit = unit.lowercase(Locale.ROOT)
+        return when {
+            normalizedUnit.startsWith("m") -> 60
+            normalizedUnit.startsWith("h") || normalizedUnit.startsWith("stunde") -> 60 * 60
+            normalizedUnit.startsWith("s") -> 1
+            normalizedUnit.startsWith("t") || normalizedUnit.startsWith("d") -> 24 * 60 * 60
+            else -> 60
+        }
+    }
+
+    private fun hasCalendarDateHint(text: String): Boolean {
+        val normalized = text.lowercase(Locale.ROOT)
+        return Regex("""\b\d{4}-\d{1,2}-\d{1,2}\b""").containsMatchIn(normalized) ||
+            listOf("morgen", "tomorrow", "übermorgen", "uebermorgen", "heute", "today").any { normalized.contains(it) }
+    }
+
+    private fun parseClockTime(text: String): ReminderClockTime? {
+        val normalized = text.lowercase(Locale.ROOT)
+        Regex("""\b(?:um\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b""")
+            .find(normalized)
+            ?.let { match ->
+                val hour = match.groupValues[1].toIntOrNull()
+                val minute = match.groupValues[2].toIntOrNull()
+                if (hour != null && minute != null) return ReminderClockTime(hour, minute)
+            }
+
+        Regex("""\b([01]?\d|2[0-3])\s*uhr(?:\s*([0-5]\d))?\b""")
+            .find(normalized)
+            ?.let { match ->
+                val hour = match.groupValues[1].toIntOrNull()
+                val minute = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 0
+                if (hour != null) return ReminderClockTime(hour, minute)
+            }
+
+        Regex("""\bum\s+([01]?\d|2[0-3])\b""")
+            .find(normalized)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+            ?.let { return ReminderClockTime(it, 0) }
+
+        return null
+    }
+
+    private fun openReminderCalendarDraft(text: String, dueTime: String): String {
+        val intent = Intent(Intent.ACTION_INSERT)
+            .setData(CalendarContract.Events.CONTENT_URI)
+            .putExtra(CalendarContract.Events.TITLE, text)
+            .putExtra(CalendarContract.Events.DESCRIPTION, "NeuroGlasses reminder: $text\nZeit: $dueTime")
+
+        parseReminderCalendarStartMillis(dueTime)?.let { startMillis ->
+            intent
+                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMillis)
+                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, startMillis + 30 * 60 * 1000L)
+        }
+
+        return launchIntent(intent, "calendar reminder draft")
+    }
+
+    private fun parseReminderCalendarStartMillis(dueTime: String): Long? {
+        val normalized = dueTime.lowercase(Locale.ROOT)
+        val calendar = Calendar.getInstance()
+
+        Regex("""\b(\d{4})-(\d{1,2})-(\d{1,2})(?:[ t](\d{1,2})(?::(\d{2}))?)?\b""")
+            .find(normalized)
+            ?.let { match ->
+                calendar.set(Calendar.YEAR, match.groupValues[1].toInt())
+                calendar.set(Calendar.MONTH, match.groupValues[2].toInt() - 1)
+                calendar.set(Calendar.DAY_OF_MONTH, match.groupValues[3].toInt())
+                calendar.set(Calendar.HOUR_OF_DAY, match.groupValues.getOrNull(4)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 9)
+                calendar.set(Calendar.MINUTE, match.groupValues.getOrNull(5)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 0)
+                calendar.set(Calendar.SECOND, 0)
+                calendar.set(Calendar.MILLISECOND, 0)
+                return calendar.timeInMillis
+            }
+
+        val dayOffset = when {
+            normalized.contains("übermorgen") || normalized.contains("uebermorgen") -> 2
+            normalized.contains("morgen") || normalized.contains("tomorrow") -> 1
+            normalized.contains("heute") || normalized.contains("today") -> 0
+            else -> null
+        } ?: return null
+
+        calendar.add(Calendar.DAY_OF_YEAR, dayOffset)
+        val clockTime = parseClockTime(normalized) ?: ReminderClockTime(9, 0)
+        calendar.set(Calendar.HOUR_OF_DAY, clockTime.hour)
+        calendar.set(Calendar.MINUTE, clockTime.minute)
+        calendar.set(Calendar.SECOND, 0)
+        calendar.set(Calendar.MILLISECOND, 0)
+        return calendar.timeInMillis
     }
 
     private fun listReminders(): String {
@@ -1103,7 +1611,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 } else {
                     "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
                 }
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Frage nur nach, wenn Empfänger oder Nachricht wirklich fehlen. Bei Navigation, Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
                 messagesList.add(
                     Message(
                         role = "system",
@@ -1259,8 +1767,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     }
 
                     // Also send the full response to the non-streaming callback for backwards compatibility
-                    val finalResponse = fullResponse.toString()
-                    if (finalResponse.isNotEmpty()) {
+                    val finalResponse = fullResponse.toString().trim()
+                    if (finalResponse.isNotBlank()) {
                         Log.d(appTag, "Full streaming response: $finalResponse")
                         if (persistConversation && requestChatId != null) {
                             appendChatMessages(
@@ -1289,7 +1797,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                             listener?.onOpenAIResponse(fallbackResponse)
                         } else {
                             Log.w(appTag, "Streaming completed but no content was received")
-                            listener?.onOpenAIFailed("Empty response")
+                            val genericFallback = "Ich habe gerade keine verwertbare Antwort erhalten. Bitte versuch es nochmal."
+                            listener?.onOpenAIStreamingChunk(genericFallback, true)
+                            listener?.onOpenAIResponse(genericFallback)
                         }
                     }
                 }
@@ -1348,7 +1858,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
                     Log.d(appTag, "Executing ${toolCalls.size} tool call(s), round ${round + 1}")
                     toolCalls.forEach { toolCall ->
-                        val result = executeAssistantTool(toolCall)
+                        val result = executeAssistantTool(toolCall, instruction)
                         toolResults += "${toolCall.function.name}: $result"
                         listener?.onAssistantToolResult(toolCall.function.name, result)
                         messagesList.add(
@@ -1403,6 +1913,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
 
         Thread {
+            var call: Call? = null
             try {
                 // Create the TTS request
                 val request = TtsRequest(

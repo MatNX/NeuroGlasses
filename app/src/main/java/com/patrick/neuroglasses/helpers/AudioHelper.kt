@@ -120,6 +120,9 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         override fun onAudioError(code: Int, msg: String?) {
             Log.e(appTag, "Audio stream error: $code $msg")
             lastStopReason = StopReason.ERROR
+            cancelAutoStopCheck()
+            isRecording = false
+            isClosingAudioRecord = false
             listener?.onAudioRecordingFailed(msg ?: "Audio stream error $code")
         }
     }
@@ -420,6 +423,43 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         }
 
         Log.d(appTag, "=== Close Audio Record Complete ===")
+        return stopped
+    }
+
+    /**
+     * Abort a bad/stale recording without saving or notifying a completed recording.
+     * Used when the SDK stream gets stuck between stop and start during reconnect.
+     */
+    fun abortRecordingForReconnect(): Boolean {
+        Log.d(appTag, "=== Aborting Audio Record For Reconnect ===")
+        cancelAutoStopCheck()
+        isClosingAudioRecord = true
+        val stopped = runCatching { RokidHostConnection.stopAudioStream() }.getOrDefault(false)
+        isClosingAudioRecord = false
+        isRecording = false
+        lastStopReason = StopReason.ERROR
+        clearAudioCache()
+        Log.d(appTag, "Abort audio record stop sent: $stopped")
+        Log.d(appTag, "=== Abort Audio Record Complete ===")
+        return stopped
+    }
+
+    /**
+     * Force-stop the Rokid audio stream during a user/session close.
+     * This is intentionally unconditional because the SDK can keep the
+     * microphone channel open even after our local recording flag fell behind.
+     */
+    fun abortRecordingForSessionClose(): Boolean {
+        Log.d(appTag, "=== Aborting Audio Record For Session Close ===")
+        cancelAutoStopCheck()
+        isClosingAudioRecord = true
+        val stopped = runCatching { RokidHostConnection.stopAudioStream() }.getOrDefault(false)
+        isClosingAudioRecord = false
+        isRecording = false
+        lastStopReason = StopReason.MANUAL
+        clearAudioCache()
+        Log.d(appTag, "Session-close audio stop sent: $stopped")
+        Log.d(appTag, "=== Abort Audio Record For Session Close Complete ===")
         return stopped
     }
 

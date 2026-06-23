@@ -34,10 +34,15 @@
     <string name="toast_hi_rokid_channel_connected">Hi-Rokid-Kanal verbunden</string>
     <string name="toast_hi_rokid_channel_failed">Hi-Rokid-Kanal konnte nicht verbunden werden</string>
     <string name="notification_channel_rokid">Hi-Rokid-Verbindung</string>
+    <string name="notification_channel_ai_launch">NeuroGlasses KI-Start</string>
+    <string name="notification_channel_reminders">NeuroGlasses Erinnerungen</string>
     <string name="notification_rokid_title">NeuroGlasses ist mit Hi Rokid verbunden</string>
     <string name="notification_rokid_connecting">Verbinde mit dem Brillenkanal…</string>
     <string name="notification_rokid_connected">Brille bereit. KI-Taste startet NeuroGlasses.</string>
     <string name="notification_rokid_waiting_glasses">Hi Rokid verbunden. Warte auf die Brille.</string>
+    <string name="notification_ai_launch_title">NeuroGlasses startet</string>
+    <string name="notification_ai_launch_text">KI-Taste erkannt. Neuro hört gleich zu.</string>
+    <string name="notification_reminder_title">NeuroGlasses Erinnerung</string>
     <string name="notification_action_stop">Trennen</string>
     <string name="toast_connected">Verbunden!</string>
     <string name="toast_disconnected">Getrennt</string>

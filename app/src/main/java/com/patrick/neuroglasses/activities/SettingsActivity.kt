@@ -2,11 +2,18 @@ package com.patrick.neuroglasses.activities
 
 import android.content.Context
 import android.os.Bundle
+import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
+import android.widget.Spinner
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import com.patrick.neuroglasses.R
+
+private data class GroqModelOption(
+    val label: String,
+    val id: String
+)
 
 class SettingsActivity : AppCompatActivity() {
 
@@ -15,7 +22,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var apiTokenEditText: EditText
     private lateinit var apiTimeoutEditText: EditText
     private lateinit var systemPromptEditText: EditText
-    private lateinit var vlmModelEditText: EditText
+    private lateinit var vlmModelSpinner: Spinner
     private lateinit var vlmMaxTokensEditText: EditText
     private lateinit var asrModelEditText: EditText
     private lateinit var ttsModelEditText: EditText
@@ -40,12 +47,32 @@ class SettingsActivity : AppCompatActivity() {
         const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
         const val DEFAULT_API_TIMEOUT = 15
-        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools nur, wenn der Nutzer eindeutig eine Handlung verlangt, z. B. anrufen, SMS senden, navigieren, Wetter abrufen, suchen, erinnern, Kalender, E-Mail, App öffnen, teilen, Akku prüfen oder ein Foto aufnehmen. Bei Anrufen und SMS ist ein Kontaktname ein gültiger Empfänger: frage nicht nach der Telefonnummer, sondern nutze das Telefon/SMS-Tool mit dem Namen. Bei kurzen Tests wie 'test' bestätigst du nur knapp und öffnest keine Apps."
+        const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools nur, wenn der Nutzer eindeutig eine Handlung verlangt, z. B. anrufen, SMS senden, navigieren, Wetter abrufen, suchen, erinnern, Kalender, E-Mail, App öffnen, teilen, Akku prüfen oder ein Foto aufnehmen. Bei Anrufen und SMS ist ein Kontaktname ein gültiger Empfänger: frage nicht nach der Telefonnummer, sondern nutze das Telefon/SMS-Tool mit dem Namen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze das Erinnerungs-Tool statt nach einem Format zu fragen. Bei kurzen Tests wie 'test' bestätigst du nur knapp und öffnest keine Apps."
         const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
         const val DEFAULT_VLM_MAX_TOKENS = 1024
         const val DEFAULT_ASR_MODEL = "whisper-large-v3"
         const val DEFAULT_TTS_MODEL = "android-system-tts"
         const val DEFAULT_TTS_VOICE = "de-DE"
+
+        private val GROQ_VISION_MODEL_OPTIONS = listOf(
+            GroqModelOption(
+                "Llama 4 Scout 17B (Vision, Tools, Deutsch)",
+                "meta-llama/llama-4-scout-17b-16e-instruct"
+            ),
+            GroqModelOption(
+                "Qwen3.6 27B (Vision, Tools, Deutsch)",
+                "qwen/qwen3.6-27b"
+            )
+        )
+
+        private fun normalizeVlmModel(model: String?): String {
+            val cleanModel = model?.trim().orEmpty()
+            return if (GROQ_VISION_MODEL_OPTIONS.any { it.id == cleanModel }) {
+                cleanModel
+            } else {
+                DEFAULT_VLM_MODEL
+            }
+        }
 
         // Helper functions to get configuration values
         fun getApiBaseUrl(context: Context): String {
@@ -70,7 +97,7 @@ class SettingsActivity : AppCompatActivity() {
 
         fun getVlmModel(context: Context): String {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
-            return prefs.getString(KEY_VLM_MODEL, DEFAULT_VLM_MODEL) ?: DEFAULT_VLM_MODEL
+            return normalizeVlmModel(prefs.getString(KEY_VLM_MODEL, DEFAULT_VLM_MODEL))
         }
 
         fun getVlmMaxTokens(context: Context): Int {
@@ -109,13 +136,15 @@ class SettingsActivity : AppCompatActivity() {
         apiTokenEditText = findViewById(R.id.apiTokenEditText)
         apiTimeoutEditText = findViewById(R.id.apiTimeoutEditText)
         systemPromptEditText = findViewById(R.id.systemPromptEditText)
-        vlmModelEditText = findViewById(R.id.vlmModelEditText)
+        vlmModelSpinner = findViewById(R.id.vlmModelSpinner)
         vlmMaxTokensEditText = findViewById(R.id.vlmMaxTokensEditText)
         asrModelEditText = findViewById(R.id.asrModelEditText)
         ttsModelEditText = findViewById(R.id.ttsModelEditText)
         ttsVoiceEditText = findViewById(R.id.ttsVoiceEditText)
         saveButton = findViewById(R.id.saveButton)
         resetButton = findViewById(R.id.resetButton)
+
+        setupVlmModelSpinner()
 
         // Load current settings
         loadSettings()
@@ -137,7 +166,7 @@ class SettingsActivity : AppCompatActivity() {
         apiTokenEditText.setText(prefs.getString(KEY_API_TOKEN, DEFAULT_API_TOKEN))
         apiTimeoutEditText.setText(prefs.getInt(KEY_API_TIMEOUT, DEFAULT_API_TIMEOUT).toString())
         systemPromptEditText.setText(prefs.getString(KEY_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT))
-        vlmModelEditText.setText(prefs.getString(KEY_VLM_MODEL, DEFAULT_VLM_MODEL))
+        selectVlmModel(getVlmModel(this))
         vlmMaxTokensEditText.setText(prefs.getInt(KEY_VLM_MAX_TOKENS, DEFAULT_VLM_MAX_TOKENS).toString())
         asrModelEditText.setText(prefs.getString(KEY_ASR_MODEL, DEFAULT_ASR_MODEL))
         ttsModelEditText.setText(getTtsModel(this))
@@ -178,12 +207,8 @@ class SettingsActivity : AppCompatActivity() {
             }
             editor.putString(KEY_SYSTEM_PROMPT, systemPrompt)
 
-            // Validate and save VLM model
-            val vlmModel = vlmModelEditText.text.toString().trim()
-            if (vlmModel.isEmpty()) {
-                Toast.makeText(this, "VLM-Modell darf nicht leer sein", Toast.LENGTH_SHORT).show()
-                return
-            }
+            // Save curated Groq VLM model
+            val vlmModel = selectedVlmModel()
             editor.putString(KEY_VLM_MODEL, vlmModel)
 
             // Validate and save VLM max tokens
@@ -234,7 +259,7 @@ class SettingsActivity : AppCompatActivity() {
         apiTokenEditText.setText(DEFAULT_API_TOKEN)
         apiTimeoutEditText.setText(DEFAULT_API_TIMEOUT.toString())
         systemPromptEditText.setText(DEFAULT_SYSTEM_PROMPT)
-        vlmModelEditText.setText(DEFAULT_VLM_MODEL)
+        selectVlmModel(DEFAULT_VLM_MODEL)
         vlmMaxTokensEditText.setText(DEFAULT_VLM_MAX_TOKENS.toString())
         asrModelEditText.setText(DEFAULT_ASR_MODEL)
         ttsModelEditText.setText(DEFAULT_TTS_MODEL)
@@ -242,4 +267,26 @@ class SettingsActivity : AppCompatActivity() {
 
         Toast.makeText(this, "Auf Standardwerte zurückgesetzt", Toast.LENGTH_SHORT).show()
     }
+
+    private fun setupVlmModelSpinner() {
+        val adapter = ArrayAdapter(
+            this,
+            android.R.layout.simple_spinner_item,
+            GROQ_VISION_MODEL_OPTIONS.map { it.label }
+        )
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        vlmModelSpinner.adapter = adapter
+    }
+
+    private fun selectVlmModel(model: String) {
+        val normalizedModel = normalizeVlmModel(model)
+        val index = GROQ_VISION_MODEL_OPTIONS.indexOfFirst { it.id == normalizedModel }
+            .takeIf { it >= 0 }
+            ?: 0
+        vlmModelSpinner.setSelection(index)
+    }
+
+    private fun selectedVlmModel(): String =
+        GROQ_VISION_MODEL_OPTIONS.getOrNull(vlmModelSpinner.selectedItemPosition)?.id
+            ?: DEFAULT_VLM_MODEL
 }

@@ -18,6 +18,7 @@
     <uses-permission android:name="android.permission.READ_CONTACTS" />
     <uses-permission android:name="android.permission.CALL_PHONE" />
     <uses-permission android:name="android.permission.SEND_SMS" />
+    <uses-permission android:name="com.android.alarm.permission.SET_ALARM" />
 
     <!-- Network permissions -->
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
@@ -27,6 +28,8 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
 
     <!-- WiFi permissions (required by Rokid SDK) -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
@@ -70,6 +73,11 @@
         <package android:name="com.google.android.calendar" />
         <package android:name="com.google.android.gm" />
         <package android:name="com.whatsapp" />
+        <package android:name="org.mozilla.firefox" />
+        <package android:name="org.mozilla.firefox_beta" />
+        <package android:name="org.mozilla.fenix" />
+        <package android:name="org.mozilla.firefox_nightly" />
+        <package android:name="org.mozilla.focus" />
 
         <intent>
             <action android:name="com.rokid.sprite.aiapp.externalapp.AUTHORIZATION" />
@@ -89,6 +97,22 @@
         <intent>
             <action android:name="android.intent.action.SENDTO" />
             <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.INSERT" />
+            <data android:mimeType="vnd.android.cursor.item/event" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEARCH" />
+        </intent>
+        <intent>
+            <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_ALARM" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SET_TIMER" />
         </intent>
     </queries>
 
@@ -113,9 +137,14 @@
         <activity
             android:name=".activities.AITestActivity"
             android:exported="false"
-            android:launchMode="singleTop" />
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:turnScreenOn="true" />
         <activity
             android:name=".activities.SettingsActivity"
+            android:exported="false" />
+        <receiver
+            android:name=".receivers.ReminderReceiver"
             android:exported="false" />
         <service
             android:name=".services.RokidConnectionService"

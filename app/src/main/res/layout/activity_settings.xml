@@ -136,13 +136,12 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/systemPromptEditText" />
 
-        <EditText
-            android:id="@+id/vlmModelEditText"
+        <Spinner
+            android:id="@+id/vlmModelSpinner"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
-            android:hint="Modellname für Bild-/Sprachmodell"
-            android:inputType="text"
             android:minHeight="48dp"
+            android:spinnerMode="dropdown"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/vlmModelLabel" />
@@ -158,7 +157,7 @@
             android:layout_marginTop="16dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@+id/vlmModelEditText" />
+            app:layout_constraintTop_toBottomOf="@+id/vlmModelSpinner" />
 
         <EditText
             android:id="@+id/vlmMaxTokensEditText"
