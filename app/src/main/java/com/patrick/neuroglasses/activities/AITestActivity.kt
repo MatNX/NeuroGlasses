@@ -297,6 +297,14 @@ class AITestActivity : AppCompatActivity() {
                 }
             }
 
+
+            override fun onAssistantExternalAppLaunched(label: String) {
+                runOnUiThread {
+                    Log.i(appTag, "External app launched ($label); stopping assistant session")
+                    stopAssistantSessionForExternalApp(label)
+                }
+            }
+
             override fun onOpenAIFailed(error: String) {
                 runOnUiThread {
                     updateProcessingStatus("KI-Anfrage fehlgeschlagen: $error")
@@ -510,6 +518,25 @@ class AITestActivity : AppCompatActivity() {
         } else {
             updateProcessingStatus("Bildaufnahme übersprungen (nicht aktiviert)")
         }
+    }
+
+    /**
+     * Stop the current assistant turn before handing control to a native Android/Rokid app.
+     */
+    private fun stopAssistantSessionForExternalApp(label: String) {
+        isAiSceneOpen = false
+        isStreaming = false
+        updateStatus("$label geöffnet")
+        updateProcessingStatus("Assistent gestoppt – App geöffnet")
+
+        if (audioHelper.isRecording) {
+            audioHelper.closeAudioRecord("AI_assistant")
+        }
+        streamingAudioPlayer.stop()
+        customSceneHelper.stopAudio()
+        customSceneHelper.closeCustomView()
+        showProcessingUI(false)
+        finish()
     }
 
     /**
