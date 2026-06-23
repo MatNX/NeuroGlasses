@@ -251,26 +251,26 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             !chatId.isNullOrBlank() -> sessions.firstOrNull { it.id == chatId }
             !title.isNullOrBlank() -> sessions.firstOrNull { it.title.equals(title, ignoreCase = true) }
             else -> null
-        } ?: return "Chat not found. Use list_chats to see available chat ids and titles."
+        } ?: return "Chat nicht gefunden. Nutze list_chats, um verfügbare Chat-IDs und Titel zu sehen."
         chatPrefs.edit().putString("active_chat_id", session.id).apply()
-        return "Switched to chat '${session.title}' (${session.id})."
+        return "Zu Chat '${session.title}' (${session.id}) gewechselt."
     }
 
     private fun listChats(): String {
         val active = activeChatId()
         val sessions = getChatSessions()
-        if (sessions.isEmpty()) return "No chats exist yet."
+        if (sessions.isEmpty()) return "Es gibt noch keine Chats."
         return sessions.joinToString("\n") { session ->
             val marker = if (session.id == active) "*" else "-"
-            "$marker ${session.title} [${session.id}] (${session.messages.size} messages)"
+            "$marker ${session.title} [${session.id}] (${session.messages.size} Nachrichten)"
         }
     }
 
     private fun renameChat(chatId: String?, title: String): String {
-        if (title.isBlank()) return "A new chat title is required."
+        if (title.isBlank()) return "Ein neuer Chat-Titel ist erforderlich."
         val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatId()
         val updated = updateChatSession(targetId) { it.copy(title = title) }
-        return if (updated == null) "Chat not found." else "Renamed chat to '${updated.title}'."
+        return if (updated == null) "Chat nicht gefunden." else "Chat in '${updated.title}' umbenannt."
     }
 
     /**
@@ -449,66 +449,61 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return listOf(
             AssistantTool(function = ToolFunction(
                 name = "place_phone_call",
-                description = "Hands-free: immediately place a phone call to a number or contact name when CALL_PHONE permission is granted; otherwise report that permission is needed.",
-                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Phone number or contact name.")))
+                description = "Deutschsprachig: Rufe freihändig eine Telefonnummer oder einen Kontakt an, wenn die CALL_PHONE-Berechtigung vorhanden ist; sonst erkläre kurz, dass die Berechtigung fehlt.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Telefonnummer oder Kontaktname.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "send_sms",
-                description = "Hands-free: send an SMS to a number or contact name when SEND_SMS permission is granted.",
+                description = "Deutschsprachig: Sende freihändig eine SMS an eine Telefonnummer oder einen Kontakt, wenn die SEND_SMS-Berechtigung vorhanden ist.",
                 parameters = objectSchema(listOf("recipient", "message"), mapOf(
-                    "recipient" to stringProp("Phone number or contact name."),
-                    "message" to stringProp("Message body to send.")
+                    "recipient" to stringProp("Telefonnummer oder Kontaktname."),
+                    "message" to stringProp("Zu sendender Nachrichtentext.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "start_navigation",
-                description = "Start turn-by-turn navigation to a destination, preferring a maps app that can begin navigation directly.",
-                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Address, landmark, or business name.")))
-            )),
-            AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
-                description = "Start YouTube/YouTube Music playback or search for a requested song, artist, playlist, or genre.",
-                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Music query to play.")))
+                description = "Deutschsprachig: Starte YouTube/YouTube Music oder suche nach gewünschtem Lied, Künstler, Playlist oder Genre.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Musikwunsch.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_rokid_translator",
-                description = "Open the native Rokid real-time translator app/scene if it is installed on the companion phone.",
+                description = "Deutschsprachig: Öffne die native Rokid-Echtzeitübersetzer-App oder Szene, falls sie am Telefon installiert ist.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
                 name = "get_gps_location",
-                description = "Read the phone's last known GPS/network location and return coordinates for the assistant to use hands-free.",
+                description = "Deutschsprachig: Lies den letzten bekannten GPS-/Netzwerkstandort des Telefons aus und gib Koordinaten für freihändige Antworten zurück.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
                 name = "get_weather",
-                description = "Fetch a concise weather report for the current GPS location or a named place without opening a browser.",
-                parameters = objectSchema(emptyList(), mapOf("location" to stringProp("Optional city/place; omit for current GPS location.")))
+                description = "Deutschsprachig: Hole einen kurzen Wetterbericht für den aktuellen Standort oder einen genannten Ort, ohne einen Browser zu öffnen.",
+                parameters = objectSchema(emptyList(), mapOf("location" to stringProp("Optionaler Ort; leer lassen für den aktuellen GPS-Standort.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "web_search",
-                description = "Fetch a short web-search/instant-answer summary without opening a browser.",
-                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
+                description = "Deutschsprachig: Hole eine kurze Websuche- oder Sofortantwort-Zusammenfassung, ohne einen Browser zu öffnen.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Suchanfrage.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "set_timer",
-                description = "Create a hands-free Android timer.",
+                description = "Deutschsprachig: Erstelle freihändig einen Android-Timer.",
                 parameters = objectSchema(listOf("seconds"), mapOf(
-                    "seconds" to mapOf("type" to "integer", "description" to "Timer duration in seconds."),
-                    "label" to stringProp("Optional timer label.")
+                    "seconds" to mapOf("type" to "integer", "description" to "Timer-Dauer in Sekunden."),
+                    "label" to stringProp("Optionale Timer-Beschriftung.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "create_reminder",
-                description = "Store an in-app reminder that can be listed later by the assistant.",
+                description = "Deutschsprachig: Speichere eine In-App-Erinnerung, die später aufgelistet werden kann.",
                 parameters = objectSchema(listOf("text"), mapOf(
-                    "text" to stringProp("Reminder text."),
-                    "when" to stringProp("Optional natural language due time." )
+                    "text" to stringProp("Erinnerungstext."),
+                    "when" to stringProp("Optionale Fälligkeitszeit in natürlicher Sprache." )
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "list_reminders",
-                description = "Read reminders previously stored by the assistant.",
+                description = "Deutschsprachig: Lies zuvor gespeicherte Erinnerungen vor.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
@@ -558,28 +553,28 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "new_chat",
-                description = "Create and switch to a fresh persistent chat thread when the user asks for a new topic, new chat, or separate conversation.",
-                parameters = objectSchema(emptyList(), mapOf("title" to stringProp("Optional title for the new chat.")))
+                description = "Deutschsprachig: Erstelle und öffne einen neuen dauerhaften Chat, wenn der Nutzer ein neues Thema, einen neuen Chat oder ein getrenntes Gespräch möchte.",
+                parameters = objectSchema(emptyList(), mapOf("title" to stringProp("Optionaler Titel für den neuen Chat.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "list_chats",
-                description = "List persistent chat threads with ids, titles, and the active chat marker.",
+                description = "Deutschsprachig: Liste dauerhafte Chats mit IDs, Titeln und Markierung des aktiven Chats auf.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
                 name = "switch_chat",
-                description = "Switch the active persistent chat thread by id or exact title before answering.",
+                description = "Deutschsprachig: Wechsle vor der Antwort per ID oder exaktem Titel in einen anderen dauerhaften Chat.",
                 parameters = objectSchema(emptyList(), mapOf(
-                    "chat_id" to stringProp("Chat id returned by list_chats."),
-                    "title" to stringProp("Chat title to switch to if no id is known.")
+                    "chat_id" to stringProp("Chat-ID aus list_chats."),
+                    "title" to stringProp("Chat-Titel für den Wechsel, falls keine ID bekannt ist.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "rename_chat",
-                description = "Rename the active persistent chat or a specified chat.",
+                description = "Deutschsprachig: Benenne den aktiven oder angegebenen Chat um.",
                 parameters = objectSchema(listOf("title"), mapOf(
-                    "title" to stringProp("New title."),
-                    "chat_id" to stringProp("Optional chat id; omit to rename active chat.")
+                    "title" to stringProp("Neuer Titel."),
+                    "chat_id" to stringProp("Optionale Chat-ID; leer lassen, um den aktiven Chat umzubenennen.")
                 ))
             ))
         )
@@ -595,7 +590,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return when (toolCall.function.name) {
             "place_phone_call" -> placePhoneCall(resolvePhone(arg("recipient")))
             "send_sms" -> sendSms(resolvePhone(arg("recipient")), arg("message"))
-            "start_navigation" -> launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=${Uri.encode(arg("destination"))}")), "turn-by-turn navigation")
             "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
@@ -612,12 +606,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "open_accessibility_settings" -> launchIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), "Bedienungshilfen")
             "new_chat" -> {
                 val session = createChatSession(arg("title"))
-                "Created and switched to new chat '${session.title}' (${session.id})."
+                "Neuer Chat '${session.title}' (${session.id}) erstellt und geöffnet."
             }
             "list_chats" -> listChats()
             "switch_chat" -> switchChat(arg("chat_id"), arg("title"))
             "rename_chat" -> renameChat(arg("chat_id"), arg("title"))
-            else -> "Unknown tool: ${toolCall.function.name}"
+            else -> "Unbekanntes Tool: ${toolCall.function.name}"
         }
     }
 
@@ -634,10 +628,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         context.startActivity(intent)
         shouldStopAssistantTurn = true
         listener?.onAssistantExternalAppLaunched(label)
-        "Started $label hands-free."
+        "$label freihändig gestartet."
     } catch (e: Exception) {
         Log.e(appTag, "Could not start $label", e)
-        "Could not start $label: ${e.message}"
+        "$label konnte nicht gestartet werden: ${e.message}"
     }
 
     private fun hasPermission(permission: String): Boolean = context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
@@ -662,25 +656,25 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun placePhoneCall(phone: String): String {
-        if (phone.isBlank()) return "I need a contact name or phone number to place a call."
-        if (!hasPermission(Manifest.permission.CALL_PHONE)) return "CALL_PHONE permission is required before I can place calls hands-free."
-        return launchIntent(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phone)}")), "phone call")
+        if (phone.isBlank()) return "Ich brauche einen Kontaktnamen oder eine Telefonnummer für den Anruf."
+        if (!hasPermission(Manifest.permission.CALL_PHONE)) return "Die CALL_PHONE-Berechtigung ist nötig, bevor ich freihändig anrufen kann."
+        return launchIntent(Intent(Intent.ACTION_CALL, Uri.parse("tel:${Uri.encode(phone)}")), "Telefonanruf")
     }
 
     private fun sendSms(phone: String, message: String): String {
-        if (phone.isBlank() || message.isBlank()) return "I need both a recipient and message before sending SMS."
-        if (!hasPermission(Manifest.permission.SEND_SMS)) return "SEND_SMS permission is required before I can send texts hands-free."
+        if (phone.isBlank() || message.isBlank()) return "Ich brauche Empfänger und Nachricht, bevor ich eine SMS senden kann."
+        if (!hasPermission(Manifest.permission.SEND_SMS)) return "Die SEND_SMS-Berechtigung ist nötig, bevor ich freihändig SMS senden kann."
         return try {
             context.getSystemService(SmsManager::class.java).sendTextMessage(phone, null, message, null, null)
-            "SMS sent to $phone."
+            "SMS an $phone gesendet."
         } catch (e: Exception) {
             Log.e(appTag, "Could not send SMS", e)
-            "Could not send SMS: ${e.message}"
+            "SMS konnte nicht gesendet werden: ${e.message}"
         }
     }
 
     private fun playYoutubeMusic(query: String): String {
-        if (query.isBlank()) return "I need a song, artist, playlist, or genre to play."
+        if (query.isBlank()) return "Ich brauche ein Lied, einen Künstler, eine Playlist oder ein Genre zum Abspielen."
         val encoded = Uri.encode(query)
         val intents = listOf(
             Intent(Intent.ACTION_VIEW, Uri.parse("vnd.youtube://results?search_query=$encoded")).setPackage("com.google.android.youtube"),
@@ -688,23 +682,23 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             Intent(Intent.ACTION_VIEW, Uri.parse("https://www.youtube.com/results?search_query=$encoded"))
         )
         intents.forEach { intent ->
-            val result = launchIntent(intent, "YouTube music search for $query")
-            if (!result.startsWith("Could not")) return result
+            val result = launchIntent(intent, "YouTube-Musiksuche nach $query")
+            if (!result.contains("konnte nicht gestartet werden")) return result
         }
-        return "Could not start YouTube or YouTube Music."
+        return "YouTube oder YouTube Music konnte nicht gestartet werden."
     }
 
     private fun openRokidTranslator(): String {
         val packageNames = listOf("com.rokid.translate", "com.rokid.translator", "com.rokid.glass.translator", "com.rokid.ai.translate")
         packageNames.forEach { packageName ->
-            context.packageManager.getLaunchIntentForPackage(packageName)?.let { return launchIntent(it, "Rokid real-time translator") }
+            context.packageManager.getLaunchIntentForPackage(packageName)?.let { return launchIntent(it, "Rokid-Echtzeitübersetzer") }
         }
-        return "I could not find the Rokid translator app on this phone."
+        return "Ich konnte die Rokid-Übersetzer-App auf diesem Telefon nicht finden."
     }
 
     private fun getGpsLocation(): String {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
-            return "Location permission is required before I can read GPS hands-free."
+            return "Die Standortberechtigung ist nötig, bevor ich GPS freihändig auslesen kann."
         }
         return try {
             val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
@@ -712,40 +706,40 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             val location = providers.asSequence().mapNotNull { provider ->
                 runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
             }.maxByOrNull { it.time }
-            if (location == null) "No last known location is available yet." else "Current location: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracy}m."
+            if (location == null) "Noch kein letzter bekannter Standort verfügbar." else "Aktueller Standort: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracy}m."
         } catch (e: Exception) {
-            "Could not read location: ${e.message}"
+            "Standort konnte nicht gelesen werden: ${e.message}"
         }
     }
 
     private fun getWeather(location: String): String {
-        val query = if (location.isNotBlank()) location else getGpsLocation().takeIf { it.startsWith("Current location:") }?.let {
+        val query = if (location.isNotBlank()) location else getGpsLocation().takeIf { it.startsWith("Aktueller Standort:") }?.let {
             val lat = Regex("latitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
             val lon = Regex("longitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
             if (lat != null && lon != null) "$lat,$lon" else null
         }.orEmpty()
-        if (query.isBlank()) return "I need a location or GPS permission to fetch weather."
-        return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "weather")
+        if (query.isBlank()) return "Ich brauche einen Ort oder die GPS-Berechtigung, um Wetter abzurufen."
+        return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "Wetter")
     }
 
     private fun webSearch(query: String): String {
-        if (query.isBlank()) return "I need a query to search the web."
+        if (query.isBlank()) return "Ich brauche eine Suchanfrage für die Websuche."
         val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
-        val raw = fetchText(url, "web search")
+        val raw = fetchText(url, "Websuche")
         val parsed = runCatching { gson.fromJson(raw, Map::class.java) as Map<*, *> }.getOrNull() ?: return raw.take(800)
         val abstract = parsed["AbstractText"]?.toString().orEmpty()
         val heading = parsed["Heading"]?.toString().orEmpty()
         val related = (parsed["RelatedTopics"] as? List<*>)?.firstOrNull()?.let { it as? Map<*, *> }?.get("Text")?.toString().orEmpty()
-        return listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n").ifBlank { "No instant answer found for $query." }
+        return listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n").ifBlank { "Keine Sofortantwort für $query gefunden." }
     }
 
     private fun fetchText(url: String, label: String): String = try {
         val request = Request.Builder().url(url).get().build()
         getClient().newCall(request).execute().use { response ->
-            if (!response.isSuccessful) "Could not fetch $label: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
+            if (!response.isSuccessful) "$label konnte nicht abgerufen werden: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
         }
     } catch (e: Exception) {
-        "Could not fetch $label: ${e.message}"
+        "$label konnte nicht abgerufen werden: ${e.message}"
     }
 
     private fun setTimer(seconds: Int, label: String): String {
@@ -865,7 +859,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Nutze die verfügbaren Tools proaktiv, damit der Nutzer das Telefon nach der Einrichtung möglichst nicht mehr ansehen muss. Frage nur nach, wenn für Aktionen wie Anruf, SMS, Navigation, Kalender oder E-Mail wichtige Angaben fehlen. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation steht absichtlich nicht als Tool zur Verfügung. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
