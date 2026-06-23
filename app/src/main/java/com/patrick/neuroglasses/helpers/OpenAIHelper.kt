@@ -314,6 +314,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         fun onAssistantToolCall(toolName: String, arguments: Map<String, String>): String? = null
 
         /**
+         * Called when a tool successfully opens another Android app or system screen.
+         * The current assistant turn should stop immediately so it does not reopen the
+         * glasses chat UI or keep audio resources alive over the launched app.
+         */
+        fun onAssistantExternalAppLaunched(label: String) {}
+
+        /**
          * Called when OpenAI API call fails
          * @param error Error message
          */
@@ -619,9 +626,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return parsed.mapNotNull { (key, value) -> key?.toString()?.let { it to value?.toString().orEmpty() } }.toMap()
     }
 
+    @Volatile
+    private var shouldStopAssistantTurn = false
+
     private fun launchIntent(intent: Intent, label: String): String = try {
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         context.startActivity(intent)
+        shouldStopAssistantTurn = true
+        listener?.onAssistantExternalAppLaunched(label)
         "Started $label hands-free."
     } catch (e: Exception) {
         Log.e(appTag, "Could not start $label", e)
@@ -872,7 +884,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     )
                 )
 
+                shouldStopAssistantTurn = false
                 val toolMessages = resolveToolCallsIfNeeded(messagesList)
+                if (shouldStopAssistantTurn) {
+                    Log.i(appTag, "Assistant turn stopped after launching external app")
+                    return@Thread
+                }
 
                 // Create the request with streaming enabled. Tools are resolved in a prior
                 // non-streaming pass so the final response can stream cleanly to the glasses.
