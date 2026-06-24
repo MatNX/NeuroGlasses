@@ -2328,9 +2328,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
                     val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return ToolResolutionResult(messagesList, toolResults)
                     val toolCalls = assistantMessage.toolCalls.orEmpty()
-                    messagesList.add(assistantMessage)
 
-                    if (toolCalls.isEmpty()) return ToolResolutionResult(messagesList, toolResults)
+                    if (toolCalls.isEmpty()) {
+                        val directText = messageContentToText(assistantMessage.content).trim()
+                        if (directText.isNotBlank()) {
+                            Log.d(appTag, "Tool planning produced direct text without tool calls; streaming the original user request instead")
+                        }
+                        return ToolResolutionResult(messagesList, toolResults)
+                    }
+
+                    messagesList.add(assistantMessage)
 
                     Log.d(appTag, "Executing ${toolCalls.size} tool call(s), round ${round + 1}")
                     toolCalls.forEach { toolCall ->
