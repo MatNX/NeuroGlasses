@@ -73,6 +73,30 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/apiTokenLabel" />
 
+        <!-- MapTiler API-Schlüssel Section -->
+        <TextView
+            android:id="@+id/mapTilerApiKeyLabel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="MapTiler API-Schlüssel (Navigation)"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginTop="16dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/apiTokenEditText" />
+
+        <EditText
+            android:id="@+id/mapTilerApiKeyEditText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="MapTiler-API-Schlüssel eingeben"
+            android:inputType="textPassword"
+            android:minHeight="48dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/mapTilerApiKeyLabel" />
+
         <!-- API-Timeout Section -->
         <TextView
             android:id="@+id/apiTimeoutLabel"
@@ -84,7 +108,7 @@
             android:layout_marginTop="16dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@+id/apiTokenEditText" />
+            app:layout_constraintTop_toBottomOf="@+id/mapTilerApiKeyEditText" />
 
         <EditText
             android:id="@+id/apiTimeoutEditText"

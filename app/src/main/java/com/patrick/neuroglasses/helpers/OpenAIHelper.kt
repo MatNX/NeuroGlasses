@@ -27,6 +27,7 @@ import com.google.gson.Gson
 import com.google.gson.annotations.SerializedName
 import com.patrick.neuroglasses.activities.SettingsActivity
 import com.patrick.neuroglasses.receivers.ReminderReceiver
+import com.patrick.neuroglasses.services.RokidConnectionService
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.asRequestBody
@@ -167,6 +168,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+    private val navigationDestinationResolver by lazy { NavigationDestinationResolver(context, appTag) }
     @Volatile private var activeAsrCall: Call? = null
 
     companion object {
@@ -174,6 +176,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         const val LOCAL_TOOL_HANDLED_RESULT = "__neuroglasses_local_tool_handled__"
 
         private const val MAX_TOOL_ROUNDS = 3
+        private const val TOOL_PLANNING_MAX_TOKENS = 256
         private const val MAX_TTS_INPUT_CHARS = 200
         private const val MIN_TTS_AUDIO_BYTES = 44
         private const val MIN_ASR_TIMEOUT_SECONDS = 30L
@@ -575,7 +578,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_rokid_native_app",
-                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, camera, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. For navigation with a destination, use start_navigation so the destination can be forwarded.",
+                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, camera, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. For navigation with a destination, use start_navigation so NeuroGlasses can resolve and confirm the address first.",
                 parameters = objectSchema(listOf("app"), mapOf(
                     "app" to mapOf(
                         "type" to "string",
@@ -602,8 +605,33 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "start_navigation",
-                description = "Open Rokid glasses-side navigation/maps for a destination and forward that target through the Rokid Nav command channel. Prefer this native glasses launch over phone Google Maps whenever the user asks for navigation, route guidance, maps, or directions.",
-                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Exact address, landmark, business name, or destination phrase the user wants to navigate to.")))
+                description = "Resolve an Austrian destination before starting NeuroGlasses background navigation. Use this for navigation, maps, routes, or directions. The tool may return candidate locations and ask the user to confirm one by number. Default mode is public_transit; use foot only when the user explicitly asks to walk or go by foot.",
+                parameters = objectSchema(listOf("destination"), mapOf(
+                    "destination" to stringProp("Best transcript of the destination/address, preserving all heard German street/place words, house numbers, postcodes, and city names."),
+                    "mode" to mapOf(
+                        "type" to "string",
+                        "description" to "Route preference. Default public_transit; use foot for explicit walking/by-foot requests.",
+                        "enum" to listOf("public_transit", "foot")
+                    )
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "confirm_navigation_destination",
+                description = "Confirm or refine a pending navigation destination after start_navigation returned candidate options. Use this when the user says 'eins', 'die zweite', 'ja die erste', a candidate name, or gives a corrected address. If corrected, pass the corrected text as destination.",
+                parameters = objectSchema(listOf("selection"), mapOf(
+                    "selection" to stringProp("The user's choice such as '1', 'eins', 'zweite', a candidate name, 'nein', or the corrected spoken text."),
+                    "destination" to stringProp("Optional corrected full destination/address if the user did not choose one of the numbered options."),
+                    "mode" to mapOf(
+                        "type" to "string",
+                        "description" to "Optional route preference to keep or override.",
+                        "enum" to listOf("public_transit", "foot")
+                    )
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "stop_navigation",
+                description = "Stop the active NeuroGlasses background navigation session when the user asks to end, cancel, or stop navigation.",
+                parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
@@ -746,7 +774,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "find_contact_phone" -> findContactPhone(arg("recipient"))
             "stop_conversation" -> "Conversation stopped."
             "open_rokid_native_app" -> openRokidNativeApp(arg("app"))
-            "start_navigation" -> openRokidNavigation(arg("destination"))
+            "start_navigation" -> startOsmNavigation(arg("destination"), arg("mode"))
+            "confirm_navigation_destination" -> confirmOsmNavigationDestination(arg("selection"), arg("destination"), arg("mode"))
+            "stop_navigation" -> stopOsmNavigation()
             "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
@@ -776,6 +806,18 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val parsed = runCatching { gson.fromJson(arguments, Map::class.java) as Map<*, *> }.getOrDefault(emptyMap<Any, Any>())
         return parsed.mapNotNull { (key, value) -> key?.toString()?.let { it to value?.toString().orEmpty() } }.toMap()
     }
+
+    private fun shouldDeferAfterToolResult(toolName: String, result: String): Boolean =
+        toolName in setOf("start_navigation", "confirm_navigation_destination")
+
+    private fun navigationActuallyStarted(result: String): Boolean =
+        result.startsWith("Navigation mode started", ignoreCase = true)
+
+    private fun toolResultLooksFailed(result: String): Boolean =
+        result.startsWith("Could not", ignoreCase = true) ||
+            result.startsWith("I need", ignoreCase = true) ||
+            result.contains("permission is required", ignoreCase = true) ||
+            result.contains("failed", ignoreCase = true)
 
     private fun buildToolResultFallback(results: List<String>): String {
         if (results.isEmpty()) return ""
@@ -1071,6 +1113,54 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun openRokidTranslator(): String = openRokidNativeApp("translator")
+
+    private fun startOsmNavigation(destination: String, mode: String): String {
+        val cleanMode = mode.ifBlank { "public_transit" }
+        val resolution = navigationDestinationResolver.resolve(destination, cleanMode)
+        return when (resolution.status) {
+            NavigationDestinationResolver.Status.CONFIRMED -> {
+                val selected = resolution.selected ?: return resolution.message
+                RokidConnectionService.startNavigation(
+                    context = context,
+                    destination = selected.shortLabel,
+                    mode = resolution.mode.ifBlank { cleanMode },
+                    latitude = selected.latitude,
+                    longitude = selected.longitude
+                )
+            }
+            NavigationDestinationResolver.Status.NEEDS_CONFIRMATION,
+            NavigationDestinationResolver.Status.NOT_FOUND,
+            NavigationDestinationResolver.Status.ERROR,
+            NavigationDestinationResolver.Status.CANCELLED -> resolution.message
+        }
+    }
+
+    private fun confirmOsmNavigationDestination(selection: String, destination: String, mode: String): String {
+        val resolution = navigationDestinationResolver.confirm(
+            selection = selection,
+            refinedDestination = destination.takeIf { it.isNotBlank() },
+            modeOverride = mode.takeIf { it.isNotBlank() }
+        )
+        return when (resolution.status) {
+            NavigationDestinationResolver.Status.CONFIRMED -> {
+                val selected = resolution.selected ?: return resolution.message
+                RokidConnectionService.startNavigation(
+                    context = context,
+                    destination = selected.shortLabel,
+                    mode = resolution.mode.ifBlank { "public_transit" },
+                    latitude = selected.latitude,
+                    longitude = selected.longitude
+                )
+            }
+            NavigationDestinationResolver.Status.NEEDS_CONFIRMATION,
+            NavigationDestinationResolver.Status.NOT_FOUND,
+            NavigationDestinationResolver.Status.ERROR,
+            NavigationDestinationResolver.Status.CANCELLED -> resolution.message
+        }
+    }
+
+    private fun stopOsmNavigation(): String =
+        RokidConnectionService.stopNavigation(context)
 
     private fun openRokidNavigation(destination: String): String {
         val launchResult = RokidHostConnection.openGlassApp(rokidNavigationTargets())
@@ -2129,7 +2219,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             else ->
                 "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
         }
-        val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Entscheide semantisch, ob ein Tool nötig ist; verlasse dich nicht auf Wortlisten. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Wenn der Nutzer etwas über die aktuelle Sicht, ein Bild, sichtbare Details, Objekte, Hände, Anzahlen, Farben, Schilder, Text oder Übersetzung von sichtbarem Text wissen will und noch kein Bild angehängt ist, nutze snap_glasses_photo. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. Bei aktuellen Fakten, Nachrichten, Webinhalten, Preisen, Öffnungszeiten oder allem, was sich ändern kann, nutze web_search; beantworte danach aus den gelesenen Quellen und sag knapp, wenn Seiten nicht lesbar waren. $sessionPrompt"
+        val systemPrompt = getSystemPrompt() + "\n\nDeutsch (Österreich), kurz und freihändig. Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Natürliche Erinnerungszeiten sind ok. Aktuelles/Web/Preise/Öffnungszeiten: web_search. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
@@ -2304,7 +2394,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val request = OpenAIRequest(
                     model = getVlmModel(),
                     messages = messagesList,
-                    maxTokens = getVlmMaxTokens(),
+                    maxTokens = TOOL_PLANNING_MAX_TOKENS,
                     stream = false,
                     tools = tools,
                     toolChoice = "auto"
@@ -2348,6 +2438,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                         }
                         toolResults += "${toolCall.function.name}: $result"
                         listener?.onAssistantToolResult(toolCall.function.name, result)
+                        if (shouldDeferAfterToolResult(toolCall.function.name, result)) {
+                            Log.d(appTag, "Tool ${toolCall.function.name} completed locally; deferring final assistant response")
+                            return ToolResolutionResult(messagesList, toolResults, deferred = true)
+                        }
                         messagesList.add(
                             Message(
                                 role = "tool",

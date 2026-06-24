@@ -20,6 +20,7 @@ class SettingsActivity : AppCompatActivity() {
     // UI Components
     private lateinit var apiBaseUrlEditText: EditText
     private lateinit var apiTokenEditText: EditText
+    private lateinit var mapTilerApiKeyEditText: EditText
     private lateinit var apiTimeoutEditText: EditText
     private lateinit var systemPromptEditText: EditText
     private lateinit var vlmModelSpinner: Spinner
@@ -35,6 +36,7 @@ class SettingsActivity : AppCompatActivity() {
         const val PREFS_NAME = "GroqSettings"
         const val KEY_API_BASE_URL = "api_base_url"
         const val KEY_API_TOKEN = "api_token"
+        const val KEY_MAPTILER_API_KEY = "maptiler_api_key"
         const val KEY_API_TIMEOUT = "api_timeout"
         const val KEY_SYSTEM_PROMPT = "system_prompt"
         const val KEY_VLM_MODEL = "vlm_model"
@@ -46,6 +48,7 @@ class SettingsActivity : AppCompatActivity() {
         // Default values
         const val DEFAULT_API_BASE_URL = "https://api.groq.com/openai/v1"
         const val DEFAULT_API_TOKEN = ""
+        const val DEFAULT_MAPTILER_API_KEY = ""
         const val DEFAULT_API_TIMEOUT = 15
         const val DEFAULT_SYSTEM_PROMPT = "Du bist ein deutschsprachiger KI-Assistent für Rokid-AR-Brillen in Österreich. Antworte kurz, natürlich und freihändig nutzbar. Nutze Tools nur, wenn der Nutzer eindeutig eine Handlung verlangt, z. B. anrufen, SMS senden, navigieren, Wetter abrufen, suchen, erinnern, Kalender, E-Mail, App öffnen, teilen, Akku prüfen oder ein Foto aufnehmen. Bei Anrufen und SMS ist ein Kontaktname ein gültiger Empfänger: frage nicht nach der Telefonnummer, sondern nutze das Telefon/SMS-Tool mit dem Namen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze das Erinnerungs-Tool statt nach einem Format zu fragen. Bei kurzen Tests wie 'test' bestätigst du nur knapp und öffnest keine Apps."
         const val DEFAULT_VLM_MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
@@ -83,6 +86,11 @@ class SettingsActivity : AppCompatActivity() {
         fun getApiToken(context: Context): String {
             val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
             return prefs.getString(KEY_API_TOKEN, DEFAULT_API_TOKEN) ?: DEFAULT_API_TOKEN
+        }
+
+        fun getMapTilerApiKey(context: Context): String {
+            val prefs = context.getSharedPreferences(PREFS_NAME, MODE_PRIVATE)
+            return prefs.getString(KEY_MAPTILER_API_KEY, DEFAULT_MAPTILER_API_KEY) ?: DEFAULT_MAPTILER_API_KEY
         }
 
         fun getApiTimeout(context: Context): Int {
@@ -134,6 +142,7 @@ class SettingsActivity : AppCompatActivity() {
         // Initialize UI components
         apiBaseUrlEditText = findViewById(R.id.apiBaseUrlEditText)
         apiTokenEditText = findViewById(R.id.apiTokenEditText)
+        mapTilerApiKeyEditText = findViewById(R.id.mapTilerApiKeyEditText)
         apiTimeoutEditText = findViewById(R.id.apiTimeoutEditText)
         systemPromptEditText = findViewById(R.id.systemPromptEditText)
         vlmModelSpinner = findViewById(R.id.vlmModelSpinner)
@@ -164,6 +173,7 @@ class SettingsActivity : AppCompatActivity() {
 
         apiBaseUrlEditText.setText(prefs.getString(KEY_API_BASE_URL, DEFAULT_API_BASE_URL))
         apiTokenEditText.setText(prefs.getString(KEY_API_TOKEN, DEFAULT_API_TOKEN))
+        mapTilerApiKeyEditText.setText(prefs.getString(KEY_MAPTILER_API_KEY, DEFAULT_MAPTILER_API_KEY))
         apiTimeoutEditText.setText(prefs.getInt(KEY_API_TIMEOUT, DEFAULT_API_TIMEOUT).toString())
         systemPromptEditText.setText(prefs.getString(KEY_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT))
         selectVlmModel(getVlmModel(this))
@@ -189,6 +199,10 @@ class SettingsActivity : AppCompatActivity() {
             // Save API token
             val apiToken = apiTokenEditText.text.toString().trim()
             editor.putString(KEY_API_TOKEN, apiToken)
+
+            // Save MapTiler API key for navigation geocoding
+            val mapTilerApiKey = mapTilerApiKeyEditText.text.toString().trim()
+            editor.putString(KEY_MAPTILER_API_KEY, mapTilerApiKey)
 
             // Validate and save API timeout
             val apiTimeoutStr = apiTimeoutEditText.text.toString().trim()
@@ -257,6 +271,7 @@ class SettingsActivity : AppCompatActivity() {
     private fun resetToDefaults() {
         apiBaseUrlEditText.setText(DEFAULT_API_BASE_URL)
         apiTokenEditText.setText(DEFAULT_API_TOKEN)
+        mapTilerApiKeyEditText.setText(DEFAULT_MAPTILER_API_KEY)
         apiTimeoutEditText.setText(DEFAULT_API_TIMEOUT.toString())
         systemPromptEditText.setText(DEFAULT_SYSTEM_PROMPT)
         selectVlmModel(DEFAULT_VLM_MODEL)

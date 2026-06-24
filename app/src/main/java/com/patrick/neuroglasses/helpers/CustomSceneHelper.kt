@@ -4,6 +4,8 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.media.MediaPlayer
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Base64
 import android.util.Log
@@ -83,6 +85,10 @@ class CustomSceneHelper(
                 override fun onCustomViewOpened() {
                     Log.d(appTag, "Custom view opened")
                     lastVisibleSceneEventMs = SystemClock.elapsedRealtime()
+                    if (isTransientPopupVisible()) {
+                        Log.d(appTag, "Ignoring custom view opened callback for transient popup")
+                        return
+                    }
                     listener?.onSceneOpened()
 
                     // Play audio if available
@@ -90,6 +96,10 @@ class CustomSceneHelper(
                 }
 
                 override fun onCustomViewError(code: Int, msg: String?) {
+                    if (isTransientPopupVisible()) {
+                        Log.w(appTag, "Ignoring transient popup custom view error: $code $msg")
+                        return
+                    }
                     if (SystemClock.elapsedRealtime() - lastVisibleSceneEventMs < CUSTOM_VIEW_FALSE_ERROR_GRACE_MS) {
                         Log.w(appTag, "Ignoring custom view error after visible scene/update: $code $msg")
                         return
@@ -102,6 +112,10 @@ class CustomSceneHelper(
                 override fun onCustomViewUpdated() {
                     Log.d(appTag, "Custom view updated")
                     lastVisibleSceneEventMs = SystemClock.elapsedRealtime()
+                    if (isTransientPopupVisible()) {
+                        Log.d(appTag, "Ignoring custom view updated callback for transient popup")
+                        return
+                    }
                     listener?.onSceneUpdated()
                 }
 
@@ -281,6 +295,12 @@ class CustomSceneHelper(
      */
     fun displayTextResult(resultText: String): Boolean {
         Log.i(appTag, "Displaying text result: $resultText")
+        if (deferPersistentViewWhilePopupIsVisible(resultText)) {
+            Log.d(appTag, "Persistent text display deferred while transient popup is visible")
+            return true
+        }
+        rememberPersistentView(resultText)
+
         if (!sendAiIcon(force = true)) {
             Log.w(appTag, "Continuing custom view open even though the AI icon was not confirmed")
         }
@@ -343,12 +363,78 @@ class CustomSceneHelper(
     }
 
     /**
+     * Display a short-lived navigation popup without replacing the assistant view permanently.
+     */
+    fun displayNavigationPopup(
+        message: String,
+        durationMs: Long = NAVIGATION_POPUP_DURATION_MS
+    ): Boolean {
+        val cleanMessage = message.trim()
+        if (cleanMessage.isBlank()) return false
+
+        val generation = markTransientPopupVisible(durationMs)
+        val customViewData = """
+            {
+                "type": "RelativeLayout",
+                "props": {
+                    "layout_width": "match_parent",
+                    "layout_height": "match_parent",
+                    "backgroundColor": "#00000000",
+                    "paddingStart": "18dp",
+                    "paddingTop": "18dp",
+                    "paddingEnd": "18dp",
+                    "paddingBottom": "22dp"
+                },
+                "children": [
+                    {
+                        "type": "TextView",
+                        "props": {
+                            "id": "tv_nav_popup",
+                            "layout_width": "match_parent",
+                            "layout_height": "wrap_content",
+                            "text": ${JSONObject.quote("Navigation\n$cleanMessage")},
+                            "textSize": "16sp",
+                            "textColor": "#FF00FF00",
+                            "textStyle": "bold",
+                            "backgroundColor": "#DD000000",
+                            "paddingStart": "18dp",
+                            "paddingTop": "14dp",
+                            "paddingEnd": "18dp",
+                            "paddingBottom": "14dp",
+                            "layout_alignParentBottom": "true",
+                            "layout_alignParentStart": "true",
+                            "layout_alignParentEnd": "true"
+                        }
+                    }
+                ]
+            }
+        """.trimIndent()
+
+        val success = RokidHostConnection.customViewOpen(customViewData)
+        Log.d(appTag, "Open navigation popup success: $success")
+        if (!success) {
+            clearTransientPopup(generation)
+            return false
+        }
+
+        sharedHandler.postDelayed({
+            dismissTransientPopup(generation)
+        }, durationMs)
+        return true
+    }
+
+    /**
      * Update the displayed text
      * @param newText The new text to display
      * @return The status of the request
      */
     fun updateTextResult(newText: String): Boolean {
         Log.i(appTag, "Updating text result: $newText")
+        if (deferPersistentViewWhilePopupIsVisible(newText)) {
+            Log.d(appTag, "Persistent text update deferred while transient popup is visible")
+            return true
+        }
+        rememberPersistentView(newText)
 
         // Create update JSON
         val updateData = """
@@ -378,14 +464,18 @@ class CustomSceneHelper(
      */
     fun closeCustomView(suppressSceneClosedCallback: Boolean = true): Boolean {
         Log.d(appTag, "Closing custom view")
+        clearPersistentView()
+        clearTransientPopup()
         lastVisibleSceneEventMs = 0L
         val requestedAtMs = SystemClock.elapsedRealtime()
         if (suppressSceneClosedCallback) {
             suppressSceneClosedUntilMs = requestedAtMs + APP_CLOSE_EVENT_SUPPRESSION_MS
+            suppressSceneClosedGlobally(APP_CLOSE_EVENT_SUPPRESSION_MS)
         }
         val success = RokidHostConnection.customViewClose()
         if (!success && suppressSceneClosedCallback) {
             suppressSceneClosedUntilMs = requestedAtMs + APP_CLOSE_EVENT_FALSE_SUPPRESSION_MS
+            suppressSceneClosedGlobally(APP_CLOSE_EVENT_FALSE_SUPPRESSION_MS)
         }
         Log.d(appTag, "Close custom view success: $success")
         return success
@@ -393,9 +483,79 @@ class CustomSceneHelper(
 
     private fun shouldSuppressSceneClosedCallback(): Boolean {
         val now = SystemClock.elapsedRealtime()
-        val shouldSuppress = suppressSceneClosedUntilMs > 0L && now <= suppressSceneClosedUntilMs
+        val shouldSuppress = (suppressSceneClosedUntilMs > 0L && now <= suppressSceneClosedUntilMs) ||
+            consumeGlobalSceneClosedSuppression(now)
         suppressSceneClosedUntilMs = 0L
         return shouldSuppress
+    }
+
+    private fun deferPersistentViewWhilePopupIsVisible(text: String): Boolean {
+        synchronized(sceneStateLock) {
+            val now = SystemClock.elapsedRealtime()
+            if (now > transientPopupUntilMs) return false
+            persistentViewVisible = true
+            persistentViewText = text
+            return true
+        }
+    }
+
+    private fun rememberPersistentView(text: String) {
+        synchronized(sceneStateLock) {
+            persistentViewVisible = true
+            persistentViewText = text
+        }
+    }
+
+    private fun clearPersistentView() {
+        synchronized(sceneStateLock) {
+            persistentViewVisible = false
+            persistentViewText = null
+        }
+    }
+
+    private fun markTransientPopupVisible(durationMs: Long): Int {
+        synchronized(sceneStateLock) {
+            transientPopupGeneration += 1
+            transientPopupUntilMs = SystemClock.elapsedRealtime() + durationMs
+            return transientPopupGeneration
+        }
+    }
+
+    private fun clearTransientPopup(generation: Int? = null) {
+        synchronized(sceneStateLock) {
+            if (generation == null || generation == transientPopupGeneration) {
+                transientPopupUntilMs = 0L
+            }
+        }
+    }
+
+    private fun dismissTransientPopup(generation: Int) {
+        val shouldRestore = synchronized(sceneStateLock) {
+            if (generation != transientPopupGeneration) return
+            transientPopupUntilMs = 0L
+            persistentViewVisible && !persistentViewText.isNullOrBlank()
+        }
+
+        suppressSceneClosedGlobally(APP_CLOSE_EVENT_SUPPRESSION_MS)
+        val success = RokidHostConnection.customViewClose()
+        Log.d(appTag, "Dismiss navigation popup success: $success")
+
+        if (shouldRestore) {
+            sharedHandler.postDelayed({
+                restorePersistentViewAfterPopup(generation)
+            }, NAVIGATION_POPUP_RESTORE_DELAY_MS)
+        }
+    }
+
+    private fun restorePersistentViewAfterPopup(generation: Int) {
+        val textToRestore = synchronized(sceneStateLock) {
+            if (generation != transientPopupGeneration) return
+            if (!persistentViewVisible) return
+            persistentViewText
+        } ?: return
+
+        Log.d(appTag, "Restoring persistent custom view after navigation popup")
+        displayTextResult(textToRestore)
     }
 
     /**
@@ -415,5 +575,41 @@ class CustomSceneHelper(
         private const val CUSTOM_VIEW_FALSE_ERROR_GRACE_MS = 1200L
         private const val APP_CLOSE_EVENT_SUPPRESSION_MS = 1000L
         private const val APP_CLOSE_EVENT_FALSE_SUPPRESSION_MS = 250L
+        private const val NAVIGATION_POPUP_DURATION_MS = 5_500L
+        private const val NAVIGATION_POPUP_RESTORE_DELAY_MS = 180L
+
+        private val sharedHandler = Handler(Looper.getMainLooper())
+        private val sceneStateLock = Any()
+        private var persistentViewText: String? = null
+        private var persistentViewVisible = false
+        private var transientPopupUntilMs = 0L
+        private var transientPopupGeneration = 0
+        private var globalSuppressSceneClosedUntilMs = 0L
+
+        private fun suppressSceneClosedGlobally(durationMs: Long) {
+            synchronized(sceneStateLock) {
+                globalSuppressSceneClosedUntilMs = maxOf(
+                    globalSuppressSceneClosedUntilMs,
+                    SystemClock.elapsedRealtime() + durationMs
+                )
+            }
+        }
+
+        private fun consumeGlobalSceneClosedSuppression(now: Long): Boolean {
+            synchronized(sceneStateLock) {
+                val shouldSuppress = globalSuppressSceneClosedUntilMs > 0L &&
+                    now <= globalSuppressSceneClosedUntilMs
+                if (shouldSuppress) {
+                    globalSuppressSceneClosedUntilMs = 0L
+                }
+                return shouldSuppress
+            }
+        }
+
+        private fun isTransientPopupVisible(): Boolean {
+            synchronized(sceneStateLock) {
+                return SystemClock.elapsedRealtime() <= transientPopupUntilMs
+            }
+        }
     }
 }

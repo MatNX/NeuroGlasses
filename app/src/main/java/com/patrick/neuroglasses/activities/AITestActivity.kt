@@ -445,6 +445,25 @@ class AITestActivity : AppCompatActivity() {
             override fun onAssistantToolResult(toolName: String, result: String) {
                 runOnUiThread {
                     if (!isConversationActive || isClosingConversation) return@runOnUiThread
+                    if (isNavigationStartTool(toolName) && navigationActuallyStarted(result)) {
+                        Log.d(appTag, "Navigation tool result: $result")
+                        closeConversation("Navigation gestartet.")
+                        return@runOnUiThread
+                    }
+                    if (isNavigationStartTool(toolName)) {
+                        val message = localizeToolResult(result)
+                        updateProcessingStatus(message)
+                        if (hasOpenedStreamingView) {
+                            customSceneHelper.updateTextResult(message)
+                        } else {
+                            hasOpenedStreamingView = true
+                            customSceneHelper.displayTextResult(message)
+                        }
+                        lastResultText = message
+                        rememberConversationTurn(currentInstructionText, message)
+                        speakLocalResultOrRestart(message)
+                        return@runOnUiThread
+                    }
                     if (isNativeRokidTool(toolName)) {
                         Log.d(appTag, "Native Rokid tool result: $result")
                         closeConversation("Native Rokid app opened.", finishAiSession = false)
@@ -595,6 +614,20 @@ class AITestActivity : AppCompatActivity() {
     private fun usesSystemTts(): Boolean =
         SettingsActivity.getTtsModel(this).equals(SettingsActivity.DEFAULT_TTS_MODEL, ignoreCase = true)
 
+    private fun speakLocalResultOrRestart(response: String) {
+        if (useTtsCheckBox.isChecked && shouldSpeakResponse(response)) {
+            RokidHostConnection.sendTtsContent(response)
+            if (usesSystemTts()) {
+                systemTtsPlayer.speak(response, SettingsActivity.getTtsVoice(this))
+            } else {
+                val audioDir = getExternalFilesDir("tts_audio") ?: filesDir
+                openAIHelper.callTtsAPI(response, audioDir, streaming = false)
+            }
+        } else {
+            restartConversationListening()
+        }
+    }
+
     private fun toolNeedsUnlockedPhone(toolName: String): Boolean =
         toolName in setOf(
             "place_phone_call",
@@ -625,6 +658,8 @@ class AITestActivity : AppCompatActivity() {
         "find_contact_phone" -> "Kontakt-Suche"
         "open_rokid_native_app" -> "Rokid-App"
         "start_navigation" -> "Navigation"
+        "confirm_navigation_destination" -> "Navigationsziel"
+        "stop_navigation" -> "Navigation stoppen"
         "play_youtube_music" -> "YouTube"
         "open_rokid_translator" -> "Rokid-Übersetzer"
         "get_gps_location" -> "Standort"
@@ -653,10 +688,15 @@ class AITestActivity : AppCompatActivity() {
         else -> result
     }
 
+    private fun isNavigationStartTool(toolName: String): Boolean =
+        toolName == "start_navigation" || toolName == "confirm_navigation_destination"
+
+    private fun navigationActuallyStarted(result: String): Boolean =
+        result.startsWith("Navigation mode started", ignoreCase = true)
+
     private fun isNativeRokidTool(toolName: String): Boolean =
         toolName == "open_rokid_native_app" ||
-            toolName == "open_rokid_translator" ||
-            toolName == "start_navigation"
+            toolName == "open_rokid_translator"
 
     private fun rememberConversationTurn(userText: String, assistantText: String) {
         val cleanUserText = userText.trim()

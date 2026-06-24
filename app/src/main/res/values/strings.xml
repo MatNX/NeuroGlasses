@@ -43,7 +43,9 @@
     <string name="notification_ai_launch_title">NeuroGlasses startet</string>
     <string name="notification_ai_launch_text">KI-Taste erkannt. Neuro hört gleich zu.</string>
     <string name="notification_reminder_title">NeuroGlasses Erinnerung</string>
+    <string name="notification_navigation_title">NeuroGlasses Navigation läuft</string>
     <string name="notification_action_stop">Trennen</string>
+    <string name="notification_action_stop_navigation">Navigation stoppen</string>
     <string name="toast_connected">Verbunden!</string>
     <string name="toast_disconnected">Getrennt</string>
     <string name="toast_connection_failed">Verbindung fehlgeschlagen: %s</string>
