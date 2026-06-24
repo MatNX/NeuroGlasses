@@ -178,6 +178,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val MIN_TTS_AUDIO_BYTES = 44
         private const val MIN_ASR_TIMEOUT_SECONDS = 30L
         private const val ROKID_SPRITE_LAUNCHER_PACKAGE = "com.rokid.os.sprite.launcher"
+        private const val WEB_SEARCH_MAX_RESULTS = 5
+        private const val WEB_SEARCH_MAX_PAGES_TO_READ = 3
+        private const val WEB_SEARCH_MAX_OUTPUT_CHARS = 5000
+        private const val WEB_SEARCH_USER_AGENT =
+            "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) NeuroGlasses/1.0 Mobile Safari/537.36"
     }
 
     private data class ContactPhone(
@@ -209,6 +214,18 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val requestChatId: String?,
         val hasImage: Boolean,
         val deferred: Boolean = false
+    )
+
+    private data class WebSearchResult(
+        val title: String,
+        val url: String,
+        val snippet: String
+    )
+
+    private data class WebPageRead(
+        val source: WebSearchResult,
+        val excerpt: String = "",
+        val error: String? = null
     )
 
     // Get configuration from SharedPreferences
@@ -610,7 +627,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "web_search",
-                description = "Fetch a short web-search/instant-answer summary without opening a browser.",
+                description = "Search the web, open the most relevant result pages, and return compact source excerpts without opening a visible browser.",
                 parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
             )),
             AssistantTool(function = ToolFunction(
@@ -762,13 +779,39 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun buildToolResultFallback(results: List<String>): String {
         if (results.isEmpty()) return ""
-        val lastResult = results.last().substringAfter(":").trim()
+        val last = results.last()
+        val toolName = last.substringBefore(":").trim()
+        val lastResult = last.substringAfter(":").trim()
         return when {
+            toolName == "web_search" ->
+                "Ich habe die Websuche ausgeführt, aber danach keinen KI-Antworttext bekommen. Hier sind die Rohfunde:\n${lastResult.take(2600)}"
             lastResult.startsWith("Started ", ignoreCase = true) -> "Erledigt: ${lastResult.removePrefix("Started ").removeSuffix(" hands-free.")} gestartet."
             lastResult.startsWith("Could not", ignoreCase = true) -> "Das hat leider nicht geklappt: $lastResult"
             lastResult.contains("permission", ignoreCase = true) -> "Dafür fehlt noch eine Berechtigung: $lastResult"
             else -> lastResult
         }
+    }
+
+    private fun buildAssistantFailureResponse(
+        reason: String,
+        detail: String? = null,
+        toolResults: List<String> = emptyList()
+    ): String {
+        val toolFallback = buildToolResultFallback(toolResults)
+        val cleanDetail = detail
+            ?.replace(Regex("\\s+"), " ")
+            ?.trim()
+            ?.take(360)
+            .orEmpty()
+
+        return buildString {
+            append("Ich habe gerade keine normale KI-Antwort bekommen: $reason.")
+            if (cleanDetail.isNotBlank()) append(" Details: $cleanDetail")
+            if (toolFallback.isNotBlank()) {
+                append("\n\nSchon ermittelte Ergebnisse:\n")
+                append(toolFallback)
+            }
+        }.take(3200)
     }
 
     private fun visionInstruction(instruction: String): String =
@@ -1184,53 +1227,301 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun webSearch(query: String): String {
-        if (query.isBlank()) return "I need a query to search the web."
-        val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
-        val raw = fetchText(url, "web search")
-        val parsed = runCatching { gson.fromJson(raw, Map::class.java) as Map<*, *> }.getOrNull() ?: return raw.take(800)
-        val abstract = parsed["AbstractText"]?.toString().orEmpty()
-        val heading = parsed["Heading"]?.toString().orEmpty()
-        val related = (parsed["RelatedTopics"] as? List<*>)?.firstOrNull()?.let { it as? Map<*, *> }?.get("Text")?.toString().orEmpty()
-        val instantAnswer = listOf(heading, abstract, related).filter { it.isNotBlank() }.joinToString("\n")
-        if (instantAnswer.isNotBlank()) return instantAnswer.take(900)
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return "I need a query to search the web."
 
-        val htmlUrl = "https://html.duckduckgo.com/html/?q=${URLEncoder.encode(query, "UTF-8")}"
-        val html = fetchText(htmlUrl, "web search results")
-        if (html.startsWith("Could not", ignoreCase = true)) return html
-        val results = parseDuckDuckGoHtmlResults(html)
-        return results.ifEmpty { listOf("No useful web-search result found for $query.") }
-            .take(3)
-            .joinToString("\n")
+        val searchErrors = mutableListOf<String>()
+        val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
+        val results = searchDuckDuckGo(
+            "https://html.duckduckgo.com/html/?q=$encodedQuery",
+            "DuckDuckGo HTML search",
+            searchErrors
+        ).ifEmpty {
+            searchDuckDuckGo(
+                "https://lite.duckduckgo.com/lite/?q=$encodedQuery",
+                "DuckDuckGo Lite search",
+                searchErrors
+            )
+        }.distinctBy { it.url }
+            .take(WEB_SEARCH_MAX_RESULTS)
+
+        if (results.isEmpty()) {
+            val instantFallback = fetchDuckDuckGoInstantFallback(cleanQuery)
+            val diagnostics = searchErrors.distinct().joinToString("; ").takeIf { it.isNotBlank() }
+            return buildString {
+                append("Ich konnte keine normalen Web-Suchergebnisse öffnen.")
+                diagnostics?.let { append(" Ursache: $it.") }
+                if (instantFallback.isNotBlank()) {
+                    append("\nFallback-Info:\n")
+                    append(instantFallback)
+                } else {
+                    append(" Ich habe deshalb keine belastbaren Quellen für \"$cleanQuery\" gefunden.")
+                }
+            }.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
+        }
+
+        val pageReads = results.take(WEB_SEARCH_MAX_PAGES_TO_READ).map { result ->
+            readWebPage(result, cleanQuery)
+        }
+        val readablePages = pageReads.filter { it.excerpt.isNotBlank() }
+
+        return buildString {
+            append("Websuche für \"$cleanQuery\".\n")
+            append("Top-Treffer:\n")
+            results.forEachIndexed { index, result ->
+                append("${index + 1}. ${result.title} - ${result.url}")
+                if (result.snippet.isNotBlank()) append("\n   ${result.snippet}")
+                append("\n")
+            }
+
+            if (readablePages.isEmpty()) {
+                append("Ich konnte die Trefferliste lesen, aber keine Ergebnisseite zuverlässig öffnen.\n")
+            } else {
+                append("Geöffnete Seiten und relevante Auszüge:\n")
+                readablePages.forEachIndexed { index, page ->
+                    append("[${index + 1}] ${page.source.title}\n")
+                    append("${page.source.url}\n")
+                    append(page.excerpt)
+                    append("\n")
+                }
+            }
+
+            val readFailures = pageReads.filter { it.error != null }
+            if (readFailures.isNotEmpty()) {
+                append("Nicht lesbar: ")
+                append(readFailures.joinToString("; ") { "${it.source.title} (${it.error})" })
+                append("\n")
+            }
+
+            val diagnostics = searchErrors.distinct().joinToString("; ").takeIf { it.isNotBlank() }
+            diagnostics?.let { append("Suchhinweis: $it\n") }
+        }.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
     }
 
-    private fun parseDuckDuckGoHtmlResults(html: String): List<String> {
-        val resultPattern = Regex(
-            """(?s)<a[^>]+class="result__a"[^>]*>(.*?)</a>.*?<a[^>]+class="result__snippet"[^>]*>(.*?)</a>""",
-            RegexOption.IGNORE_CASE
+    private fun searchDuckDuckGo(
+        searchUrl: String,
+        label: String,
+        errors: MutableList<String>
+    ): List<WebSearchResult> {
+        val html = fetchText(searchUrl, label, maxChars = 350_000)
+        if (html.startsWith("Could not", ignoreCase = true)) {
+            errors += html
+            return emptyList()
+        }
+
+        val results = parseDuckDuckGoHtmlResults(html)
+        if (results.isEmpty()) {
+            errors += "$label returned no parseable result links"
+        }
+        return results
+    }
+
+    private fun fetchDuckDuckGoInstantFallback(query: String): String {
+        val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
+        val raw = fetchText(url, "DuckDuckGo instant answer", maxChars = 120_000)
+        if (raw.startsWith("Could not", ignoreCase = true)) return raw
+
+        val parsed = runCatching { gson.fromJson(raw, Map::class.java) as Map<*, *> }.getOrNull() ?: return ""
+        val heading = parsed["Heading"]?.toString().orEmpty()
+        val abstract = parsed["AbstractText"]?.toString().orEmpty()
+        val related = (parsed["RelatedTopics"] as? List<*>)?.firstOrNull()?.let { it as? Map<*, *> }?.get("Text")?.toString().orEmpty()
+        return listOf(heading, abstract, related)
+            .filter { it.isNotBlank() }
+            .joinToString("\n")
+            .take(1200)
+    }
+
+    private fun parseDuckDuckGoHtmlResults(html: String): List<WebSearchResult> {
+        val anchorPattern = Regex(
+            """(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"""
         )
-        return resultPattern.findAll(html).mapNotNull { match ->
-            val title = htmlToPlainText(match.groupValues[1])
-            val snippet = htmlToPlainText(match.groupValues[2])
-            listOf(title, snippet).filter { it.isNotBlank() }.joinToString(": ").takeIf { it.isNotBlank() }
-        }.toList()
+        val anchors = anchorPattern.findAll(html).toList()
+        val primaryResults = anchors.mapIndexedNotNull { index, match ->
+            val url = normalizeSearchResultUrl(match.groupValues[1]) ?: return@mapIndexedNotNull null
+            val title = htmlToPlainText(match.groupValues[2])
+            if (title.isBlank()) return@mapIndexedNotNull null
+            val blockEnd = anchors.getOrNull(index + 1)?.range?.first ?: minOf(html.length, match.range.last + 2500)
+            val block = html.substring(match.range.last + 1, blockEnd)
+            WebSearchResult(
+                title = title.take(180),
+                url = url,
+                snippet = extractSearchSnippet(block).take(320)
+            )
+        }
+
+        return (primaryResults.ifEmpty { parseGenericSearchAnchors(html) })
+            .distinctBy { it.url }
+            .take(WEB_SEARCH_MAX_RESULTS)
+    }
+
+    private fun parseGenericSearchAnchors(html: String): List<WebSearchResult> {
+        val anchorPattern = Regex("""(?is)<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>""")
+        return anchorPattern.findAll(html).mapNotNull { match ->
+            val url = normalizeSearchResultUrl(match.groupValues[1]) ?: return@mapNotNull null
+            val title = htmlToPlainText(match.groupValues[2])
+            if (title.length < 4 || title.equals("next", ignoreCase = true)) return@mapNotNull null
+            WebSearchResult(
+                title = title.take(180),
+                url = url,
+                snippet = ""
+            )
+        }.distinctBy { it.url }
+            .take(WEB_SEARCH_MAX_RESULTS)
+            .toList()
+    }
+
+    private fun extractSearchSnippet(block: String): String {
+        val snippetPattern = Regex(
+            """(?is)class="[^"]*(?:result__snippet|result-snippet)[^"]*"[^>]*>(.*?)</(?:a|div|td)>"""
+        )
+        return snippetPattern.find(block)?.groupValues?.getOrNull(1)?.let { htmlToPlainText(it) }.orEmpty()
+    }
+
+    private fun normalizeSearchResultUrl(rawHref: String): String? {
+        var href = decodeHtmlEntities(rawHref.trim())
+        if (href.startsWith("//")) href = "https:$href"
+        if (href.startsWith("/")) href = "https://duckduckgo.com$href"
+
+        val parsed = runCatching { Uri.parse(href) }.getOrNull() ?: return null
+        val target = parsed.getQueryParameter("uddg")?.let { Uri.decode(it) } ?: href
+        val cleanTarget = decodeHtmlEntities(target)
+        val targetUri = runCatching { Uri.parse(cleanTarget) }.getOrNull() ?: return null
+        val scheme = targetUri.scheme?.lowercase(Locale.ROOT)
+        if (scheme != "http" && scheme != "https") return null
+        val host = targetUri.host.orEmpty().lowercase(Locale.ROOT)
+        if (host.endsWith("duckduckgo.com")) return null
+        return cleanTarget
+    }
+
+    private fun readWebPage(result: WebSearchResult, query: String): WebPageRead {
+        return try {
+            val request = Request.Builder()
+                .url(result.url)
+                .get()
+                .header("User-Agent", WEB_SEARCH_USER_AGENT)
+                .header("Accept-Language", "de,en;q=0.8")
+                .build()
+
+            getClient().newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    return WebPageRead(result, error = "HTTP ${response.code}")
+                }
+
+                val contentType = response.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
+                if (!isReadableWebContent(contentType)) {
+                    return WebPageRead(result, error = contentType.ifBlank { "unknown content type" })
+                }
+
+                val body = response.body?.string().orEmpty()
+                if (body.isBlank()) return WebPageRead(result, error = "empty body")
+
+                val readableText = extractReadableText(body)
+                val excerpt = extractRelevantPassages(readableText, query)
+                    .ifBlank { result.snippet }
+                    .take(1200)
+                if (excerpt.isBlank()) {
+                    WebPageRead(result, error = "no readable text")
+                } else {
+                    WebPageRead(result, excerpt = excerpt)
+                }
+            }
+        } catch (e: Exception) {
+            WebPageRead(result, error = e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private fun isReadableWebContent(contentType: String): Boolean =
+        contentType.isBlank() ||
+            contentType.contains("text/html") ||
+            contentType.contains("text/plain") ||
+            contentType.contains("application/xhtml") ||
+            contentType.contains("application/json") ||
+            contentType.contains("application/ld+json")
+
+    private fun extractReadableText(html: String): String =
+        html
+            .replace(Regex("""(?is)<(script|style|noscript|svg|canvas|header|footer|nav|form)[^>]*>.*?</\1>"""), " ")
+            .replace(Regex("""(?is)<!--.*?-->"""), " ")
+            .let { htmlToPlainText(it) }
+
+    private fun extractRelevantPassages(text: String, query: String): String {
+        val cleanText = text.replace(Regex("\\s+"), " ").trim()
+        if (cleanText.isBlank()) return ""
+
+        val chunks = cleanText
+            .split(Regex("""(?<=[.!?])\s+"""))
+            .map { it.trim() }
+            .filter { it.length in 60..900 }
+        if (chunks.isEmpty()) return cleanText.take(900)
+
+        val terms = searchTerms(query)
+        if (terms.isEmpty()) return chunks.take(3).joinToString(" ").take(1200)
+
+        val scored: List<String> = chunks.mapIndexed { index: Int, chunk: String ->
+            val lower = chunk.lowercase(Locale.ROOT)
+            val termScore = terms.fold(0) { score, term -> score + if (lower.contains(term)) 3 else 0 }
+            val earlyResultBoost = if (index < 8) 1 else 0
+            Triple(termScore + earlyResultBoost, index, chunk)
+        }.filter { it.first > 0 }
+            .sortedWith(compareByDescending<Triple<Int, Int, String>> { it.first }.thenBy { it.second })
+            .take(3)
+            .sortedBy { it.second }
+            .map { it.third }
+
+        return scored.ifEmpty { chunks.take(2) }.joinToString(" ").take(1200)
+    }
+
+    private fun searchTerms(query: String): List<String> {
+        val stopWords = setOf(
+            "der", "die", "das", "den", "dem", "und", "oder", "eine", "einen", "einem", "ist",
+            "sind", "was", "wer", "wie", "wann", "wo", "warum", "bitte", "the", "and", "for",
+            "with", "what", "when", "where", "who", "why", "how", "latest", "news"
+        )
+        return query.lowercase(Locale.ROOT)
+            .split(Regex("""[^\p{L}\p{N}]+"""))
+            .filter { it.length >= 3 && it !in stopWords }
+            .distinct()
+            .take(8)
     }
 
     private fun htmlToPlainText(html: String): String =
         html
             .replace(Regex("<.*?>"), " ")
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&#x27;", "'")
-            .replace("&#39;", "'")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
+            .let { decodeHtmlEntities(it) }
             .replace(Regex("\\s+"), " ")
             .trim()
 
-    private fun fetchText(url: String, label: String): String = try {
-        val request = Request.Builder().url(url).get().build()
+    private fun decodeHtmlEntities(text: String): String =
+        text
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&apos;", "'")
+            .replace("&#x27;", "'")
+            .replace("&#39;", "'")
+            .replace("&nbsp;", " ")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace(Regex("""&#x([0-9a-fA-F]+);""")) { match ->
+                match.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: match.value
+            }
+            .replace(Regex("""&#(\d+);""")) { match ->
+                match.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: match.value
+            }
+
+    private fun fetchText(url: String, label: String, maxChars: Int = Int.MAX_VALUE): String = try {
+        val request = Request.Builder()
+            .url(url)
+            .get()
+            .header("User-Agent", WEB_SEARCH_USER_AGENT)
+            .header("Accept-Language", "de,en;q=0.8")
+            .build()
         getClient().newCall(request).execute().use { response ->
-            if (!response.isSuccessful) "Could not fetch $label: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
+            if (!response.isSuccessful) {
+                "Could not fetch $label: HTTP ${response.code}"
+            } else {
+                val text = response.body?.string()?.trim().orEmpty()
+                if (maxChars == Int.MAX_VALUE) text else text.take(maxChars)
+            }
         }
     } catch (e: Exception) {
         "Could not fetch $label: ${e.message}"
@@ -1549,6 +1840,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         Log.d(appTag, "Has image: ${image != null}")
 
         Thread {
+            var builtChatContext: ChatRequestContext? = null
             try {
                 val chatContext = buildChatRequestContext(
                     instruction = instruction,
@@ -1558,6 +1850,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     persistConversation = persistConversation,
                     conversationHistory = conversationHistory
                 )
+                builtChatContext = chatContext
                 if (chatContext.deferred) {
                     Log.d(appTag, "Assistant tool deferred this request; waiting for local follow-up")
                     return@Thread
@@ -1595,7 +1888,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                             )
                             return@Thread
                         }
-                        listener?.onOpenAIFailed("API call failed: ${response.code}")
+                        deliverFailureResponse(
+                            buildAssistantFailureResponse(
+                                reason = "Der KI-Dienst hat HTTP ${response.code} zurückgegeben",
+                                detail = errorBody,
+                                toolResults = chatContext.toolResults
+                            ),
+                            chatContext,
+                            instruction,
+                            persistConversation
+                        )
                         return@Thread
                     }
 
@@ -1614,7 +1916,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                             )
                             return@Thread
                         }
-                        listener?.onOpenAIFailed("Empty response")
+                        deliverFailureResponse(
+                            buildAssistantFailureResponse(
+                                reason = "Der Antwortkörper war leer",
+                                toolResults = chatContext.toolResults
+                            ),
+                            chatContext,
+                            instruction,
+                            persistConversation
+                        )
                         return@Thread
                     }
 
@@ -1691,7 +2001,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                             )
                             return@Thread
                         }
-                        listener?.onOpenAIFailed("Streaming timeout: server may not be sending proper SSE format")
+                        deliverFailureResponse(
+                            buildAssistantFailureResponse(
+                                reason = "Der Antwortstream ist abgelaufen",
+                                detail = "Der Server hat vermutlich kein kompatibles SSE-Streaming gesendet.",
+                                toolResults = chatContext.toolResults
+                            ),
+                            chatContext,
+                            instruction,
+                            persistConversation
+                        )
                         return@Thread
                     }
 
@@ -1731,18 +2050,44 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                             )
                         } else {
                             Log.w(appTag, "Streaming completed but no content was received")
-                            val genericFallback = "Ich habe gerade keine verwertbare Antwort erhalten. Bitte versuch es nochmal."
-                            listener?.onOpenAIStreamingChunk(genericFallback, true)
-                            listener?.onOpenAIResponse(genericFallback)
+                            val genericFallback = buildAssistantFailureResponse(
+                                reason = "Der Antwortstream war leer",
+                                detail = "Die Anfrage wurde gesendet, aber es kam kein Text zurück.",
+                                toolResults = chatContext.toolResults
+                            )
+                            deliverFailureResponse(
+                                genericFallback,
+                                chatContext,
+                                instruction,
+                                persistConversation
+                            )
                         }
                     }
                 }
             } catch (e: IOException) {
                 Log.e(appTag, "Network error: ${e.message}", e)
-                listener?.onOpenAIFailed("Network error: ${e.message}")
+                deliverFailureResponse(
+                    buildAssistantFailureResponse(
+                        reason = "Netzwerkfehler",
+                        detail = e.message,
+                        toolResults = builtChatContext?.toolResults.orEmpty()
+                    ),
+                    builtChatContext,
+                    instruction,
+                    persistConversation
+                )
             } catch (e: Exception) {
                 Log.e(appTag, "Error calling OpenAI Streaming API: ${e.message}", e)
-                listener?.onOpenAIFailed("Error: ${e.message}")
+                deliverFailureResponse(
+                    buildAssistantFailureResponse(
+                        reason = "Interner Fehler bei der KI-Anfrage",
+                        detail = e.message,
+                        toolResults = builtChatContext?.toolResults.orEmpty()
+                    ),
+                    builtChatContext,
+                    instruction,
+                    persistConversation
+                )
             }
         }.start()
     }
@@ -1784,7 +2129,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             else ->
                 "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
         }
-        val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Entscheide semantisch, ob ein Tool nötig ist; verlasse dich nicht auf Wortlisten. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Wenn der Nutzer etwas über die aktuelle Sicht, ein Bild, sichtbare Details, Objekte, Hände, Anzahlen, Farben, Schilder, Text oder Übersetzung von sichtbarem Text wissen will und noch kein Bild angehängt ist, nutze snap_glasses_photo. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. $sessionPrompt"
+        val systemPrompt = getSystemPrompt() + "\n\nAntworte standardmäßig auf Deutsch (Österreich), knapp und freihändig nutzbar. Entscheide semantisch, ob ein Tool nötig ist; verlasse dich nicht auf Wortlisten. Nutze Tools nur bei klarer Handlungsabsicht des Nutzers; kurze Proben wie 'test', 'ping' oder 'hallo' sind nur Gespräch und dürfen keine Apps öffnen, keine Suche starten, keine Übersetzer-App öffnen und kein Foto auslösen. Wenn der Nutzer stoppen, abbrechen oder die Konversation beenden will, nutze stop_conversation. Wenn der Nutzer etwas über die aktuelle Sicht, ein Bild, sichtbare Details, Objekte, Hände, Anzahlen, Farben, Schilder, Text oder Übersetzung von sichtbarem Text wissen will und noch kein Bild angehängt ist, nutze snap_glasses_photo. Bei Rokid-/Brillen-Navigation, Maps, Route oder Wegbeschreibung nutze start_navigation; übergib ein genanntes Ziel exakt im destination-Parameter, damit es an Rokid Nav gesendet wird. Öffne dafür eine native Brillen-App, nicht Google Maps am Telefon. Bei Übersetzen, Echtzeitübersetzung, Voice Translation oder RT Translation nutze open_rokid_translator oder open_rokid_native_app, nicht Google Translate am Telefon. Bei Anruf oder SMS gilt: Ein Kontaktname ist ein vollständiger Empfänger. Frage nicht nach der Telefonnummer, wenn ein Name genannt wurde; rufe place_phone_call oder send_sms mit dem Namen auf und lass die App Kontakte auflösen. Bei Erinnerungen ist natürlicher Zeittext wie 'in 10 Minuten', 'um 14 Uhr' oder 'morgen um 9' ausreichend; nutze create_reminder, statt nach einem Format zu fragen. Frage nur nach, wenn Empfänger, Nachricht, Erinnerungstext oder andere Pflichtangaben wirklich fehlen. Bei Kalender oder E-Mail frage nur nach fehlenden Pflichtangaben. Bei aktuellen Fakten, Nachrichten, Webinhalten, Preisen, Öffnungszeiten oder allem, was sich ändern kann, nutze web_search; beantworte danach aus den gelesenen Quellen und sag knapp, wenn Seiten nicht lesbar waren. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
@@ -1917,6 +2262,30 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 )
             )
         }
+        listener?.onOpenAIResponse(finalResponse)
+    }
+
+    private fun deliverFailureResponse(
+        response: String,
+        chatContext: ChatRequestContext?,
+        instruction: String,
+        persistConversation: Boolean
+    ) {
+        val finalResponse = response.trim()
+        if (finalResponse.isBlank()) return
+
+        if (chatContext != null) {
+            deliverChatResponse(
+                response = finalResponse,
+                chatContext = chatContext,
+                instruction = instruction,
+                persistConversation = persistConversation,
+                emitStreamingChunk = true
+            )
+            return
+        }
+
+        listener?.onOpenAIStreamingChunk(finalResponse, true)
         listener?.onOpenAIResponse(finalResponse)
     }
 

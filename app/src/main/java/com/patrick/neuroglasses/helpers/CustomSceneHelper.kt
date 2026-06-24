@@ -77,6 +77,7 @@ class CustomSceneHelper(
             RokidHostConnection.setCustomViewListener(object : ICustomViewCbk {
                 override fun onCustomViewIconsSent() {
                     Log.d(appTag, "Custom view icons sent")
+                    iconsSent = true
                 }
 
                 override fun onCustomViewOpened() {
@@ -94,6 +95,7 @@ class CustomSceneHelper(
                         return
                     }
                     Log.e(appTag, "Custom view error: $code $msg")
+                    iconsSent = false
                     listener?.onSceneOpenFailed(code)
                 }
 
@@ -112,6 +114,7 @@ class CustomSceneHelper(
                         return
                     }
                     suppressSceneClosedUntilMs = 0L
+                    iconsSent = false
                     listener?.onSceneClosed()
                 }
             })
@@ -195,15 +198,15 @@ class CustomSceneHelper(
      * Send AI icon to glasses
      * @return The status of the request
      */
-    private fun sendAiIcon(): Boolean {
-        if (iconsSent) {
+    private fun sendAiIcon(force: Boolean = false): Boolean {
+        if (iconsSent && !force) {
             Log.d(appTag, "Icons already sent, skipping")
             return true
         }
 
         try {
-            // Load the AI icon from drawable resources using R identifier
-            val bitmap = BitmapFactory.decodeResource(context.resources, R.drawable.ai_icon_small)
+            // Use the Neuro-sama app artwork for the glasses-side assistant icon.
+            val bitmap = BitmapFactory.decodeResource(context.resources, R.drawable.neuro_glasses_icon)
             if (bitmap == null) {
                 Log.e(appTag, "Failed to decode AI icon bitmap")
                 return false
@@ -278,7 +281,9 @@ class CustomSceneHelper(
      */
     fun displayTextResult(resultText: String): Boolean {
         Log.i(appTag, "Displaying text result: $resultText")
-        sendAiIcon()
+        if (!sendAiIcon(force = true)) {
+            Log.w(appTag, "Continuing custom view open even though the AI icon was not confirmed")
+        }
 
         // Keep the text view clear of the icon area; the Rokid renderer can
         // overlap RelativeLayout children during rapid streaming updates.
