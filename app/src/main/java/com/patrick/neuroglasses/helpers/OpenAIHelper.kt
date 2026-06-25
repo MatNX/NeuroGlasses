@@ -166,6 +166,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun getAsrModel(): String = SettingsActivity.getAsrModel(context)
     private fun getTtsModel(): String = SettingsActivity.getTtsModel(context)
     private fun getTtsVoice(): String = SettingsActivity.getTtsVoice(context)
+    private fun getMapTilerApiKey(): String = SettingsActivity.getMapTilerApiKey(context)
 
     // Build OkHttpClient with configurable timeout
     private fun getClient(isStreaming: Boolean = false): OkHttpClient {
@@ -545,8 +546,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "start_navigation",
-                description = "Deutschsprachig: Starte sofort die Navigation zu einem eindeutig erkannten Ziel in Google Maps oder einer Karten-App. Nutze dieses Tool, sobald der Nutzer ein Ziel ausgewählt hat oder die Zielabsicht eindeutig ist; frage nur nach, wenn das Ziel wirklich mehrdeutig ist.",
-                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder ausgewählte Option.")))
+                description = "Deutschsprachig: Geokodiere jedes Navigationsziel zuerst über MapTiler. Starte Navigation nur, wenn MapTiler eine sehr hohe Treffer-Konfidenz liefert; gib sonst die besten Optionen zurück und bitte den Nutzer um Auswahl.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder ausgewählte Option, die zuerst über MapTiler geprüft wird.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_app",
@@ -804,19 +805,84 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return launchIntent(intent, "E-Mail-Entwurf")
     }
 
+    private data class NavigationCandidate(
+        val label: String,
+        val latitude: Double,
+        val longitude: Double,
+        val confidence: Double
+    )
+
     private fun startNavigation(destination: String): String {
-        if (destination.isBlank()) return "Ich brauche ein eindeutiges Navigationsziel."
-        val encoded = Uri.encode(destination)
+        if (destination.isBlank()) return "Ich brauche ein Navigationsziel, das ich zuerst über MapTiler prüfen kann."
+        if (getMapTilerApiKey().isBlank()) return "Navigation braucht zuerst einen MapTiler API-Schlüssel in den Einstellungen."
+
+        val candidates = geocodeWithMapTiler(destination)
+        if (candidates.isEmpty()) {
+            return "MapTiler hat kein passendes Ziel für '$destination' gefunden. Bitte nenne eine genauere Adresse oder einen eindeutigeren Ortsnamen."
+        }
+
+        val best = candidates.first()
+        val secondConfidence = candidates.getOrNull(1)?.confidence ?: 0.0
+        val hasVeryHighConfidence = best.confidence >= 0.90 && (candidates.size == 1 || best.confidence - secondConfidence >= 0.15)
+        if (!hasVeryHighConfidence) {
+            return candidates.take(3).mapIndexed { index, candidate ->
+                "${index + 1}. ${candidate.label} (${(candidate.confidence * 100).toInt()}%)"
+            }.joinToString(
+                prefix = "MapTiler ist nicht sicher genug. Welche Option soll ich nehmen?\n",
+                separator = "\n"
+            )
+        }
+
+        val encodedLabel = Uri.encode(best.label)
+        val coordinateQuery = "${best.latitude},${best.longitude}"
         val intents = listOf(
-            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encoded&mode=w")).setPackage("com.google.android.apps.maps"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encoded")).setPackage("com.google.android.apps.maps"),
-            Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$encoded"))
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$coordinateQuery")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encodedLabel")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("geo:${best.latitude},${best.longitude}?q=$encodedLabel"))
         )
         intents.forEach { intent ->
-            val result = launchIntent(intent, "Navigation zu $destination")
-            if (!result.contains("konnte nicht gestartet werden")) return result
+            val result = launchIntent(intent, "Navigation zu ${best.label}")
+            if (!result.contains("konnte nicht gestartet werden")) return "$result MapTiler-Treffer: ${best.label} (${(best.confidence * 100).toInt()}%)."
         }
-        return "Navigation zu $destination konnte nicht gestartet werden."
+        return "MapTiler hat '${best.label}' sicher gefunden, aber die Navigation konnte nicht gestartet werden."
+    }
+
+    private fun geocodeWithMapTiler(query: String): List<NavigationCandidate> {
+        val apiKey = getMapTilerApiKey()
+        if (apiKey.isBlank()) {
+            Log.w(appTag, "MapTiler API key missing; navigation cannot be geocoded")
+            return emptyList()
+        }
+
+        val url = "https://api.maptiler.com/geocoding/${URLEncoder.encode(query, "UTF-8")}.json?key=${URLEncoder.encode(apiKey, "UTF-8")}&limit=3&language=de"
+        return try {
+            val request = Request.Builder().url(url).get().build()
+            executeTracked(request).use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(appTag, "MapTiler geocoding failed: HTTP ${response.code}")
+                    return emptyList()
+                }
+                val body = response.body?.string().orEmpty()
+                val parsed = gson.fromJson(body, Map::class.java) as? Map<*, *> ?: return emptyList()
+                val features = parsed["features"] as? List<*> ?: return emptyList()
+                features.mapNotNull { feature ->
+                    val item = feature as? Map<*, *> ?: return@mapNotNull null
+                    val center = item["center"] as? List<*> ?: return@mapNotNull null
+                    val longitude = (center.getOrNull(0) as? Number)?.toDouble() ?: return@mapNotNull null
+                    val latitude = (center.getOrNull(1) as? Number)?.toDouble() ?: return@mapNotNull null
+                    val label = item["place_name"]?.toString()?.takeIf { it.isNotBlank() }
+                        ?: item["text"]?.toString()?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val confidence = ((item["relevance"] as? Number)?.toDouble()
+                        ?: (item["score"] as? Number)?.toDouble()
+                        ?: 0.0).coerceIn(0.0, 1.0)
+                    NavigationCandidate(label, latitude, longitude, confidence)
+                }.sortedByDescending { it.confidence }
+            }
+        } catch (e: Exception) {
+            Log.e(appTag, "MapTiler geocoding error", e)
+            emptyList()
+        }
     }
 
     private fun openApp(app: String): String {
@@ -901,7 +967,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar; starte sie direkt bei eindeutiger Zielwahl oder wenn der Nutzer eine angezeigte Option auswählt. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar. Jede Navigationsabsicht muss start_navigation nutzen, damit MapTiler zuerst geokodiert. Starte erst, wenn das Tool eine sehr hohe MapTiler-Konfidenz meldet; wenn das Tool Optionen zurückgibt, zeige diese Optionen und warte auf die Auswahl des Nutzers. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
