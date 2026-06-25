@@ -25,6 +25,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.Collections
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
@@ -152,6 +153,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+    private val activeCalls = Collections.synchronizedSet(mutableSetOf<Call>())
 
 
     // Get configuration from SharedPreferences
@@ -180,6 +182,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun getChatApiUrl(): String = "${getApiBaseUrl()}/chat/completions"
     private fun getAsrApiUrl(): String = "${getApiBaseUrl()}/audio/transcriptions"
     private fun getTtsApiUrl(): String = "${getApiBaseUrl()}/audio/speech"
+
+    fun cancelActiveRequests() {
+        synchronized(activeCalls) {
+            activeCalls.forEach { call -> runCatching { call.cancel() } }
+            activeCalls.clear()
+        }
+        shouldStopAssistantTurn = true
+        Log.i(appTag, "Cancelled active AI network requests")
+    }
+
+    private fun executeTracked(request: Request, isStreaming: Boolean = false): Response {
+        val call = getClient(isStreaming = isStreaming).newCall(request)
+        activeCalls.add(call)
+        return call.execute()
+    }
 
 
     private fun getChatSessions(): MutableList<PersistedChatSession> {
@@ -398,7 +415,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 Log.d(appTag, "Sending ASR request for file: ${audioFile.name} (${audioFile.length()} bytes)")
 
                 // Execute the request
-                getClient().newCall(request).execute().use { response ->
+                executeTracked(request).use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "ASR API call failed: ${response.code} - $errorBody")
@@ -527,6 +544,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 ))
             )),
             AssistantTool(function = ToolFunction(
+                name = "start_navigation",
+                description = "Deutschsprachig: Starte sofort die Navigation zu einem eindeutig erkannten Ziel in Google Maps oder einer Karten-App. Nutze dieses Tool, sobald der Nutzer ein Ziel ausgewählt hat oder die Zielabsicht eindeutig ist; frage nur nach, wenn das Ziel wirklich mehrdeutig ist.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder ausgewählte Option.")))
+            )),
+            AssistantTool(function = ToolFunction(
                 name = "open_app",
                 description = "Deutschsprachig: Öffne eine installierte App anhand von Paketname oder bekanntem App-Namen.",
                 parameters = objectSchema(listOf("app"), mapOf("app" to stringProp("Paketname oder App-Name, z. B. Maps, WhatsApp, Kalender.")))
@@ -600,6 +622,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "list_reminders" -> listReminders()
             "create_calendar_event" -> createCalendarEvent(arg("title"), arg("start"), arg("end"), arg("location"), arg("notes"))
             "send_email" -> sendEmail(arg("to"), arg("subject"), arg("body"))
+            "start_navigation" -> startNavigation(arg("destination"))
             "open_app" -> openApp(arg("app"))
             "share_text" -> shareText(arg("text"))
             "get_battery_status" -> getBatteryStatus()
@@ -739,7 +762,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun fetchText(url: String, label: String): String = try {
         val request = Request.Builder().url(url).get().build()
-        getClient().newCall(request).execute().use { response ->
+        executeTracked(request).use { response ->
             if (!response.isSuccessful) "$label konnte nicht abgerufen werden: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
         }
     } catch (e: Exception) {
@@ -779,6 +802,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .putExtra(Intent.EXTRA_SUBJECT, subject)
             .putExtra(Intent.EXTRA_TEXT, body)
         return launchIntent(intent, "E-Mail-Entwurf")
+    }
+
+    private fun startNavigation(destination: String): String {
+        if (destination.isBlank()) return "Ich brauche ein eindeutiges Navigationsziel."
+        val encoded = Uri.encode(destination)
+        val intents = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encoded&mode=w")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encoded")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("geo:0,0?q=$encoded"))
+        )
+        intents.forEach { intent ->
+            val result = launchIntent(intent, "Navigation zu $destination")
+            if (!result.contains("konnte nicht gestartet werden")) return result
+        }
+        return "Navigation zu $destination konnte nicht gestartet werden."
     }
 
     private fun openApp(app: String): String {
@@ -863,7 +901,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation steht absichtlich nicht als Tool zur Verfügung. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar; starte sie direkt bei eindeutiger Zielwahl oder wenn der Nutzer eine angezeigte Option auswählt. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
@@ -923,7 +961,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 listener?.onOpenAIStreamingStarted()
 
                 // Execute the request with streaming-specific timeout
-                getClient(isStreaming = true).newCall(httpRequest).execute().use { response ->
+                executeTracked(httpRequest, isStreaming = true).use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "API call failed: ${response.code} - $errorBody")
@@ -1052,7 +1090,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .build()
 
         return try {
-            getClient().newCall(httpRequest).execute().use { response ->
+            executeTracked(httpRequest).use { response ->
                 if (!response.isSuccessful) {
                     Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
                     return messagesList
@@ -1154,7 +1192,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     private fun callTtsAPIStreaming(httpRequest: Request, outputDir: File) {
         // Execute the request with streaming
-        getClient(isStreaming = true).newCall(httpRequest).execute().use { response ->
+        executeTracked(httpRequest, isStreaming = true).use { response ->
             val contentType = response.body?.contentType()
             val contentLength = response.body?.contentLength()
             Log.d(appTag, "TTS response received: code=${response.code}, contentType=$contentType, contentLength=$contentLength")
@@ -1247,7 +1285,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     private fun callTtsAPINonStreaming(httpRequest: Request, outputDir: File) {
         // Execute the request
-        getClient().newCall(httpRequest).execute().use { response ->
+        executeTracked(httpRequest).use { response ->
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
                 Log.e(appTag, "TTS API call failed: ${response.code} - $errorBody")
