@@ -99,6 +99,11 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         override fun onAudioReceived(data: ByteArray, offset: Int, length: Int) {
             Log.d(appTag, "Audio data received - Offset: $offset, Length: $length")
 
+            if (!isRecording) {
+                Log.v(appTag, "Ignoring audio chunk because no recording is active")
+                return
+            }
+
             if (length <= 0) return
 
             Log.i(appTag, "Audio chunk: $length bytes")
@@ -120,10 +125,15 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         override fun onAudioError(code: Int, msg: String?) {
             Log.e(appTag, "Audio stream error: $code $msg")
             lastStopReason = StopReason.ERROR
-            cancelAutoStopCheck()
-            isRecording = false
             isClosingAudioRecord = false
-            listener?.onAudioRecordingFailed(msg ?: "Audio stream error $code")
+            if (audioChunks.isNotEmpty()) {
+                Log.w(appTag, "Audio stream failed after receiving data; saving buffered audio before reconnect")
+                finishStoppedRecording()
+            } else {
+                cancelAutoStopCheck()
+                isRecording = false
+                listener?.onAudioRecordingFailed(msg ?: "Audio stream error $code")
+            }
         }
     }
 
@@ -417,8 +427,12 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         if (stopped) {
             Log.i(appTag, "Audio recording stopped successfully")
             finishStoppedRecording()
+        } else if (audioChunks.isNotEmpty()) {
+            Log.w(appTag, "Audio stop failed after receiving data; saving buffered audio anyway")
+            finishStoppedRecording()
         } else {
             Log.e(appTag, "Failed to stop audio recording")
+            isRecording = false
             listener?.onAudioRecordingFailed("Audio stop failed")
         }
 

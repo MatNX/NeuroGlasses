@@ -177,6 +177,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         private const val MAX_TOOL_ROUNDS = 3
         private const val TOOL_PLANNING_MAX_TOKENS = 256
+        private const val TOOL_PLANNING_TIMEOUT_SECONDS = 8L
+        private const val WEB_FETCH_TIMEOUT_SECONDS = 5L
+        private const val STREAMING_READ_TIMEOUT_SECONDS = 35L
         private const val MAX_TTS_INPUT_CHARS = 200
         private const val MIN_TTS_AUDIO_BYTES = 44
         private const val MIN_ASR_TIMEOUT_SECONDS = 30L
@@ -208,6 +211,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private data class ToolResolutionResult(
         val messages: List<Message>,
         val results: List<String>,
+        val directResponse: String? = null,
         val deferred: Boolean = false
     )
 
@@ -216,6 +220,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val toolResults: List<String>,
         val requestChatId: String?,
         val hasImage: Boolean,
+        val directResponse: String? = null,
         val deferred: Boolean = false
     )
 
@@ -245,14 +250,37 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     // Build OkHttpClient with configurable timeout
     private fun getClient(isStreaming: Boolean = false): OkHttpClient {
         val timeoutSeconds = getApiTimeout().toLong()
+        val readTimeoutSeconds = if (isStreaming) {
+            minOf(timeoutSeconds * 2, STREAMING_READ_TIMEOUT_SECONDS)
+        } else {
+            timeoutSeconds
+        }
         return OkHttpClient.Builder()
             .connectTimeout(timeoutSeconds, TimeUnit.SECONDS)
             // For streaming, use a longer read timeout to allow for slower chunk delivery
             // but still respect the configured timeout as a baseline
-            .readTimeout(if (isStreaming) timeoutSeconds * 2 else timeoutSeconds, TimeUnit.SECONDS)
+            .readTimeout(readTimeoutSeconds, TimeUnit.SECONDS)
             .writeTimeout(timeoutSeconds, TimeUnit.SECONDS)
             .build()
     }
+
+    private fun getBoundedClient(timeoutSeconds: Long): OkHttpClient {
+        val configuredTimeout = getApiTimeout().toLong().coerceAtLeast(1L)
+        val boundedTimeout = minOf(configuredTimeout, timeoutSeconds)
+        return getClient()
+            .newBuilder()
+            .callTimeout(boundedTimeout, TimeUnit.SECONDS)
+            .connectTimeout(boundedTimeout, TimeUnit.SECONDS)
+            .readTimeout(boundedTimeout, TimeUnit.SECONDS)
+            .writeTimeout(boundedTimeout, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private fun getToolPlanningClient(): OkHttpClient =
+        getBoundedClient(TOOL_PLANNING_TIMEOUT_SECONDS)
+
+    private fun getWebFetchClient(): OkHttpClient =
+        getBoundedClient(WEB_FETCH_TIMEOUT_SECONDS)
 
     private fun getChatApiUrl(): String = "${getApiBaseUrl()}/chat/completions"
     private fun getAsrApiUrl(): String = "${getApiBaseUrl()}/audio/transcriptions"
@@ -435,6 +463,39 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         this.listener = listener
     }
 
+    private fun replaceActiveAsrCall(call: Call) {
+        synchronized(this) {
+            activeAsrCall?.cancel()
+            activeAsrCall = call
+        }
+    }
+
+    private fun clearActiveAsrCall(call: Call?) {
+        if (call == null) return
+        synchronized(this) {
+            if (activeAsrCall === call) activeAsrCall = null
+        }
+    }
+
+    private fun isActiveAsrCall(call: Call?): Boolean =
+        call != null && synchronized(this) { activeAsrCall === call }
+
+    private fun notifyAsrCompleteIfActive(call: Call?, text: String) {
+        if (isActiveAsrCall(call)) {
+            listener?.onAsrComplete(text)
+        } else {
+            Log.d(appTag, "Ignoring stale ASR completion")
+        }
+    }
+
+    private fun notifyAsrFailedIfActive(call: Call?, error: String) {
+        if (isActiveAsrCall(call)) {
+            listener?.onAsrFailed(error)
+        } else {
+            Log.d(appTag, "Ignoring stale ASR failure: $error")
+        }
+    }
+
     /**
      * Call ASR API to convert audio to text
      * @param audioFile The audio file to process
@@ -476,13 +537,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 // Execute the request with a total call timeout so ASR cannot hang silently.
                 val requestCall = getAsrClient().newCall(request)
                 call = requestCall
-                activeAsrCall?.cancel()
-                activeAsrCall = requestCall
+                replaceActiveAsrCall(requestCall)
                 requestCall.execute().use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "ASR API call failed: ${response.code} - $errorBody")
-                        listener?.onAsrFailed("ASR API call failed: ${response.code}")
+                        notifyAsrFailedIfActive(call, "ASR API call failed: ${response.code}")
                         return@Thread
                     }
 
@@ -495,36 +555,36 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
                         if (recognizedText.isNotEmpty()) {
                             Log.d(appTag, "ASR recognized text: $recognizedText")
-                            listener?.onAsrComplete(recognizedText)
+                            notifyAsrCompleteIfActive(call, recognizedText)
                         } else {
                             Log.e(appTag, "ASR returned empty text")
-                            listener?.onAsrFailed("No text recognized")
+                            notifyAsrFailedIfActive(call, "No text recognized")
                         }
                     } else {
                         Log.e(appTag, "Empty ASR response body")
-                        listener?.onAsrFailed("Empty response")
+                        notifyAsrFailedIfActive(call, "Empty response")
                     }
                 }
             } catch (e: IOException) {
                 Log.e(appTag, "Network error during ASR: ${e.message}", e)
-                if (call?.isCanceled() == true) {
-                    listener?.onAsrFailed("ASR cancelled")
-                } else {
-                    listener?.onAsrFailed("Network error: ${e.message}")
+                if (call?.isCanceled() != true) {
+                    notifyAsrFailedIfActive(call, "Network error: ${e.message}")
                 }
             } catch (e: Exception) {
                 Log.e(appTag, "Error calling ASR API: ${e.message}", e)
-                listener?.onAsrFailed("Error: ${e.message}")
+                notifyAsrFailedIfActive(call, "Error: ${e.message}")
             } finally {
-                if (activeAsrCall == call) activeAsrCall = null
+                clearActiveAsrCall(call)
             }
         }.start()
     }
 
     fun cancelAsrRequest(reason: String = "ASR cancelled") {
         Log.d(appTag, "Cancelling ASR request: $reason")
-        activeAsrCall?.cancel()
-        activeAsrCall = null
+        synchronized(this) {
+            activeAsrCall?.cancel()
+            activeAsrCall = null
+        }
     }
 
     private fun getAsrClient(): OkHttpClient {
@@ -1492,7 +1552,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 .header("Accept-Language", "de,en;q=0.8")
                 .build()
 
-            getClient().newCall(request).execute().use { response ->
+            getWebFetchClient().newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
                     return WebPageRead(result, error = "HTTP ${response.code}")
                 }
@@ -1605,7 +1665,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .header("User-Agent", WEB_SEARCH_USER_AGENT)
             .header("Accept-Language", "de,en;q=0.8")
             .build()
-        getClient().newCall(request).execute().use { response ->
+        getWebFetchClient().newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 "Could not fetch $label: HTTP ${response.code}"
             } else {
@@ -1945,6 +2005,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     Log.d(appTag, "Assistant tool deferred this request; waiting for local follow-up")
                     return@Thread
                 }
+                chatContext.directResponse?.takeIf { it.isNotBlank() }?.let { directResponse ->
+                    Log.d(appTag, "Using direct tool-planning response")
+                    deliverChatResponse(
+                        response = directResponse,
+                        chatContext = chatContext,
+                        instruction = instruction,
+                        persistConversation = persistConversation,
+                        emitStreamingChunk = true
+                    )
+                    return@Thread
+                }
 
                 // Convert request to JSON
                 val jsonBody = gson.toJson(chatContext.request)
@@ -2219,7 +2290,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             else ->
                 "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
         }
-        val systemPrompt = getSystemPrompt() + "\n\nDeutsch (Österreich), kurz und freihändig. Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Natürliche Erinnerungszeiten sind ok. Aktuelles/Web/Preise/Öffnungszeiten: web_search. $sessionPrompt"
+        val systemPrompt = getSystemPrompt() + "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Natürliche Erinnerungszeiten sind ok. Aktuelles/Web/Preise/Öffnungszeiten: web_search. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
@@ -2271,6 +2342,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             toolResults = toolResolution.results,
             requestChatId = requestChatId,
             hasImage = hasImage,
+            directResponse = toolResolution.directResponse,
             deferred = toolResolution.deferred
         )
     }
@@ -2408,7 +2480,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     .post(requestBody)
                     .build()
 
-                getClient().newCall(httpRequest).execute().use { response ->
+                getToolPlanningClient().newCall(httpRequest).execute().use { response ->
                     if (!response.isSuccessful) {
                         Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
                         return ToolResolutionResult(messagesList, toolResults)
@@ -2422,7 +2494,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     if (toolCalls.isEmpty()) {
                         val directText = messageContentToText(assistantMessage.content).trim()
                         if (directText.isNotBlank()) {
-                            Log.d(appTag, "Tool planning produced direct text without tool calls; streaming the original user request instead")
+                            Log.d(appTag, "Tool planning produced direct text without tool calls")
+                            return ToolResolutionResult(
+                                messages = messagesList,
+                                results = toolResults,
+                                directResponse = directText
+                            )
                         }
                         return ToolResolutionResult(messagesList, toolResults)
                     }
