@@ -2,6 +2,8 @@ package com.patrick.neuroglasses.helpers
 
 import android.annotation.SuppressLint
 import android.Manifest
+import android.app.Activity
+import android.app.ActivityOptions
 import android.app.AlarmManager
 import android.app.SearchManager
 import android.content.Context
@@ -9,6 +11,7 @@ import android.content.Intent
 import android.app.KeyguardManager
 import android.app.PendingIntent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.CalendarContract
@@ -24,6 +27,7 @@ import android.graphics.Bitmap
 import android.util.Base64
 import android.util.Log
 import com.google.gson.Gson
+import com.google.gson.JsonElement
 import com.google.gson.annotations.SerializedName
 import com.patrick.neuroglasses.activities.SettingsActivity
 import com.patrick.neuroglasses.receivers.ReminderReceiver
@@ -38,7 +42,6 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
 import java.text.DateFormat
-import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
@@ -160,6 +163,15 @@ data class PersistedChatSession(
     val messages: List<PersistedChatMessage> = emptyList()
 )
 
+data class PersistentConversationSummary(
+    val id: String,
+    val title: String,
+    val createdAt: Long,
+    val updatedAt: Long,
+    val messageCount: Int,
+    val isActive: Boolean
+)
+
 /**
  * Groq AI Helper
  * Handles AI-related API calls including ASR (speech-to-text) and OpenAI chat completion
@@ -184,8 +196,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val MIN_TTS_AUDIO_BYTES = 44
         private const val MIN_ASR_TIMEOUT_SECONDS = 30L
         private const val ROKID_SPRITE_LAUNCHER_PACKAGE = "com.rokid.os.sprite.launcher"
-        private const val WEB_SEARCH_MAX_RESULTS = 5
-        private const val WEB_SEARCH_MAX_PAGES_TO_READ = 3
+        private const val PREF_ACTIVE_CHAT_ID = "active_chat_id"
+        private const val PREF_ACTIVE_CHAT_EXPLICIT = "active_chat_explicit"
         private const val WEB_SEARCH_MAX_OUTPUT_CHARS = 5000
         private const val WEB_SEARCH_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) NeuroGlasses/1.0 Mobile Safari/537.36"
@@ -201,11 +213,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val number: String?,
         val displayName: String? = null,
         val contactPermissionMissing: Boolean = false
-    )
-
-    private data class ReminderClockTime(
-        val hour: Int,
-        val minute: Int
     )
 
     private data class ToolResolutionResult(
@@ -224,16 +231,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val deferred: Boolean = false
     )
 
-    private data class WebSearchResult(
-        val title: String,
-        val url: String,
-        val snippet: String
-    )
-
-    private data class WebPageRead(
-        val source: WebSearchResult,
-        val excerpt: String = "",
-        val error: String? = null
+    private data class LocationCoordinates(
+        val latitude: Double,
+        val longitude: Double,
+        val accuracyMeters: Float
     )
 
     // Get configuration from SharedPreferences
@@ -292,7 +293,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return runCatching {
             gson.fromJson(json, Array<PersistedChatSession>::class.java).toMutableList()
         }.getOrElse {
-            Log.w(appTag, "Could not parse persisted chats", it)
+            Log.w(appTag, "Could not read persisted chats", it)
             mutableListOf()
         }
     }
@@ -301,13 +302,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         chatPrefs.edit().putString("sessions", gson.toJson(sessions)).apply()
     }
 
-    private fun activeChatId(): String {
+    private fun activeChatIdOrNull(): String? {
         val sessions = getChatSessions()
-        val stored = chatPrefs.getString("active_chat_id", null)
+        val explicit = chatPrefs.getBoolean(PREF_ACTIVE_CHAT_EXPLICIT, false)
+        val stored = chatPrefs.getString(PREF_ACTIVE_CHAT_ID, null)
+        if (!explicit) {
+            if (stored != null) chatPrefs.edit().remove(PREF_ACTIVE_CHAT_ID).apply()
+            return null
+        }
         if (stored != null && sessions.any { it.id == stored }) return stored
-        val session = sessions.firstOrNull() ?: createChatSession("Chat 1")
-        chatPrefs.edit().putString("active_chat_id", session.id).apply()
-        return session.id
+        if (stored != null) {
+            chatPrefs.edit()
+                .remove(PREF_ACTIVE_CHAT_ID)
+                .remove(PREF_ACTIVE_CHAT_EXPLICIT)
+                .apply()
+        }
+        return null
     }
 
     private fun createChatSession(title: String? = null): PersistedChatSession {
@@ -321,9 +331,78 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         )
         sessions.add(0, session)
         saveChatSessions(sessions)
-        chatPrefs.edit().putString("active_chat_id", session.id).apply()
+        chatPrefs.edit()
+            .putString(PREF_ACTIVE_CHAT_ID, session.id)
+            .putBoolean(PREF_ACTIVE_CHAT_EXPLICIT, true)
+            .apply()
         return session
     }
+
+    fun listPersistentConversations(): List<PersistentConversationSummary> {
+        val active = activeChatIdOrNull()
+        return getChatSessions().map { session ->
+            PersistentConversationSummary(
+                id = session.id,
+                title = session.title,
+                createdAt = session.createdAt,
+                updatedAt = session.updatedAt,
+                messageCount = session.messages.size,
+                isActive = session.id == active
+            )
+        }
+    }
+
+    fun hasActivePersistentConversation(): Boolean = activeChatIdOrNull() != null
+
+    fun activePersistentConversationId(): String? = activeChatIdOrNull()
+
+    fun createPersistentConversation(title: String? = null): PersistentConversationSummary =
+        createChatSession(title).toSummary(isActive = true)
+
+    fun enterPersistentConversation(chatId: String): Boolean {
+        val exists = getChatSessions().any { it.id == chatId }
+        if (!exists) return false
+        chatPrefs.edit()
+            .putString(PREF_ACTIVE_CHAT_ID, chatId)
+            .putBoolean(PREF_ACTIVE_CHAT_EXPLICIT, true)
+            .apply()
+        return true
+    }
+
+    fun leavePersistentConversation() {
+        chatPrefs.edit()
+            .remove(PREF_ACTIVE_CHAT_ID)
+            .remove(PREF_ACTIVE_CHAT_EXPLICIT)
+            .apply()
+    }
+
+    fun renamePersistentConversation(chatId: String?, title: String): Boolean {
+        if (title.isBlank()) return false
+        val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatIdOrNull() ?: return false
+        return updateChatSession(targetId) { it.copy(title = title) } != null
+    }
+
+    fun deletePersistentConversation(chatId: String): Boolean {
+        if (chatId.isBlank()) return false
+        val sessions = getChatSessions()
+        val removed = sessions.removeAll { it.id == chatId }
+        if (!removed) return false
+        saveChatSessions(sessions)
+        if (activeChatIdOrNull() == chatId) {
+            leavePersistentConversation()
+        }
+        return true
+    }
+
+    private fun PersistedChatSession.toSummary(isActive: Boolean): PersistentConversationSummary =
+        PersistentConversationSummary(
+            id = id,
+            title = title,
+            createdAt = createdAt,
+            updatedAt = updatedAt,
+            messageCount = messages.size,
+            isActive = isActive
+        )
 
     private fun updateChatSession(chatId: String, transform: (PersistedChatSession) -> PersistedChatSession): PersistedChatSession? {
         val sessions = getChatSessions()
@@ -345,8 +424,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
     }
 
-    private fun activeChatHistoryMessages(): List<Message> {
-        val session = getChatSessions().firstOrNull { it.id == activeChatId() } ?: return emptyList()
+    private fun chatHistoryMessages(chatId: String): List<Message> {
+        val session = getChatSessions().firstOrNull { it.id == chatId } ?: return emptyList()
         return session.messages.takeLast(20).map { Message(role = it.role, content = it.text) }
     }
 
@@ -357,12 +436,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             !title.isNullOrBlank() -> sessions.firstOrNull { it.title.equals(title, ignoreCase = true) }
             else -> null
         } ?: return "Chat not found. Use list_chats to see available chat ids and titles."
-        chatPrefs.edit().putString("active_chat_id", session.id).apply()
+        chatPrefs.edit()
+            .putString(PREF_ACTIVE_CHAT_ID, session.id)
+            .putBoolean(PREF_ACTIVE_CHAT_EXPLICIT, true)
+            .apply()
         return "Switched to chat '${session.title}' (${session.id})."
     }
 
     private fun listChats(): String {
-        val active = activeChatId()
+        val active = activeChatIdOrNull()
         val sessions = getChatSessions()
         if (sessions.isEmpty()) return "No chats exist yet."
         return sessions.joinToString("\n") { session ->
@@ -373,9 +455,25 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun renameChat(chatId: String?, title: String): String {
         if (title.isBlank()) return "A new chat title is required."
-        val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatId()
+        val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatIdOrNull()
+            ?: return "No persistent chat is active."
         val updated = updateChatSession(targetId) { it.copy(title = title) }
         return if (updated == null) "Chat not found." else "Renamed chat to '${updated.title}'."
+    }
+
+    private fun leaveChat(): String {
+        leavePersistentConversation()
+        return "Left persistent chat. The main conversation is ephemeral again."
+    }
+
+    private fun deleteChat(chatId: String?): String {
+        val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatIdOrNull()
+            ?: return "No persistent chat is active."
+        return if (deletePersistentConversation(targetId)) {
+            "Deleted persistent chat."
+        } else {
+            "Chat not found."
+        }
     }
 
     /**
@@ -611,6 +709,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         )
 
         fun stringProp(description: String): Map<String, Any> = mapOf("type" to "string", "description" to description)
+        fun numericStringProp(description: String): Map<String, Any> = mapOf("type" to "string", "description" to description)
 
         val tools = listOf(
             AssistantTool(function = ToolFunction(
@@ -695,8 +794,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
-                description = "Start the YouTube app with a requested video, song, artist, playlist, or search query. Prefer YouTube video playback/search over YouTube Music.",
-                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("YouTube video or search query to start.")))
+                description = "Play requested music/video hands-free. If you know a direct YouTube URL, pass video_url. Otherwise pass query. The app will try Android media playback first for background-capable apps, then fall back to browser.",
+                parameters = objectSchema(listOf("query"), mapOf(
+                    "query" to stringProp("Song, artist, playlist, video title, or search query to play."),
+                    "video_url" to stringProp("Optional direct YouTube URL if known.")
+                ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_rokid_translator",
@@ -715,24 +817,24 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "web_search",
-                description = "Search the web, open the most relevant result pages, and return compact source excerpts without opening a visible browser.",
+                description = "Use DuckDuckGo instant answers for current/web questions. If no structured instant answer exists, open a visible web search for the user instead of scraping result pages.",
                 parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "set_timer",
-                description = "Create a hands-free Android timer. Preserve the user's natural duration in duration when unsure; never send 0 seconds unless the user explicitly requested 0.",
+                description = "Create a hands-free Android timer. Convert the user's requested duration yourself and pass a positive seconds value as decimal digits.",
                 parameters = objectSchema(listOf("seconds"), mapOf(
-                    "seconds" to mapOf("type" to "integer", "description" to "Timer duration in seconds."),
-                    "duration" to stringProp("Optional natural language timer duration, e.g. '5 Minuten', 'in 30 seconds'."),
+                    "seconds" to numericStringProp("Timer duration in seconds, as decimal digits. Must be greater than zero."),
                     "label" to stringProp("Optional timer label.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "create_reminder",
-                description = "Create a reminder. If the user gives a usable time, the app saves it and also tries Android timer, alarm, or calendar intents.",
+                description = "Create a reminder. If the user gives a due time, calculate the exact local epoch milliseconds yourself and pass due_at_epoch_millis as decimal digits; the app will not interpret natural time text.",
                 parameters = objectSchema(listOf("text"), mapOf(
                     "text" to stringProp("Reminder text."),
-                    "when" to stringProp("Optional natural language due time." )
+                    "when" to stringProp("Optional human-readable due time for display only."),
+                    "due_at_epoch_millis" to numericStringProp("Optional exact local due time as Unix epoch milliseconds, as decimal digits.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
@@ -742,18 +844,20 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "create_calendar_event",
-                description = "Deutschsprachig: Lege einen Kalendertermin per Sprache an. Nutze ISO-ähnliche Zeiten, wenn möglich.",
+                description = "Deutschsprachig: Lege einen Kalendertermin per Sprache an. Berechne Start/Ende selbst und uebergib epoch milliseconds als Dezimalziffern, wenn der Nutzer Zeiten nennt.",
                 parameters = objectSchema(listOf("title"), mapOf(
                     "title" to stringProp("Titel des Termins."),
-                    "start" to stringProp("Optionale Startzeit als Text, z. B. 2026-06-22 14:30."),
-                    "end" to stringProp("Optionale Endzeit als Text."),
+                    "start" to stringProp("Optionale Startzeit als lesbarer Text fuer die Beschreibung."),
+                    "end" to stringProp("Optionale Endzeit als lesbarer Text fuer die Beschreibung."),
+                    "start_epoch_millis" to numericStringProp("Optionaler exakter Startzeitpunkt als Unix epoch milliseconds, als Dezimalziffern."),
+                    "end_epoch_millis" to numericStringProp("Optionaler exakter Endzeitpunkt als Unix epoch milliseconds, als Dezimalziffern."),
                     "location" to stringProp("Optionaler Ort."),
                     "notes" to stringProp("Optionale Notizen.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
                 name = "send_email",
-                description = "Deutschsprachig: Öffne eine E-Mail mit Empfänger, Betreff und Text, damit der Nutzer sie sprachgeführt versenden kann.",
+                description = "Deutschsprachig: Öffne Gmail oder die Standard-Mail-App mit Empfänger, Betreff und Text. Android/Gmail verlangt Nutzerbestätigung zum Senden; dieses Tool verschickt nicht heimlich im Hintergrund.",
                 parameters = objectSchema(listOf("to", "subject", "body"), mapOf(
                     "to" to stringProp("E-Mail-Adresse des Empfängers."),
                     "subject" to stringProp("Betreff."),
@@ -810,12 +914,24 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     "title" to stringProp("New title."),
                     "chat_id" to stringProp("Optional chat id; omit to rename active chat.")
                 ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "leave_chat",
+                description = "Leave the active persistent chat and return to the ephemeral main conversation when the user asks to stop using saved chat history.",
+                parameters = objectSchema(emptyList(), emptyMap())
+            )),
+            AssistantTool(function = ToolFunction(
+                name = "delete_chat",
+                description = "Delete a persistent chat only when the user explicitly asks to remove it.",
+                parameters = objectSchema(emptyList(), mapOf(
+                    "chat_id" to stringProp("Optional chat id; omit to delete the active persistent chat.")
+                ))
             ))
         )
 
         return tools.filter { tool ->
             when (tool.function.name) {
-                "new_chat", "list_chats", "switch_chat", "rename_chat" -> includeChatTools
+                "new_chat", "list_chats", "switch_chat", "rename_chat", "leave_chat", "delete_chat" -> includeChatTools
                 "snap_glasses_photo" -> allowGlassesPhotoTool
                 else -> true
             }
@@ -823,7 +939,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun executeAssistantTool(toolCall: ToolCall, instruction: String): String {
-        val args = parseToolArguments(toolCall.function.arguments)
+        val args = decodeToolArguments(toolCall.function.arguments)
         listener?.onAssistantToolCall(toolCall.function.name, args)?.let { return it }
 
         fun arg(name: String): String = args[name].orEmpty()
@@ -837,15 +953,23 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "start_navigation" -> startOsmNavigation(arg("destination"), arg("mode"))
             "confirm_navigation_destination" -> confirmOsmNavigationDestination(arg("selection"), arg("destination"), arg("mode"))
             "stop_navigation" -> stopOsmNavigation()
-            "play_youtube_music" -> playYoutubeMusic(arg("query"))
+            "play_youtube_music" -> playYoutubeMusic(arg("query"), arg("video_url"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
             "get_weather" -> getWeather(arg("location"))
             "web_search" -> webSearch(arg("query"))
-            "set_timer" -> setTimer(resolveTimerSeconds(arg("seconds"), arg("duration"), arg("label"), instruction), arg("label").ifBlank { instruction })
-            "create_reminder" -> createReminder(arg("text"), arg("when"))
+            "set_timer" -> setTimer(arg("seconds").toIntOrNull() ?: 0, arg("label").ifBlank { instruction })
+            "create_reminder" -> createReminder(arg("text"), arg("when"), arg("due_at_epoch_millis").toLongOrNull())
             "list_reminders" -> listReminders()
-            "create_calendar_event" -> createCalendarEvent(arg("title"), arg("start"), arg("end"), arg("location"), arg("notes"))
+            "create_calendar_event" -> createCalendarEvent(
+                arg("title"),
+                arg("start"),
+                arg("end"),
+                arg("start_epoch_millis").toLongOrNull(),
+                arg("end_epoch_millis").toLongOrNull(),
+                arg("location"),
+                arg("notes")
+            )
             "send_email" -> sendEmail(arg("to"), arg("subject"), arg("body"))
             "open_app" -> openApp(arg("app"))
             "share_text" -> shareText(arg("text"))
@@ -858,13 +982,29 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "list_chats" -> listChats()
             "switch_chat" -> switchChat(arg("chat_id"), arg("title"))
             "rename_chat" -> renameChat(arg("chat_id"), arg("title"))
+            "leave_chat" -> leaveChat()
+            "delete_chat" -> deleteChat(arg("chat_id"))
             else -> "Unknown tool: ${toolCall.function.name}"
         }
     }
 
-    private fun parseToolArguments(arguments: String): Map<String, String> {
-        val parsed = runCatching { gson.fromJson(arguments, Map::class.java) as Map<*, *> }.getOrDefault(emptyMap<Any, Any>())
-        return parsed.mapNotNull { (key, value) -> key?.toString()?.let { it to value?.toString().orEmpty() } }.toMap()
+    private fun decodeToolArguments(arguments: String): Map<String, String> {
+        val decoded = runCatching { gson.fromJson(arguments, JsonElement::class.java) }.getOrNull()
+        val jsonObject = decoded?.takeIf { it.isJsonObject }?.asJsonObject ?: return emptyMap()
+        return jsonObject.entrySet().associate { (key, value) ->
+            key to jsonArgumentToString(value)
+        }
+    }
+
+    private fun jsonArgumentToString(value: JsonElement?): String {
+        if (value == null || value.isJsonNull) return ""
+        if (!value.isJsonPrimitive) return value.toString()
+        val primitive = value.asJsonPrimitive
+        return when {
+            primitive.isNumber -> primitive.asBigDecimal.toPlainString()
+            primitive.isBoolean -> primitive.asBoolean.toString()
+            else -> primitive.asString
+        }
     }
 
     private fun shouldDeferAfterToolResult(toolName: String, result: String): Boolean =
@@ -888,6 +1028,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             toolName == "web_search" ->
                 "Ich habe die Websuche ausgeführt, aber danach keinen KI-Antworttext bekommen. Hier sind die Rohfunde:\n${lastResult.take(2600)}"
             lastResult.startsWith("Started ", ignoreCase = true) -> "Erledigt: ${lastResult.removePrefix("Started ").removeSuffix(" hands-free.")} gestartet."
+            lastResult.startsWith("Requested ", ignoreCase = true) -> lastResult
             lastResult.startsWith("Could not", ignoreCase = true) -> "Das hat leider nicht geklappt: $lastResult"
             lastResult.contains("permission", ignoreCase = true) -> "Dafür fehlt noch eine Berechtigung: $lastResult"
             else -> lastResult
@@ -901,7 +1042,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     ): String {
         val toolFallback = buildToolResultFallback(toolResults)
         val cleanDetail = detail
-            ?.replace(Regex("\\s+"), " ")
+            ?.collapseWhitespace()
             ?.trim()
             ?.take(360)
             .orEmpty()
@@ -923,14 +1064,69 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "Wenn ein Detail nicht sicher erkennbar ist, sag das knapp. Nutzerfrage: $instruction"
 
     private fun launchIntent(intent: Intent, label: String): String = try {
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-        "Started $label hands-free."
+        val launchIntent = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        if (context is Activity) {
+            context.startActivity(launchIntent)
+            "Started $label hands-free."
+        } else {
+            launchIntentFromBackground(launchIntent, label)
+        }
     } catch (e: Exception) {
         Log.e(appTag, "Could not start $label", e)
         val lockedSuffix = if (isDeviceLocked()) " The phone is locked; unlock it and try again if Android blocked the target app." else ""
         "Could not start $label: ${e.message}.$lockedSuffix"
     }
+
+    private fun launchIntentFromBackground(intent: Intent, label: String): String {
+        val options = backgroundActivityLaunchOptions()
+        val requestCode = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt()
+        val pendingIntent = PendingIntent.getActivity(
+            context,
+            requestCode,
+            intent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            options
+        )
+
+        return try {
+            pendingIntent.send(context, 0, null, null, null, null, options)
+            "Requested $label via Android. If nothing opens, Android blocked this background launch."
+        } catch (e: PendingIntent.CanceledException) {
+            Log.e(appTag, "Could not send pending intent for $label", e)
+            "Could not start $label: ${e.message}."
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not request $label", e)
+            "Could not start $label: ${e.message}."
+        }
+    }
+
+    private fun backgroundActivityLaunchOptions(): Bundle? {
+        val options = ActivityOptions.makeBasic()
+        val mode = backgroundActivityStartMode() ?: return options.toBundle()
+        listOf(
+            "setPendingIntentBackgroundActivityStartMode",
+            "setPendingIntentCreatorBackgroundActivityStartMode"
+        ).forEach { methodName ->
+            runCatching {
+                ActivityOptions::class.java
+                    .getMethod(methodName, Int::class.javaPrimitiveType)
+                    .invoke(options, mode)
+            }.onFailure {
+                Log.d(appTag, "ActivityOptions.$methodName unavailable on API ${Build.VERSION.SDK_INT}")
+            }
+        }
+        return options.toBundle()
+    }
+
+    private fun backgroundActivityStartMode(): Int? =
+        listOf(
+            "MODE_BACKGROUND_ACTIVITY_START_ALLOW_ALWAYS",
+            "MODE_BACKGROUND_ACTIVITY_START_ALLOWED"
+        ).firstNotNullOfOrNull { fieldName ->
+            runCatching {
+                ActivityOptions::class.java.getField(fieldName).getInt(null)
+            }.getOrNull()
+        }
 
     private fun hasPermission(permission: String): Boolean = context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
@@ -984,9 +1180,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun normalizeContactText(value: String): String =
         value.lowercase(Locale.ROOT)
-            .replace(Regex("[^\\p{L}\\p{N}\\s]+"), " ")
-            .replace(Regex("\\s+"), " ")
+            .map { char -> if (char.isLetterOrDigit() || char.isWhitespace()) char else ' ' }
+            .joinToString("")
+            .collapseWhitespace()
             .trim()
+
+    private fun String.collapseWhitespace(): String =
+        splitToSequence(' ', '\n', '\r', '\t')
+            .filter { it.isNotBlank() }
+            .joinToString(" ")
 
     private fun contactMatchScore(query: String, candidate: String): Int? {
         if (candidate == query) return 0
@@ -1103,31 +1305,23 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (result.startsWith("Could not")) "$prefix $result" else prefix
     }
 
-    private fun playYoutubeMusic(query: String): String {
+    private fun playYoutubeMusic(query: String, videoUrl: String): String {
         if (query.isBlank()) return "I need a YouTube video, song, artist, playlist, or search query."
-        val videoId = extractYoutubeVideoId(query) ?: resolveYoutubeVideoId(query)
         val encoded = Uri.encode(query)
-        val watchUrl = videoId?.let { "https://m.youtube.com/watch?v=$it&autoplay=1" }
         val searchUrl = "https://www.youtube.com/results?search_query=$encoded"
-        val targetUrl = watchUrl ?: searchUrl
-        val firefoxIntents = firefoxPackages().map { packageName ->
-            Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)).setPackage(packageName)
+        val watchUrl = videoUrl.takeIf { it.startsWith("http://") || it.startsWith("https://") }
+        val mediaIntents = youtubeMediaPackages().map { packageName ->
+            Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
+                .setPackage(packageName)
+                .putExtra(SearchManager.QUERY, query)
+                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/video")
         }
         val intents = buildList {
-            addAll(firefoxIntents)
-            if (videoId != null) {
-                add(Intent(Intent.ACTION_VIEW, Uri.parse(targetUrl)))
-            } else {
-                add(
-                    Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
-                        .setPackage("com.google.android.youtube")
-                        .putExtra(SearchManager.QUERY, query)
-                        .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/video")
-                )
-                add(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)))
-            }
+            watchUrl?.let { add(Intent(Intent.ACTION_VIEW, Uri.parse(it))) }
+            addAll(mediaIntents)
+            add(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)))
         }
-        val label = if (videoId != null) "YouTube video in Firefox" else "YouTube search in Firefox"
+        val label = "YouTube playback"
         intents.forEach { intent ->
             val result = launchIntent(intent, label)
             if (!result.startsWith("Could not")) return result
@@ -1135,42 +1329,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return "Could not start YouTube video/search for $query."
     }
 
-    private fun firefoxPackages(): List<String> = listOf(
-        "org.mozilla.firefox",
-        "org.mozilla.firefox_beta",
-        "org.mozilla.fenix",
-        "org.mozilla.firefox_nightly",
-        "org.mozilla.focus"
+    private fun youtubeMediaPackages(): List<String> = listOf(
+        "com.google.android.apps.youtube.music",
+        "com.google.android.youtube"
     )
-
-    private fun resolveYoutubeVideoId(query: String): String? {
-        val url = "https://www.youtube.com/results?search_query=${URLEncoder.encode(query, "UTF-8")}"
-        val html = fetchText(url, "YouTube search page")
-        if (html.startsWith("Could not", ignoreCase = true)) return null
-        val patterns = listOf(
-            Regex(""""videoId"\s*:\s*"([A-Za-z0-9_-]{11})""""),
-            Regex("""/watch\?v=([A-Za-z0-9_-]{11})""")
-        )
-        return patterns.firstNotNullOfOrNull { pattern ->
-            pattern.find(html)?.groupValues?.getOrNull(1)
-        }
-    }
-
-    private fun extractYoutubeVideoId(input: String): String? {
-        val cleanInput = input.trim()
-        if (Regex("^[A-Za-z0-9_-]{11}$").matches(cleanInput)) return cleanInput
-
-        val uri = runCatching { Uri.parse(cleanInput) }.getOrNull()
-        uri?.getQueryParameter("v")?.takeIf { Regex("^[A-Za-z0-9_-]{11}$").matches(it) }?.let { return it }
-
-        val patterns = listOf(
-            Regex("""youtu\.be/([A-Za-z0-9_-]{11})"""),
-            Regex("""youtube\.com/(?:shorts|embed|live)/([A-Za-z0-9_-]{11})""")
-        )
-        return patterns.firstNotNullOfOrNull { pattern ->
-            pattern.find(cleanInput)?.groupValues?.getOrNull(1)
-        }
-    }
 
     private fun openRokidTranslator(): String = openRokidNativeApp("translator")
 
@@ -1350,28 +1512,42 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     @SuppressLint("MissingPermission")
+    private fun readLastKnownLocation(): LocationCoordinates? {
+        if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
+            return null
+        }
+        return runCatching {
+            val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
+            providers.asSequence().mapNotNull { provider ->
+                runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
+            }.maxByOrNull { it.time }
+                ?.let { LocationCoordinates(it.latitude, it.longitude, it.accuracy) }
+        }.getOrNull()
+    }
+
     private fun getGpsLocation(): String {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
             return "Location permission is required before I can read GPS hands-free."
         }
         return try {
-            val manager = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
-            val providers = listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER, LocationManager.PASSIVE_PROVIDER)
-            val location = providers.asSequence().mapNotNull { provider ->
-                runCatching { manager.getLastKnownLocation(provider) }.getOrNull()
-            }.maxByOrNull { it.time }
-            if (location == null) "No last known location is available yet." else "Current location: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracy}m."
+            val location = readLastKnownLocation()
+            if (location == null) {
+                "No last known location is available yet."
+            } else {
+                "Current location: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracyMeters}m."
+            }
         } catch (e: Exception) {
             "Could not read location: ${e.message}"
         }
     }
 
     private fun getWeather(location: String): String {
-        val query = if (location.isNotBlank()) location else getGpsLocation().takeIf { it.startsWith("Current location:") }?.let {
-            val lat = Regex("latitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
-            val lon = Regex("longitude=([-0-9.]+)").find(it)?.groupValues?.getOrNull(1)
-            if (lat != null && lon != null) "$lat,$lon" else null
-        }.orEmpty()
+        val query = if (location.isNotBlank()) {
+            location
+        } else {
+            readLastKnownLocation()?.let { "${it.latitude},${it.longitude}" }.orEmpty()
+        }
         if (query.isBlank()) return "I need a location or GPS permission to fetch weather."
         return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "weather")
     }
@@ -1380,93 +1556,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) return "I need a query to search the web."
 
-        val searchErrors = mutableListOf<String>()
-        val encodedQuery = URLEncoder.encode(cleanQuery, "UTF-8")
-        val results = searchDuckDuckGo(
-            "https://html.duckduckgo.com/html/?q=$encodedQuery",
-            "DuckDuckGo HTML search",
-            searchErrors
-        ).ifEmpty {
-            searchDuckDuckGo(
-                "https://lite.duckduckgo.com/lite/?q=$encodedQuery",
-                "DuckDuckGo Lite search",
-                searchErrors
-            )
-        }.distinctBy { it.url }
-            .take(WEB_SEARCH_MAX_RESULTS)
-
-        if (results.isEmpty()) {
-            val instantFallback = fetchDuckDuckGoInstantFallback(cleanQuery)
-            val diagnostics = searchErrors.distinct().joinToString("; ").takeIf { it.isNotBlank() }
-            return buildString {
-                append("Ich konnte keine normalen Web-Suchergebnisse öffnen.")
-                diagnostics?.let { append(" Ursache: $it.") }
-                if (instantFallback.isNotBlank()) {
-                    append("\nFallback-Info:\n")
-                    append(instantFallback)
-                } else {
-                    append(" Ich habe deshalb keine belastbaren Quellen für \"$cleanQuery\" gefunden.")
-                }
-            }.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
+        val instantAnswer = fetchDuckDuckGoInstantAnswer(cleanQuery)
+        if (instantAnswer.isNotBlank()) {
+            return instantAnswer.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
         }
 
-        val pageReads = results.take(WEB_SEARCH_MAX_PAGES_TO_READ).map { result ->
-            readWebPage(result, cleanQuery)
+        val searchUrl = "https://duckduckgo.com/?q=${URLEncoder.encode(cleanQuery, "UTF-8")}"
+        val result = launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)), "web search")
+        return if (result.startsWith("Could not", ignoreCase = true)) {
+            "I could not fetch an instant answer or open web search for \"$cleanQuery\": $result"
+        } else {
+            "Opened web search for \"$cleanQuery\"."
         }
-        val readablePages = pageReads.filter { it.excerpt.isNotBlank() }
-
-        return buildString {
-            append("Websuche für \"$cleanQuery\".\n")
-            append("Top-Treffer:\n")
-            results.forEachIndexed { index, result ->
-                append("${index + 1}. ${result.title} - ${result.url}")
-                if (result.snippet.isNotBlank()) append("\n   ${result.snippet}")
-                append("\n")
-            }
-
-            if (readablePages.isEmpty()) {
-                append("Ich konnte die Trefferliste lesen, aber keine Ergebnisseite zuverlässig öffnen.\n")
-            } else {
-                append("Geöffnete Seiten und relevante Auszüge:\n")
-                readablePages.forEachIndexed { index, page ->
-                    append("[${index + 1}] ${page.source.title}\n")
-                    append("${page.source.url}\n")
-                    append(page.excerpt)
-                    append("\n")
-                }
-            }
-
-            val readFailures = pageReads.filter { it.error != null }
-            if (readFailures.isNotEmpty()) {
-                append("Nicht lesbar: ")
-                append(readFailures.joinToString("; ") { "${it.source.title} (${it.error})" })
-                append("\n")
-            }
-
-            val diagnostics = searchErrors.distinct().joinToString("; ").takeIf { it.isNotBlank() }
-            diagnostics?.let { append("Suchhinweis: $it\n") }
-        }.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
     }
 
-    private fun searchDuckDuckGo(
-        searchUrl: String,
-        label: String,
-        errors: MutableList<String>
-    ): List<WebSearchResult> {
-        val html = fetchText(searchUrl, label, maxChars = 350_000)
-        if (html.startsWith("Could not", ignoreCase = true)) {
-            errors += html
-            return emptyList()
-        }
-
-        val results = parseDuckDuckGoHtmlResults(html)
-        if (results.isEmpty()) {
-            errors += "$label returned no parseable result links"
-        }
-        return results
-    }
-
-    private fun fetchDuckDuckGoInstantFallback(query: String): String {
+    private fun fetchDuckDuckGoInstantAnswer(query: String): String {
         val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
         val raw = fetchText(url, "DuckDuckGo instant answer", maxChars = 120_000)
         if (raw.startsWith("Could not", ignoreCase = true)) return raw
@@ -1480,183 +1584,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .joinToString("\n")
             .take(1200)
     }
-
-    private fun parseDuckDuckGoHtmlResults(html: String): List<WebSearchResult> {
-        val anchorPattern = Regex(
-            """(?is)<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"""
-        )
-        val anchors = anchorPattern.findAll(html).toList()
-        val primaryResults = anchors.mapIndexedNotNull { index, match ->
-            val url = normalizeSearchResultUrl(match.groupValues[1]) ?: return@mapIndexedNotNull null
-            val title = htmlToPlainText(match.groupValues[2])
-            if (title.isBlank()) return@mapIndexedNotNull null
-            val blockEnd = anchors.getOrNull(index + 1)?.range?.first ?: minOf(html.length, match.range.last + 2500)
-            val block = html.substring(match.range.last + 1, blockEnd)
-            WebSearchResult(
-                title = title.take(180),
-                url = url,
-                snippet = extractSearchSnippet(block).take(320)
-            )
-        }
-
-        return (primaryResults.ifEmpty { parseGenericSearchAnchors(html) })
-            .distinctBy { it.url }
-            .take(WEB_SEARCH_MAX_RESULTS)
-    }
-
-    private fun parseGenericSearchAnchors(html: String): List<WebSearchResult> {
-        val anchorPattern = Regex("""(?is)<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>""")
-        return anchorPattern.findAll(html).mapNotNull { match ->
-            val url = normalizeSearchResultUrl(match.groupValues[1]) ?: return@mapNotNull null
-            val title = htmlToPlainText(match.groupValues[2])
-            if (title.length < 4 || title.equals("next", ignoreCase = true)) return@mapNotNull null
-            WebSearchResult(
-                title = title.take(180),
-                url = url,
-                snippet = ""
-            )
-        }.distinctBy { it.url }
-            .take(WEB_SEARCH_MAX_RESULTS)
-            .toList()
-    }
-
-    private fun extractSearchSnippet(block: String): String {
-        val snippetPattern = Regex(
-            """(?is)class="[^"]*(?:result__snippet|result-snippet)[^"]*"[^>]*>(.*?)</(?:a|div|td)>"""
-        )
-        return snippetPattern.find(block)?.groupValues?.getOrNull(1)?.let { htmlToPlainText(it) }.orEmpty()
-    }
-
-    private fun normalizeSearchResultUrl(rawHref: String): String? {
-        var href = decodeHtmlEntities(rawHref.trim())
-        if (href.startsWith("//")) href = "https:$href"
-        if (href.startsWith("/")) href = "https://duckduckgo.com$href"
-
-        val parsed = runCatching { Uri.parse(href) }.getOrNull() ?: return null
-        val target = parsed.getQueryParameter("uddg")?.let { Uri.decode(it) } ?: href
-        val cleanTarget = decodeHtmlEntities(target)
-        val targetUri = runCatching { Uri.parse(cleanTarget) }.getOrNull() ?: return null
-        val scheme = targetUri.scheme?.lowercase(Locale.ROOT)
-        if (scheme != "http" && scheme != "https") return null
-        val host = targetUri.host.orEmpty().lowercase(Locale.ROOT)
-        if (host.endsWith("duckduckgo.com")) return null
-        return cleanTarget
-    }
-
-    private fun readWebPage(result: WebSearchResult, query: String): WebPageRead {
-        return try {
-            val request = Request.Builder()
-                .url(result.url)
-                .get()
-                .header("User-Agent", WEB_SEARCH_USER_AGENT)
-                .header("Accept-Language", "de,en;q=0.8")
-                .build()
-
-            getWebFetchClient().newCall(request).execute().use { response ->
-                if (!response.isSuccessful) {
-                    return WebPageRead(result, error = "HTTP ${response.code}")
-                }
-
-                val contentType = response.header("Content-Type").orEmpty().lowercase(Locale.ROOT)
-                if (!isReadableWebContent(contentType)) {
-                    return WebPageRead(result, error = contentType.ifBlank { "unknown content type" })
-                }
-
-                val body = response.body?.string().orEmpty()
-                if (body.isBlank()) return WebPageRead(result, error = "empty body")
-
-                val readableText = extractReadableText(body)
-                val excerpt = extractRelevantPassages(readableText, query)
-                    .ifBlank { result.snippet }
-                    .take(1200)
-                if (excerpt.isBlank()) {
-                    WebPageRead(result, error = "no readable text")
-                } else {
-                    WebPageRead(result, excerpt = excerpt)
-                }
-            }
-        } catch (e: Exception) {
-            WebPageRead(result, error = e.message ?: e.javaClass.simpleName)
-        }
-    }
-
-    private fun isReadableWebContent(contentType: String): Boolean =
-        contentType.isBlank() ||
-            contentType.contains("text/html") ||
-            contentType.contains("text/plain") ||
-            contentType.contains("application/xhtml") ||
-            contentType.contains("application/json") ||
-            contentType.contains("application/ld+json")
-
-    private fun extractReadableText(html: String): String =
-        html
-            .replace(Regex("""(?is)<(script|style|noscript|svg|canvas|header|footer|nav|form)[^>]*>.*?</\1>"""), " ")
-            .replace(Regex("""(?is)<!--.*?-->"""), " ")
-            .let { htmlToPlainText(it) }
-
-    private fun extractRelevantPassages(text: String, query: String): String {
-        val cleanText = text.replace(Regex("\\s+"), " ").trim()
-        if (cleanText.isBlank()) return ""
-
-        val chunks = cleanText
-            .split(Regex("""(?<=[.!?])\s+"""))
-            .map { it.trim() }
-            .filter { it.length in 60..900 }
-        if (chunks.isEmpty()) return cleanText.take(900)
-
-        val terms = searchTerms(query)
-        if (terms.isEmpty()) return chunks.take(3).joinToString(" ").take(1200)
-
-        val scored: List<String> = chunks.mapIndexed { index: Int, chunk: String ->
-            val lower = chunk.lowercase(Locale.ROOT)
-            val termScore = terms.fold(0) { score, term -> score + if (lower.contains(term)) 3 else 0 }
-            val earlyResultBoost = if (index < 8) 1 else 0
-            Triple(termScore + earlyResultBoost, index, chunk)
-        }.filter { it.first > 0 }
-            .sortedWith(compareByDescending<Triple<Int, Int, String>> { it.first }.thenBy { it.second })
-            .take(3)
-            .sortedBy { it.second }
-            .map { it.third }
-
-        return scored.ifEmpty { chunks.take(2) }.joinToString(" ").take(1200)
-    }
-
-    private fun searchTerms(query: String): List<String> {
-        val stopWords = setOf(
-            "der", "die", "das", "den", "dem", "und", "oder", "eine", "einen", "einem", "ist",
-            "sind", "was", "wer", "wie", "wann", "wo", "warum", "bitte", "the", "and", "for",
-            "with", "what", "when", "where", "who", "why", "how", "latest", "news"
-        )
-        return query.lowercase(Locale.ROOT)
-            .split(Regex("""[^\p{L}\p{N}]+"""))
-            .filter { it.length >= 3 && it !in stopWords }
-            .distinct()
-            .take(8)
-    }
-
-    private fun htmlToPlainText(html: String): String =
-        html
-            .replace(Regex("<.*?>"), " ")
-            .let { decodeHtmlEntities(it) }
-            .replace(Regex("\\s+"), " ")
-            .trim()
-
-    private fun decodeHtmlEntities(text: String): String =
-        text
-            .replace("&amp;", "&")
-            .replace("&quot;", "\"")
-            .replace("&apos;", "'")
-            .replace("&#x27;", "'")
-            .replace("&#39;", "'")
-            .replace("&nbsp;", " ")
-            .replace("&lt;", "<")
-            .replace("&gt;", ">")
-            .replace(Regex("""&#x([0-9a-fA-F]+);""")) { match ->
-                match.groupValues[1].toIntOrNull(16)?.toChar()?.toString() ?: match.value
-            }
-            .replace(Regex("""&#(\d+);""")) { match ->
-                match.groupValues[1].toIntOrNull()?.toChar()?.toString() ?: match.value
-            }
 
     private fun fetchText(url: String, label: String, maxChars: Int = Int.MAX_VALUE): String = try {
         val request = Request.Builder()
@@ -1677,16 +1604,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         "Could not fetch $label: ${e.message}"
     }
 
-    private fun resolveTimerSeconds(seconds: String, duration: String, label: String, instruction: String): Int {
-        val explicitSeconds = seconds.toIntOrNull()
-        if (explicitSeconds != null && explicitSeconds > 0) return explicitSeconds
-
-        return sequenceOf(duration, label, instruction)
-            .mapNotNull { parseRelativeReminderSeconds(it) }
-            .firstOrNull { it > 0 }
-            ?: 0
-    }
-
     private fun setTimer(seconds: Int, label: String): String {
         if (seconds <= 0) return "Timer duration must be greater than zero seconds."
         val intent = Intent(AlarmClock.ACTION_SET_TIMER)
@@ -1696,49 +1613,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return launchIntent(intent, "${seconds}-second timer")
     }
 
-    private fun createReminder(text: String, dueTime: String): String {
+    private fun createReminder(text: String, dueTime: String, dueAtMillis: Long?): String {
         if (text.isBlank()) return "Reminder text cannot be empty."
         val prefs = context.getSharedPreferences("assistant_reminders", Context.MODE_PRIVATE)
         val existing = prefs.getStringSet("items", emptySet()).orEmpty().toMutableSet()
-        existing.add("${System.currentTimeMillis()}|$text|$dueTime")
+        existing.add("${System.currentTimeMillis()}|$text|$dueTime|${dueAtMillis ?: ""}")
         prefs.edit().putStringSet("items", existing).apply()
 
         val savedMessage = "Reminder saved: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
-        val androidResult = scheduleAndroidReminder(text, dueTime)
+        val androidResult = scheduleAndroidReminder(text, dueAtMillis)
         return listOf(savedMessage, androidResult).filter { it.isNotBlank() }.joinToString(" ")
     }
 
-    private fun scheduleAndroidReminder(text: String, dueTime: String): String {
-        val cleanDueTime = dueTime.trim()
-        if (cleanDueTime.isBlank()) return ""
-
-        val triggerAtMillis = parseReminderTriggerAtMillis(cleanDueTime)
-            ?: return "Reminder saved in NeuroGlasses, but I could not understand the time '$cleanDueTime' well enough to schedule a notification."
-
-        return scheduleReminderNotification(text, triggerAtMillis)
-    }
-
-    private fun parseReminderTriggerAtMillis(dueTime: String): Long? {
-        parseRelativeReminderSeconds(dueTime)?.let { seconds ->
-            return System.currentTimeMillis() + seconds * 1000L
-        }
-
-        parseReminderCalendarStartMillis(dueTime)?.let { return it }
-
-        parseClockTime(dueTime)?.let { clockTime ->
-            val calendar = Calendar.getInstance()
-            calendar.set(Calendar.HOUR_OF_DAY, clockTime.hour)
-            calendar.set(Calendar.MINUTE, clockTime.minute)
-            calendar.set(Calendar.SECOND, 0)
-            calendar.set(Calendar.MILLISECOND, 0)
-            if (calendar.timeInMillis <= System.currentTimeMillis()) {
-                calendar.add(Calendar.DAY_OF_YEAR, 1)
-            }
-            return calendar.timeInMillis
-        }
-
-        return null
-    }
+    private fun scheduleAndroidReminder(text: String, dueAtMillis: Long?): String =
+        dueAtMillis?.takeIf { it > System.currentTimeMillis() }?.let { triggerAtMillis ->
+            scheduleReminderNotification(text, triggerAtMillis)
+        } ?: ""
 
     private fun scheduleReminderNotification(text: String, triggerAtMillis: Long): String {
         return try {
@@ -1765,165 +1655,50 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
     }
 
-    private fun parseRelativeReminderSeconds(text: String): Int? {
-        val normalized = text.lowercase(Locale.ROOT)
-        val numericMatch = Regex(
-            """\b(?:in\s+)?(\d{1,4})\s*(sekunden?|seconds?|secs?|s|minuten?|minutes?|mins?|m|stunden?|hours?|h|tage?|days?|d)\b""",
-            RegexOption.IGNORE_CASE
-        ).find(normalized)
-        val amount = numericMatch?.groupValues?.getOrNull(1)?.toIntOrNull()
-        val unit = numericMatch?.groupValues?.getOrNull(2)
-        if (amount != null && unit != null) return amount * secondsPerReminderUnit(unit)
-
-        val oneUnitMatch = Regex(
-            """\b(?:in\s+)?ein(?:e|er|em|en)?\s+(sekunde|second|minute|minuten|stunde|stunden|hour|tag|tage|day)\b""",
-            RegexOption.IGNORE_CASE
-        ).find(normalized)
-        val oneUnit = oneUnitMatch?.groupValues?.getOrNull(1)
-        oneUnit?.let { return secondsPerReminderUnit(it) }
-
-        val wordMatch = Regex(
-            """\b(?:in\s+)?([a-zäöüß]+)\s+(sekunden?|seconds?|secs?|minuten?|minutes?|mins?|stunden?|hours?|tage?|days?)\b""",
-            RegexOption.IGNORE_CASE
-        ).find(normalized)
-        val wordAmount = wordMatch?.groupValues?.getOrNull(1)?.let { parseSmallNumberWord(it) }
-        val wordUnit = wordMatch?.groupValues?.getOrNull(2)
-        if (wordAmount != null && wordUnit != null) return wordAmount * secondsPerReminderUnit(wordUnit)
-
-        return null
-    }
-
-    private fun parseSmallNumberWord(word: String): Int? =
-        when (word.lowercase(Locale.ROOT)) {
-            "ein", "eine", "einer", "eins", "one" -> 1
-            "zwei", "two" -> 2
-            "drei", "three" -> 3
-            "vier", "four" -> 4
-            "fünf", "fuenf", "funf", "five" -> 5
-            "sechs", "six" -> 6
-            "sieben", "seven" -> 7
-            "acht", "eight" -> 8
-            "neun", "nine" -> 9
-            "zehn", "ten" -> 10
-            "elf", "eleven" -> 11
-            "zwölf", "zwoelf", "twelve" -> 12
-            "fünfzehn", "fuenfzehn", "fifteen" -> 15
-            "zwanzig", "twenty" -> 20
-            "dreißig", "dreissig", "thirty" -> 30
-            "vierzig", "forty" -> 40
-            "fünfzig", "fuenfzig", "fifty" -> 50
-            "sechzig", "sixty" -> 60
-            else -> null
-        }
-
-    private fun secondsPerReminderUnit(unit: String): Int {
-        val normalizedUnit = unit.lowercase(Locale.ROOT)
-        return when {
-            normalizedUnit.startsWith("m") -> 60
-            normalizedUnit.startsWith("h") || normalizedUnit.startsWith("stunde") -> 60 * 60
-            normalizedUnit.startsWith("s") -> 1
-            normalizedUnit.startsWith("t") || normalizedUnit.startsWith("d") -> 24 * 60 * 60
-            else -> 60
-        }
-    }
-
-    private fun hasCalendarDateHint(text: String): Boolean {
-        val normalized = text.lowercase(Locale.ROOT)
-        return Regex("""\b\d{4}-\d{1,2}-\d{1,2}\b""").containsMatchIn(normalized) ||
-            listOf("morgen", "tomorrow", "übermorgen", "uebermorgen", "heute", "today").any { normalized.contains(it) }
-    }
-
-    private fun parseClockTime(text: String): ReminderClockTime? {
-        val normalized = text.lowercase(Locale.ROOT)
-        Regex("""\b(?:um\s*)?([01]?\d|2[0-3])[:.]([0-5]\d)\b""")
-            .find(normalized)
-            ?.let { match ->
-                val hour = match.groupValues[1].toIntOrNull()
-                val minute = match.groupValues[2].toIntOrNull()
-                if (hour != null && minute != null) return ReminderClockTime(hour, minute)
-            }
-
-        Regex("""\b([01]?\d|2[0-3])\s*uhr(?:\s*([0-5]\d))?\b""")
-            .find(normalized)
-            ?.let { match ->
-                val hour = match.groupValues[1].toIntOrNull()
-                val minute = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 0
-                if (hour != null) return ReminderClockTime(hour, minute)
-            }
-
-        Regex("""\bum\s+([01]?\d|2[0-3])\b""")
-            .find(normalized)
-            ?.groupValues
-            ?.getOrNull(1)
-            ?.toIntOrNull()
-            ?.let { return ReminderClockTime(it, 0) }
-
-        return null
-    }
-
-    private fun openReminderCalendarDraft(text: String, dueTime: String): String {
-        val intent = Intent(Intent.ACTION_INSERT)
-            .setData(CalendarContract.Events.CONTENT_URI)
-            .putExtra(CalendarContract.Events.TITLE, text)
-            .putExtra(CalendarContract.Events.DESCRIPTION, "NeuroGlasses reminder: $text\nZeit: $dueTime")
-
-        parseReminderCalendarStartMillis(dueTime)?.let { startMillis ->
-            intent
-                .putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMillis)
-                .putExtra(CalendarContract.EXTRA_EVENT_END_TIME, startMillis + 30 * 60 * 1000L)
-        }
-
-        return launchIntent(intent, "calendar reminder draft")
-    }
-
-    private fun parseReminderCalendarStartMillis(dueTime: String): Long? {
-        val normalized = dueTime.lowercase(Locale.ROOT)
-        val calendar = Calendar.getInstance()
-
-        Regex("""\b(\d{4})-(\d{1,2})-(\d{1,2})(?:[ t](\d{1,2})(?::(\d{2}))?)?\b""")
-            .find(normalized)
-            ?.let { match ->
-                calendar.set(Calendar.YEAR, match.groupValues[1].toInt())
-                calendar.set(Calendar.MONTH, match.groupValues[2].toInt() - 1)
-                calendar.set(Calendar.DAY_OF_MONTH, match.groupValues[3].toInt())
-                calendar.set(Calendar.HOUR_OF_DAY, match.groupValues.getOrNull(4)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 9)
-                calendar.set(Calendar.MINUTE, match.groupValues.getOrNull(5)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 0)
-                calendar.set(Calendar.SECOND, 0)
-                calendar.set(Calendar.MILLISECOND, 0)
-                return calendar.timeInMillis
-            }
-
-        val dayOffset = when {
-            normalized.contains("übermorgen") || normalized.contains("uebermorgen") -> 2
-            normalized.contains("morgen") || normalized.contains("tomorrow") -> 1
-            normalized.contains("heute") || normalized.contains("today") -> 0
-            else -> null
-        } ?: return null
-
-        calendar.add(Calendar.DAY_OF_YEAR, dayOffset)
-        val clockTime = parseClockTime(normalized) ?: ReminderClockTime(9, 0)
-        calendar.set(Calendar.HOUR_OF_DAY, clockTime.hour)
-        calendar.set(Calendar.MINUTE, clockTime.minute)
-        calendar.set(Calendar.SECOND, 0)
-        calendar.set(Calendar.MILLISECOND, 0)
-        return calendar.timeInMillis
-    }
-
     private fun listReminders(): String {
         val prefs = context.getSharedPreferences("assistant_reminders", Context.MODE_PRIVATE)
         val reminders = prefs.getStringSet("items", emptySet()).orEmpty().sorted().map { item ->
-            val parts = item.split("|", limit = 3)
-            "- ${parts.getOrNull(1).orEmpty()}${parts.getOrNull(2)?.takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()}"
+            val parts = item.split("|", limit = 4)
+            val dueText = parts.getOrNull(2)?.takeIf { it.isNotBlank() }
+            val dueMillis = parts.getOrNull(3)?.toLongOrNull()
+            val dueLabel = dueText ?: dueMillis?.let {
+                DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.GERMANY).format(Date(it))
+            }
+            "- ${parts.getOrNull(1).orEmpty()}${dueLabel?.let { " ($it)" }.orEmpty()}"
         }
         return if (reminders.isEmpty()) "No reminders saved." else reminders.joinToString("\n")
     }
 
     private fun sendEmail(to: String, subject: String, body: String): String {
         if (to.isBlank()) return "Ich brauche eine E-Mail-Adresse."
-        val intent = Intent(Intent.ACTION_SENDTO, Uri.parse("mailto:${Uri.encode(to)}"))
-            .putExtra(Intent.EXTRA_SUBJECT, subject)
-            .putExtra(Intent.EXTRA_TEXT, body)
-        return launchIntent(intent, "E-Mail-Entwurf")
+        val mailUri = Uri.parse(
+            "mailto:${Uri.encode(to)}" +
+                "?subject=${Uri.encode(subject)}" +
+                "&body=${Uri.encode(body)}"
+        )
+        val intents = listOf(
+            Intent(Intent.ACTION_SENDTO, mailUri).setPackage("com.google.android.gm"),
+            Intent(Intent.ACTION_SENDTO, mailUri),
+            Intent(Intent.ACTION_SEND)
+                .setType("message/rfc822")
+                .putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
+                .putExtra(Intent.EXTRA_SUBJECT, subject)
+                .putExtra(Intent.EXTRA_TEXT, body)
+                .setPackage("com.google.android.gm"),
+            Intent(Intent.ACTION_SEND)
+                .setType("message/rfc822")
+                .putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
+                .putExtra(Intent.EXTRA_SUBJECT, subject)
+                .putExtra(Intent.EXTRA_TEXT, body)
+        )
+
+        intents.forEach { intent ->
+            val result = launchIntent(intent, "E-Mail-Entwurf")
+            if (!result.startsWith("Could not")) {
+                return "Opened email draft for $to. Android/Gmail requires you to confirm Send; silent Gmail sending needs OAuth or SMTP configuration."
+            }
+        }
+        return "Could not open an email app for $to."
     }
 
     private fun openApp(app: String): String {
@@ -1962,13 +1737,26 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (percent >= 0) "Akkustand: $percent%, lädt: ${if (charging) "ja" else "nein"}." else "Akkustand ist nicht verfügbar."
     }
 
-    private fun createCalendarEvent(title: String, start: String, end: String, location: String, notes: String): String {
+    private fun createCalendarEvent(
+        title: String,
+        start: String,
+        end: String,
+        startEpochMillis: Long?,
+        endEpochMillis: Long?,
+        location: String,
+        notes: String
+    ): String {
         if (title.isBlank()) return "Ich brauche einen Termintitel."
         val intent = Intent(Intent.ACTION_INSERT)
             .setData(CalendarContract.Events.CONTENT_URI)
             .putExtra(CalendarContract.Events.TITLE, title)
             .putExtra(CalendarContract.Events.EVENT_LOCATION, location)
             .putExtra(CalendarContract.Events.DESCRIPTION, listOf(notes, start.takeIf { it.isNotBlank() }?.let { "Start: $it" }, end.takeIf { it.isNotBlank() }?.let { "Ende: $it" }).filterNotNull().joinToString("\n"))
+        startEpochMillis?.takeIf { it > 0 }?.let { startMillis ->
+            intent.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMillis)
+            val endMillis = endEpochMillis?.takeIf { it > startMillis } ?: (startMillis + 30 * 60 * 1000L)
+            intent.putExtra(CalendarContract.EXTRA_EVENT_END_TIME, endMillis)
+        }
         return launchIntent(intent, "Kalendertermin")
     }
 
@@ -1982,7 +1770,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         image: Bitmap?,
         allowGlassesPhotoTool: Boolean = false,
         includePersistedHistory: Boolean = true,
-        persistConversation: Boolean = true,
+        persistConversation: Boolean = false,
         conversationHistory: List<Message> = emptyList()
     ) {
         Log.d(appTag, "OpenAI Streaming API called")
@@ -2278,27 +2066,31 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             contentList.add(Content(type = "text", text = instruction))
         }
 
-        val requestChatId = if (persistConversation) activeChatId() else null
+        val requestChatId = activeChatIdOrNull()
         val messagesList = mutableListOf<Message>()
         val sessionPrompt = when {
             hasImage ->
                 "Diese Anfrage enthält ein frisches Kamerabild. Verwende dieses Bild als primäre Quelle und ziehe keine älteren Bildbeschreibungen oder Tool-Ergebnisse heran."
-            persistConversation ->
-                "Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat nur, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+            requestChatId != null ->
+                "Du bist in einem explizit gewählten persistenten Chat. Verwende dessen Verlauf. Nutze Chat-Verwaltungstools nur, wenn der Nutzer neue Chats, Chatlisten, Umbenennungen, Löschungen, Wechsel oder das Verlassen des persistenten Chats wünscht."
             conversationHistory.isNotEmpty() ->
-                "Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse aus anderen Konversationen."
+                "Du bist in der ephemeren Hauptkonversation. Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Erstelle oder betrete persistente Chats nur bei ausdrücklicher Nutzerbitte."
             else ->
-                "Diese Anfrage ist eigenständig und hat keinen Chat-Verlauf. Verwende keine früheren Tests, Kontakte, Telefonnummern, Pläne oder Tool-Ergebnisse, wenn sie nicht im aktuellen Nutzertext stehen."
+                "Diese Anfrage ist Teil der ephemeren Hauptkonversation und hat keinen gespeicherten Chat-Verlauf. Erstelle oder betrete persistente Chats nur bei ausdrücklicher Nutzerbitte."
         }
-        val systemPrompt = getSystemPrompt() + "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Natürliche Erinnerungszeiten sind ok. Aktuelles/Web/Preise/Öffnungszeiten: web_search. $sessionPrompt"
+        val systemPrompt = getSystemPrompt() +
+            "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. ${currentAssistantTimeHint()} " +
+            "Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. " +
+            "Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. " +
+            "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings. Erwarte keine Textinterpretation durch die App. " +
+            "Aktuelles/Web/Preise/Öffnungszeiten: web_search. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
         if (includeHistoryForRequest) {
-            if (includePersistedHistory) {
-                messagesList.addAll(activeChatHistoryMessages())
-            }
-            if (conversationHistory.isNotEmpty()) {
+            if (requestChatId != null) {
+                messagesList.addAll(chatHistoryMessages(requestChatId))
+            } else if (conversationHistory.isNotEmpty()) {
                 messagesList.addAll(conversationHistory.takeLast(20))
             }
         } else if (hasImage) {
@@ -2312,7 +2104,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 messagesList,
                 instruction,
                 allowGlassesPhotoTool,
-                includeChatTools = persistConversation
+                includeChatTools = true
             )
         } else {
             val reason = if (hasImage) "image request" else "text request"
@@ -2345,6 +2137,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             directResponse = toolResolution.directResponse,
             deferred = toolResolution.deferred
         )
+    }
+
+    private fun currentAssistantTimeHint(): String {
+        val now = System.currentTimeMillis()
+        val formatted = DateFormat.getDateTimeInstance(DateFormat.FULL, DateFormat.LONG, Locale.GERMANY)
+            .format(Date(now))
+        return "Aktuelle lokale Zeit: $formatted; epoch_ms=$now."
     }
 
     private fun recoverImageResponseWithoutStreaming(chatContext: ChatRequestContext, reason: String): String {
@@ -2415,9 +2214,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         if (emitStreamingChunk) {
             listener?.onOpenAIStreamingChunk(finalResponse, true)
         }
-        if (persistConversation && chatContext.requestChatId != null) {
+        val persistentModeEnded = chatContext.toolResults.any {
+            it.startsWith("leave_chat:") || it.startsWith("delete_chat:")
+        }
+        val targetChatId = if (persistentModeEnded) null else activeChatIdOrNull() ?: chatContext.requestChatId
+        if (targetChatId != null) {
             appendChatMessages(
-                activeChatId().takeIf { it != chatContext.requestChatId } ?: chatContext.requestChatId,
+                targetChatId,
                 listOf(
                     PersistedChatMessage("user", instruction),
                     PersistedChatMessage("assistant", finalResponse)
@@ -2612,24 +2415,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun prepareTtsInput(text: String): String {
-        val normalized = text
-            .replace(Regex("\\s+"), " ")
-            .trim()
+        val normalized = text.trim()
         if (normalized.length <= MAX_TTS_INPUT_CHARS) return normalized
-
-        val clipped = normalized.take(MAX_TTS_INPUT_CHARS)
-        val sentenceEnd = listOf(
-            clipped.lastIndexOf('.'),
-            clipped.lastIndexOf('!'),
-            clipped.lastIndexOf('?')
-        ).maxOrNull() ?: -1
-        val wordEnd = clipped.lastIndexOf(' ')
-        val cutIndex = when {
-            sentenceEnd >= 80 -> sentenceEnd + 1
-            wordEnd >= 80 -> wordEnd
-            else -> clipped.length
-        }
-        return clipped.take(cutIndex).trim().ifBlank { clipped.trim() }
+        return normalized.take(MAX_TTS_INPUT_CHARS).trim()
     }
 
     /**

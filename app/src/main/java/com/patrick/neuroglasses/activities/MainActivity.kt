@@ -9,8 +9,10 @@ import android.bluetooth.BluetoothDevice
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.view.View
 import android.widget.ArrayAdapter
 import android.widget.Button
+import android.widget.EditText
 import android.widget.ListView
 import android.widget.TextView
 import android.widget.Toast
@@ -19,11 +21,17 @@ import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import com.google.android.material.tabs.TabLayout
 import com.patrick.neuroglasses.R
 import com.patrick.neuroglasses.helpers.AppPermissions
 import com.patrick.neuroglasses.helpers.BluetoothHelper
+import com.patrick.neuroglasses.helpers.OpenAIHelper
+import com.patrick.neuroglasses.helpers.PersistentConversationSummary
 import com.patrick.neuroglasses.helpers.RokidHostConnection
 import com.patrick.neuroglasses.services.RokidConnectionService
+import java.text.DateFormat
+import java.util.Date
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
     private val appTag = "NeuroGlasses"
@@ -49,9 +57,25 @@ class MainActivity : AppCompatActivity() {
     private lateinit var navigateButton: Button
     private lateinit var testUIButton: Button
     private lateinit var scanButton: Button
+    private lateinit var mainTabLayout: TabLayout
+    private lateinit var devicesTabContent: View
+    private lateinit var conversationsTabContent: View
+    private lateinit var conversationModeTextView: TextView
+    private lateinit var conversationInfoTextView: TextView
+    private lateinit var conversationListView: ListView
+    private lateinit var newConversationButton: Button
+    private lateinit var leaveConversationButton: Button
+    private lateinit var renameConversationButton: Button
+    private lateinit var deleteConversationButton: Button
+    private lateinit var refreshConversationsButton: Button
     private lateinit var deviceListAdapter: ArrayAdapter<String>
+    private lateinit var conversationListAdapter: ArrayAdapter<String>
+    private lateinit var openAIHelper: OpenAIHelper
     private val deviceList = mutableListOf<String>()
     private val deviceMap = mutableMapOf<String, BluetoothDevice>()
+    private val conversationDisplayList = mutableListOf<String>()
+    private val conversationSummaries = mutableListOf<PersistentConversationSummary>()
+    private var selectedConversationId: String? = null
     private var pendingAuthorizationDeviceName: String? = null
     private var isWaitingForRokidAuthorization = false
     private var isGlassesConnected = false
@@ -89,10 +113,26 @@ class MainActivity : AppCompatActivity() {
         navigateButton = findViewById(R.id.navigateButton)
         testUIButton = findViewById(R.id.testUIButton)
         scanButton = findViewById(R.id.scanButton)
+        mainTabLayout = findViewById(R.id.mainTabLayout)
+        devicesTabContent = findViewById(R.id.devicesTabContent)
+        conversationsTabContent = findViewById(R.id.conversationsTabContent)
+        conversationModeTextView = findViewById(R.id.conversationModeTextView)
+        conversationInfoTextView = findViewById(R.id.conversationInfoTextView)
+        conversationListView = findViewById(R.id.conversationListView)
+        newConversationButton = findViewById(R.id.newConversationButton)
+        leaveConversationButton = findViewById(R.id.leaveConversationButton)
+        renameConversationButton = findViewById(R.id.renameConversationButton)
+        deleteConversationButton = findViewById(R.id.deleteConversationButton)
+        refreshConversationsButton = findViewById(R.id.refreshConversationsButton)
+        openAIHelper = OpenAIHelper(this, appTag)
 
         // Setup device list adapter
         deviceListAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, deviceList)
         deviceListView.adapter = deviceListAdapter
+        conversationListAdapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, conversationDisplayList)
+        conversationListView.adapter = conversationListAdapter
+        setupTabs()
+        setupConversationControls()
         RokidHostConnection.setConnectionListener(object : RokidHostConnection.ConnectionListener {
             override fun onConnectionChanged(cxrConnected: Boolean, glassesConnected: Boolean) {
                 runOnUiThread {
@@ -165,6 +205,181 @@ class MainActivity : AppCompatActivity() {
         // Check permissions
         bluetoothHelper.checkPermissions()
         connectSavedRokidHostSession()
+    }
+
+    private fun setupTabs() {
+        mainTabLayout.addOnTabSelectedListener(object : TabLayout.OnTabSelectedListener {
+            override fun onTabSelected(tab: TabLayout.Tab) {
+                showMainTab(tab.position)
+            }
+
+            override fun onTabUnselected(tab: TabLayout.Tab) = Unit
+            override fun onTabReselected(tab: TabLayout.Tab) {
+                if (tab.position == 1) refreshConversationList()
+            }
+        })
+        showMainTab(mainTabLayout.selectedTabPosition.coerceAtLeast(0))
+    }
+
+    private fun showMainTab(position: Int) {
+        devicesTabContent.visibility = if (position == 0) View.VISIBLE else View.GONE
+        conversationsTabContent.visibility = if (position == 1) View.VISIBLE else View.GONE
+        if (position == 1) refreshConversationList()
+    }
+
+    private fun setupConversationControls() {
+        conversationListView.setOnItemClickListener { _, _, position, _ ->
+            val summary = conversationSummaries.getOrNull(position) ?: return@setOnItemClickListener
+            selectedConversationId = summary.id
+            if (openAIHelper.enterPersistentConversation(summary.id)) {
+                Toast.makeText(this, "Persistente Konversation aktiv: ${summary.title}", Toast.LENGTH_SHORT).show()
+                refreshConversationList()
+            }
+        }
+
+        conversationListView.setOnItemLongClickListener { _, _, position, _ ->
+            val summary = conversationSummaries.getOrNull(position) ?: return@setOnItemLongClickListener true
+            selectedConversationId = summary.id
+            promptRenameConversation(summary)
+            true
+        }
+
+        newConversationButton.setOnClickListener {
+            promptConversationTitle(
+                title = "Neue persistente Konversation",
+                prefill = "",
+                allowBlank = true,
+                positiveLabel = "Erstellen"
+            ) { title ->
+                val created = openAIHelper.createPersistentConversation(title.takeIf { it.isNotBlank() })
+                selectedConversationId = created.id
+                Toast.makeText(this, "Persistente Konversation erstellt", Toast.LENGTH_SHORT).show()
+                refreshConversationList()
+            }
+        }
+
+        leaveConversationButton.setOnClickListener {
+            openAIHelper.leavePersistentConversation()
+            selectedConversationId = null
+            Toast.makeText(this, "Hauptkonversation ist wieder ephemer", Toast.LENGTH_SHORT).show()
+            refreshConversationList()
+        }
+
+        renameConversationButton.setOnClickListener {
+            val summary = selectedConversation() ?: return@setOnClickListener showNoConversationToast()
+            promptRenameConversation(summary)
+        }
+
+        deleteConversationButton.setOnClickListener {
+            val summary = selectedConversation() ?: return@setOnClickListener showNoConversationToast()
+            AlertDialog.Builder(this)
+                .setTitle("Konversation löschen")
+                .setMessage("Persistente Konversation \"${summary.title}\" löschen?")
+                .setPositiveButton("Löschen") { _, _ ->
+                    if (openAIHelper.deletePersistentConversation(summary.id)) {
+                        selectedConversationId = null
+                        Toast.makeText(this, "Konversation gelöscht", Toast.LENGTH_SHORT).show()
+                        refreshConversationList()
+                    }
+                }
+                .setNegativeButton("Abbrechen", null)
+                .show()
+        }
+
+        refreshConversationsButton.setOnClickListener {
+            refreshConversationList()
+        }
+    }
+
+    private fun refreshConversationList() {
+        val summaries = openAIHelper.listPersistentConversations()
+        conversationSummaries.clear()
+        conversationSummaries.addAll(summaries)
+
+        val active = summaries.firstOrNull { it.isActive }
+        selectedConversationId = when {
+            active != null -> active.id
+            summaries.any { it.id == selectedConversationId } -> selectedConversationId
+            else -> null
+        }
+
+        conversationDisplayList.clear()
+        conversationDisplayList.addAll(summaries.map { formatConversationSummary(it) })
+        if (conversationDisplayList.isEmpty()) {
+            conversationDisplayList.add("Keine persistenten Konversationen")
+        }
+        conversationListAdapter.notifyDataSetChanged()
+
+        conversationModeTextView.text = active?.let { "Persistenter Chat: ${it.title}" } ?: "Hauptkonversation: ephemer"
+        conversationInfoTextView.text = if (active == null) {
+            "Persistente Konversationen werden nur genutzt, wenn du eine erstellst oder auswählst."
+        } else {
+            "Neue Assistant-Antworten werden in diesem persistenten Chat gespeichert."
+        }
+
+        leaveConversationButton.isEnabled = active != null
+        renameConversationButton.isEnabled = summaries.isNotEmpty()
+        deleteConversationButton.isEnabled = summaries.isNotEmpty()
+    }
+
+    private fun formatConversationSummary(summary: PersistentConversationSummary): String {
+        val activePrefix = if (summary.isActive) "* " else ""
+        val updated = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.GERMANY)
+            .format(Date(summary.updatedAt))
+        return "$activePrefix${summary.title} · ${summary.messageCount} Nachrichten · $updated"
+    }
+
+    private fun selectedConversation(): PersistentConversationSummary? {
+        val selectedId = selectedConversationId
+        return conversationSummaries.firstOrNull { it.id == selectedId }
+            ?: conversationSummaries.firstOrNull { it.isActive }
+    }
+
+    private fun promptRenameConversation(summary: PersistentConversationSummary) {
+        promptConversationTitle(
+            title = "Konversation umbenennen",
+            prefill = summary.title,
+            allowBlank = false,
+            positiveLabel = "Speichern"
+        ) { title ->
+            if (openAIHelper.renamePersistentConversation(summary.id, title)) {
+                selectedConversationId = summary.id
+                Toast.makeText(this, "Konversation umbenannt", Toast.LENGTH_SHORT).show()
+                refreshConversationList()
+            }
+        }
+    }
+
+    private fun promptConversationTitle(
+        title: String,
+        prefill: String,
+        allowBlank: Boolean,
+        positiveLabel: String,
+        onTitle: (String) -> Unit
+    ) {
+        val input = EditText(this).apply {
+            hint = "Titel"
+            setSingleLine(true)
+            setText(prefill)
+            selectAll()
+        }
+        AlertDialog.Builder(this)
+            .setTitle(title)
+            .setView(input)
+            .setPositiveButton(positiveLabel) { _, _ ->
+                val cleanTitle = input.text.toString().trim()
+                if (!allowBlank && cleanTitle.isBlank()) {
+                    Toast.makeText(this, "Titel darf nicht leer sein", Toast.LENGTH_SHORT).show()
+                    return@setPositiveButton
+                }
+                onTitle(cleanTitle)
+            }
+            .setNegativeButton("Abbrechen", null)
+            .show()
+    }
+
+    private fun showNoConversationToast() {
+        Toast.makeText(this, "Keine persistente Konversation ausgewählt", Toast.LENGTH_SHORT).show()
     }
 
     override fun onRequestPermissionsResult(

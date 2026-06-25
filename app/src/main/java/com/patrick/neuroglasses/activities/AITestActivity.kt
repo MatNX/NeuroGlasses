@@ -681,6 +681,7 @@ class AITestActivity : AppCompatActivity() {
 
     private fun localizeToolResult(result: String): String = when {
         result.startsWith("Started ", ignoreCase = true) -> "gestartet"
+        result.startsWith("Requested ", ignoreCase = true) -> "angefragt"
         result.startsWith("SMS sent", ignoreCase = true) -> "gesendet"
         result.startsWith("Found ", ignoreCase = true) -> result
         result.startsWith("Could not", ignoreCase = true) -> "fehlgeschlagen: $result"

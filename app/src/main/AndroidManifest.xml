@@ -71,6 +71,7 @@
         <package android:name="com.rokid.ai.translate" />
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.google.android.youtube" />
+        <package android:name="com.google.android.apps.youtube.music" />
         <package android:name="com.google.android.calendar" />
         <package android:name="com.google.android.gm" />
         <package android:name="com.whatsapp" />
@@ -98,6 +99,18 @@
         <intent>
             <action android:name="android.intent.action.SENDTO" />
             <data android:scheme="smsto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SENDTO" />
+            <data android:scheme="mailto" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.SEND" />
+            <data android:mimeType="message/rfc822" />
+        </intent>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:scheme="https" />
         </intent>
         <intent>
             <action android:name="android.intent.action.INSERT" />
