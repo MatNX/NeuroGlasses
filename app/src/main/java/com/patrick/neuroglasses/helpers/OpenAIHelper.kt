@@ -25,6 +25,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
+import java.util.Collections
 import java.net.URLEncoder
 import java.util.Locale
 import java.util.UUID
@@ -152,6 +153,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+    private val activeCalls = Collections.synchronizedSet(mutableSetOf<Call>())
 
 
     // Get configuration from SharedPreferences
@@ -164,6 +166,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun getAsrModel(): String = SettingsActivity.getAsrModel(context)
     private fun getTtsModel(): String = SettingsActivity.getTtsModel(context)
     private fun getTtsVoice(): String = SettingsActivity.getTtsVoice(context)
+    private fun getMapTilerApiKey(): String = SettingsActivity.getMapTilerApiKey(context)
 
     // Build OkHttpClient with configurable timeout
     private fun getClient(isStreaming: Boolean = false): OkHttpClient {
@@ -180,6 +183,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun getChatApiUrl(): String = "${getApiBaseUrl()}/chat/completions"
     private fun getAsrApiUrl(): String = "${getApiBaseUrl()}/audio/transcriptions"
     private fun getTtsApiUrl(): String = "${getApiBaseUrl()}/audio/speech"
+
+    fun cancelActiveRequests() {
+        synchronized(activeCalls) {
+            activeCalls.forEach { call -> runCatching { call.cancel() } }
+            activeCalls.clear()
+        }
+        shouldStopAssistantTurn = true
+        Log.i(appTag, "Cancelled active AI network requests")
+    }
+
+    private fun executeTracked(request: Request, isStreaming: Boolean = false): Response {
+        val call = getClient(isStreaming = isStreaming).newCall(request)
+        activeCalls.add(call)
+        return call.execute()
+    }
 
 
     private fun getChatSessions(): MutableList<PersistedChatSession> {
@@ -398,7 +416,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 Log.d(appTag, "Sending ASR request for file: ${audioFile.name} (${audioFile.length()} bytes)")
 
                 // Execute the request
-                getClient().newCall(request).execute().use { response ->
+                executeTracked(request).use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "ASR API call failed: ${response.code} - $errorBody")
@@ -527,6 +545,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 ))
             )),
             AssistantTool(function = ToolFunction(
+                name = "start_navigation",
+                description = "Deutschsprachig: Geokodiere jedes Navigationsziel zuerst über MapTiler. Starte Navigation nur, wenn MapTiler eine sehr hohe Treffer-Konfidenz liefert; gib sonst die besten Optionen zurück und bitte den Nutzer um Auswahl.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder ausgewählte Option, die zuerst über MapTiler geprüft wird.")))
+            )),
+            AssistantTool(function = ToolFunction(
                 name = "open_app",
                 description = "Deutschsprachig: Öffne eine installierte App anhand von Paketname oder bekanntem App-Namen.",
                 parameters = objectSchema(listOf("app"), mapOf("app" to stringProp("Paketname oder App-Name, z. B. Maps, WhatsApp, Kalender.")))
@@ -600,6 +623,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "list_reminders" -> listReminders()
             "create_calendar_event" -> createCalendarEvent(arg("title"), arg("start"), arg("end"), arg("location"), arg("notes"))
             "send_email" -> sendEmail(arg("to"), arg("subject"), arg("body"))
+            "start_navigation" -> startNavigation(arg("destination"))
             "open_app" -> openApp(arg("app"))
             "share_text" -> shareText(arg("text"))
             "get_battery_status" -> getBatteryStatus()
@@ -739,7 +763,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun fetchText(url: String, label: String): String = try {
         val request = Request.Builder().url(url).get().build()
-        getClient().newCall(request).execute().use { response ->
+        executeTracked(request).use { response ->
             if (!response.isSuccessful) "$label konnte nicht abgerufen werden: HTTP ${response.code}" else response.body?.string()?.trim().orEmpty()
         }
     } catch (e: Exception) {
@@ -779,6 +803,86 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .putExtra(Intent.EXTRA_SUBJECT, subject)
             .putExtra(Intent.EXTRA_TEXT, body)
         return launchIntent(intent, "E-Mail-Entwurf")
+    }
+
+    private data class NavigationCandidate(
+        val label: String,
+        val latitude: Double,
+        val longitude: Double,
+        val confidence: Double
+    )
+
+    private fun startNavigation(destination: String): String {
+        if (destination.isBlank()) return "Ich brauche ein Navigationsziel, das ich zuerst über MapTiler prüfen kann."
+        if (getMapTilerApiKey().isBlank()) return "Navigation braucht zuerst einen MapTiler API-Schlüssel in den Einstellungen."
+
+        val candidates = geocodeWithMapTiler(destination)
+        if (candidates.isEmpty()) {
+            return "MapTiler hat kein passendes Ziel für '$destination' gefunden. Bitte nenne eine genauere Adresse oder einen eindeutigeren Ortsnamen."
+        }
+
+        val best = candidates.first()
+        val secondConfidence = candidates.getOrNull(1)?.confidence ?: 0.0
+        val hasVeryHighConfidence = best.confidence >= 0.90 && (candidates.size == 1 || best.confidence - secondConfidence >= 0.15)
+        if (!hasVeryHighConfidence) {
+            return candidates.take(3).mapIndexed { index, candidate ->
+                "${index + 1}. ${candidate.label} (${(candidate.confidence * 100).toInt()}%)"
+            }.joinToString(
+                prefix = "MapTiler ist nicht sicher genug. Welche Option soll ich nehmen?\n",
+                separator = "\n"
+            )
+        }
+
+        val encodedLabel = Uri.encode(best.label)
+        val coordinateQuery = "${best.latitude},${best.longitude}"
+        val intents = listOf(
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$coordinateQuery")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("google.navigation:q=$encodedLabel")).setPackage("com.google.android.apps.maps"),
+            Intent(Intent.ACTION_VIEW, Uri.parse("geo:${best.latitude},${best.longitude}?q=$encodedLabel"))
+        )
+        intents.forEach { intent ->
+            val result = launchIntent(intent, "Navigation zu ${best.label}")
+            if (!result.contains("konnte nicht gestartet werden")) return "$result MapTiler-Treffer: ${best.label} (${(best.confidence * 100).toInt()}%)."
+        }
+        return "MapTiler hat '${best.label}' sicher gefunden, aber die Navigation konnte nicht gestartet werden."
+    }
+
+    private fun geocodeWithMapTiler(query: String): List<NavigationCandidate> {
+        val apiKey = getMapTilerApiKey()
+        if (apiKey.isBlank()) {
+            Log.w(appTag, "MapTiler API key missing; navigation cannot be geocoded")
+            return emptyList()
+        }
+
+        val url = "https://api.maptiler.com/geocoding/${URLEncoder.encode(query, "UTF-8")}.json?key=${URLEncoder.encode(apiKey, "UTF-8")}&limit=3&language=de"
+        return try {
+            val request = Request.Builder().url(url).get().build()
+            executeTracked(request).use { response ->
+                if (!response.isSuccessful) {
+                    Log.w(appTag, "MapTiler geocoding failed: HTTP ${response.code}")
+                    return emptyList()
+                }
+                val body = response.body?.string().orEmpty()
+                val parsed = gson.fromJson(body, Map::class.java) as? Map<*, *> ?: return emptyList()
+                val features = parsed["features"] as? List<*> ?: return emptyList()
+                features.mapNotNull { feature ->
+                    val item = feature as? Map<*, *> ?: return@mapNotNull null
+                    val center = item["center"] as? List<*> ?: return@mapNotNull null
+                    val longitude = (center.getOrNull(0) as? Number)?.toDouble() ?: return@mapNotNull null
+                    val latitude = (center.getOrNull(1) as? Number)?.toDouble() ?: return@mapNotNull null
+                    val label = item["place_name"]?.toString()?.takeIf { it.isNotBlank() }
+                        ?: item["text"]?.toString()?.takeIf { it.isNotBlank() }
+                        ?: return@mapNotNull null
+                    val confidence = ((item["relevance"] as? Number)?.toDouble()
+                        ?: (item["score"] as? Number)?.toDouble()
+                        ?: 0.0).coerceIn(0.0, 1.0)
+                    NavigationCandidate(label, latitude, longitude, confidence)
+                }.sortedByDescending { it.confidence }
+            }
+        } catch (e: Exception) {
+            Log.e(appTag, "MapTiler geocoding error", e)
+            emptyList()
+        }
     }
 
     private fun openApp(app: String): String {
@@ -863,7 +967,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation steht absichtlich nicht als Tool zur Verfügung. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar. Jede Navigationsabsicht muss start_navigation nutzen, damit MapTiler zuerst geokodiert. Starte erst, wenn das Tool eine sehr hohe MapTiler-Konfidenz meldet; wenn das Tool Optionen zurückgibt, zeige diese Optionen und warte auf die Auswahl des Nutzers. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
@@ -923,7 +1027,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 listener?.onOpenAIStreamingStarted()
 
                 // Execute the request with streaming-specific timeout
-                getClient(isStreaming = true).newCall(httpRequest).execute().use { response ->
+                executeTracked(httpRequest, isStreaming = true).use { response ->
                     if (!response.isSuccessful) {
                         val errorBody = response.body?.string() ?: "Unknown error"
                         Log.e(appTag, "API call failed: ${response.code} - $errorBody")
@@ -1052,7 +1156,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .build()
 
         return try {
-            getClient().newCall(httpRequest).execute().use { response ->
+            executeTracked(httpRequest).use { response ->
                 if (!response.isSuccessful) {
                     Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
                     return messagesList
@@ -1154,7 +1258,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     private fun callTtsAPIStreaming(httpRequest: Request, outputDir: File) {
         // Execute the request with streaming
-        getClient(isStreaming = true).newCall(httpRequest).execute().use { response ->
+        executeTracked(httpRequest, isStreaming = true).use { response ->
             val contentType = response.body?.contentType()
             val contentLength = response.body?.contentLength()
             Log.d(appTag, "TTS response received: code=${response.code}, contentType=$contentType, contentLength=$contentLength")
@@ -1247,7 +1351,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     private fun callTtsAPINonStreaming(httpRequest: Request, outputDir: File) {
         // Execute the request
-        getClient().newCall(httpRequest).execute().use { response ->
+        executeTracked(httpRequest).use { response ->
             if (!response.isSuccessful) {
                 val errorBody = response.body?.string() ?: "Unknown error"
                 Log.e(appTag, "TTS API call failed: ${response.code} - $errorBody")

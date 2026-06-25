@@ -72,6 +72,7 @@ class AITestActivity : AppCompatActivity() {
     private var imageCaptureFinished = true
     private var pendingInstruction: String? = null
     private var pendingInstructionNeedsImage = false
+    private var isEndingConversation = false
 
     // Streaming state
     private var streamingBuffer = StringBuilder()
@@ -386,6 +387,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onSceneClosed() {
                 runOnUiThread {
                     Log.d(appTag, "Custom scene closed")
+                    endConversation("Custom view closed", closeCustomView = false, finishActivity = true)
                 }
             }
 
@@ -484,11 +486,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onAiExit() {
                 runOnUiThread {
                     Log.d(appTag, "AI scene exited")
-                    isAiSceneOpen = false
-                    // Stop audio recording if active
-                    if (audioHelper.isRecording) {
-                        audioHelper.closeAudioRecord("AI_assistant")
-                    }
+                    endConversation("AI scene exited", closeCustomView = false, finishActivity = true)
                 }
             }
         })
@@ -530,19 +528,9 @@ class AITestActivity : AppCompatActivity() {
      * Stop the current assistant turn before handing control to a native Android/Rokid app.
      */
     private fun stopAssistantSessionForExternalApp(label: String) {
-        isAiSceneOpen = false
-        isStreaming = false
         updateStatus("$label geöffnet")
         updateProcessingStatus("Assistent gestoppt – App geöffnet")
-
-        if (audioHelper.isRecording) {
-            audioHelper.closeAudioRecord("AI_assistant")
-        }
-        streamingAudioPlayer.stop()
-        customSceneHelper.stopAudio()
-        customSceneHelper.closeCustomView()
-        showProcessingUI(false)
-        finish()
+        endConversation("$label geöffnet", closeCustomView = true, finishActivity = true)
     }
 
     /**
@@ -618,21 +606,8 @@ class AITestActivity : AppCompatActivity() {
      * Send request to OpenAI with instruction and optional image
      */
     private fun sendToOpenAI(instruction: String) {
-        if (shouldEndConversation(instruction)) {
-            endConversationPolitely()
-            return
-        }
-
         pendingInstruction = instruction
-        pendingInstructionNeedsImage = shouldCaptureImageForIntent(instruction)
-
-        if (pendingInstructionNeedsImage && imageCaptureFinished) {
-            imageCaptureRequested = true
-            imageCaptureFinished = false
-            updateProcessingStatus("Bild wird für deine Frage aufgenommen…")
-            aiCameraHelper.takePhoto()
-        }
-
+        pendingInstructionNeedsImage = false
         sendPendingInstructionIfReady()
     }
 
@@ -656,39 +631,31 @@ class AITestActivity : AppCompatActivity() {
         openAIHelper.callOpenAIStreaming(instruction, imageToSend)
     }
 
-    private fun shouldCaptureImageForIntent(instruction: String): Boolean {
-        val text = instruction.lowercase()
-        val visualHints = listOf(
-            "wie viele finger", "wieviele finger", "finger", "halte ich hoch",
-            "was sehe ich", "was siehst du", "schau", "sieh", "bild", "foto",
-            "kamera", "lies", "lesen", "text", "schild", "objekt", "farbe",
-            "erkenne", "beschreibe", "vor mir", "um mich", "das hier"
-        )
-        return visualHints.any { it in text }
-    }
+    private fun endConversation(reason: String, closeCustomView: Boolean, finishActivity: Boolean) {
+        if (isEndingConversation) return
+        isEndingConversation = true
+        isAiSceneOpen = false
+        isStreaming = false
+        pendingInstruction = null
+        pendingInstructionNeedsImage = false
+        imageCaptureRequested = false
+        imageCaptureFinished = true
 
-    private fun shouldEndConversation(instruction: String): Boolean {
-        val text = instruction.lowercase().trim().trim('.', '!', '?', ',')
-        val goodbyePhrases = listOf(
-            "tschüss", "tschuess", "auf wiedersehen", "bis dann", "bis später",
-            "bis spaeter", "servus", "ciao", "goodbye", "bye", "beende das gespräch",
-            "beende das gespraech", "gespräch beenden", "gespraech beenden"
-        )
-        return goodbyePhrases.any { text == it || text.startsWith("$it ") }
-    }
+        updateStatus("Gespräch beendet")
+        updateProcessingStatus("Assistent gestoppt: $reason")
+        Toast.makeText(this, "Gespräch beendet", Toast.LENGTH_SHORT).show()
 
-    private fun endConversationPolitely() {
-        runOnUiThread {
-            updateStatus("Gespräch beendet")
-            updateProcessingStatus("Auf Wiedersehen!")
-            Toast.makeText(this, "Auf Wiedersehen!", Toast.LENGTH_SHORT).show()
-            if (audioHelper.isRecording) {
-                audioHelper.closeAudioRecord("AI_assistant")
-            }
-            streamingAudioPlayer.stop()
-            customSceneHelper.stopAudio()
+        openAIHelper.cancelActiveRequests()
+        if (audioHelper.isRecording) {
+            audioHelper.closeAudioRecord("AI_assistant")
+        }
+        streamingAudioPlayer.stop()
+        customSceneHelper.stopAudio()
+        if (closeCustomView) {
             customSceneHelper.closeCustomView()
-            showProcessingUI(false)
+        }
+        showProcessingUI(false)
+        if (finishActivity) {
             finish()
         }
     }

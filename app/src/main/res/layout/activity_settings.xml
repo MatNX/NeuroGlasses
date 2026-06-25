@@ -243,6 +243,31 @@
             app:layout_constraintStart_toStartOf="parent"
             app:layout_constraintTop_toBottomOf="@+id/ttsVoiceLabel" />
 
+
+        <!-- MapTiler API-Schlüssel Section -->
+        <TextView
+            android:id="@+id/mapTilerApiKeyLabel"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:text="MapTiler API-Schlüssel"
+            android:textSize="16sp"
+            android:textStyle="bold"
+            android:layout_marginTop="16dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/ttsVoiceEditText" />
+
+        <EditText
+            android:id="@+id/mapTilerApiKeyEditText"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:hint="MapTiler-API-Schlüssel für Navigation"
+            android:inputType="textPassword"
+            android:minHeight="48dp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@+id/mapTilerApiKeyLabel" />
+
         <!-- Buttons -->
         <Button
             android:id="@+id/saveButton"
@@ -254,7 +279,7 @@
             android:layout_marginEnd="8dp"
             app:layout_constraintEnd_toStartOf="@+id/resetButton"
             app:layout_constraintStart_toStartOf="parent"
-            app:layout_constraintTop_toBottomOf="@+id/ttsVoiceEditText" />
+            app:layout_constraintTop_toBottomOf="@+id/mapTilerApiKeyEditText" />
 
         <Button
             android:id="@+id/resetButton"
@@ -266,7 +291,7 @@
             android:layout_marginStart="8dp"
             app:layout_constraintEnd_toEndOf="parent"
             app:layout_constraintStart_toEndOf="@+id/saveButton"
-            app:layout_constraintTop_toBottomOf="@+id/ttsVoiceEditText" />
+            app:layout_constraintTop_toBottomOf="@+id/mapTilerApiKeyEditText" />
 
     </androidx.constraintlayout.widget.ConstraintLayout>
 </ScrollView>
