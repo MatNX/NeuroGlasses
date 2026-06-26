@@ -285,10 +285,10 @@ class CustomSceneHelper(
                     "layout_width": "match_parent",
                     "layout_height": "match_parent",
                     "backgroundColor": "#FF000000",
-                    "paddingStart": "20dp",
-                    "paddingTop": "20dp",
-                    "paddingEnd": "20dp",
-                    "paddingBottom": "20dp"
+                    "paddingStart": "28dp",
+                    "paddingTop": "28dp",
+                    "paddingEnd": "34dp",
+                    "paddingBottom": "42dp"
                 },
                 "children": [
                     {
@@ -308,16 +308,17 @@ class CustomSceneHelper(
                         "props": {
                             "id": "tv_result",
                             "layout_width": "match_parent",
-                            "layout_height": "match_parent",
+                            "layout_height": "wrap_content",
                             "text": "$escapedText",
-                            "textSize": "16sp",
+                            "textSize": "14sp",
                             "textColor": "#FF00FF00",
                             "textStyle": "bold",
                             "gravity": "top",
                             "layout_toEndOf": "iv_ai_icon",
                             "layout_alignParentTop": "true",
-                            "layout_alignParentBottom": "true",
-                            "marginStart": "15dp"
+                            "marginStart": "15dp",
+                            "marginEnd": "8dp",
+                            "marginBottom": "8dp"
                         }
                     }
                 ]

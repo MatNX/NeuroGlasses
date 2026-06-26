@@ -546,8 +546,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "start_navigation",
-                description = "Deutschsprachig: Geokodiere jedes Navigationsziel zuerst über MapTiler. Starte Navigation nur, wenn MapTiler eine sehr hohe Treffer-Konfidenz liefert; gib sonst die besten Optionen zurück und bitte den Nutzer um Auswahl.",
-                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder ausgewählte Option, die zuerst über MapTiler geprüft wird.")))
+                description = "Deutschsprachig: Geokodiere jedes Navigationsziel zuerst über MapTiler. Wenn MapTiler mehrere plausible Optionen liefert, wähle selbst die wahrscheinlichste Option anhand der Nutzeranfrage und rufe start_navigation erneut mit exakt diesem Optionsnamen auf. Frage den Nutzer nur, wenn die Optionen wirklich mehrdeutig sind.",
+                parameters = objectSchema(listOf("destination"), mapOf("destination" to stringProp("Zieladresse, Ortsname oder exakt ausgewählter MapTiler-Optionsname.")))
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_app",
@@ -824,11 +824,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val best = candidates.first()
         val secondConfidence = candidates.getOrNull(1)?.confidence ?: 0.0
         val hasVeryHighConfidence = best.confidence >= 0.90 && (candidates.size == 1 || best.confidence - secondConfidence >= 0.15)
-        if (!hasVeryHighConfidence) {
+        val exactLabelMatch = best.label.equals(destination, ignoreCase = true)
+        if (!hasVeryHighConfidence && !exactLabelMatch) {
             return candidates.take(3).mapIndexed { index, candidate ->
                 "${index + 1}. ${candidate.label} (${(candidate.confidence * 100).toInt()}%)"
             }.joinToString(
-                prefix = "MapTiler ist nicht sicher genug. Welche Option soll ich nehmen?\n",
+                prefix = "MapTiler lieferte mehrere Optionen. Wähle als Assistent selbst die beste Option, wenn die Nutzeranfrage genug Kontext enthält, und rufe start_navigation erneut mit exakt dem Optionsnamen auf. Frage den Nutzer nur bei echter Mehrdeutigkeit. Optionen:\n",
                 separator = "\n"
             )
         }
@@ -967,7 +968,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 val messagesList = mutableListOf<Message>()
 
                 // Add system message
-                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar. Jede Navigationsabsicht muss start_navigation nutzen, damit MapTiler zuerst geokodiert. Starte erst, wenn das Tool eine sehr hohe MapTiler-Konfidenz meldet; wenn das Tool Optionen zurückgibt, zeige diese Optionen und warte auf die Auswahl des Nutzers. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
+                val systemPrompt = getSystemPrompt() + "\n\nAntworte immer auf Deutsch (Österreich), knapp und freihändig nutzbar. Erkenne die Absicht statt nur Schlüsselwörter zu lesen: Bei visuellen Fragen wie Finger zählen, Text lesen, Objekte/Farben erkennen oder \"was sehe ich\" soll ein Foto als Kontext genutzt werden; wenn noch kein Bild vorhanden ist, nutze snap_glasses_photo. Bei Verabschiedungen wie \"tschüss\", \"auf Wiedersehen\" oder \"goodbye\" verabschiede dich kurz und beende das Gespräch. Nutze verfügbare Tools proaktiv, aber nur wenn die Absicht eindeutig und die Aktion nicht destruktiv ist. Frage nur nach, wenn für Anruf, SMS, Kalender oder E-Mail Pflichtangaben fehlen oder die Aktion unsicher wäre. Navigation ist als start_navigation Tool verfügbar. Jede Navigationsabsicht muss start_navigation nutzen, damit MapTiler zuerst geokodiert. Wenn das Tool mehrere MapTiler-Optionen zurückgibt, wähle selbst die wahrscheinlichste Option und rufe start_navigation erneut mit dem exakten Optionsnamen auf, sofern der Nutzerkontext ausreicht; zeige die Liste nur, wenn du wirklich unsicher bist. Du hast persistente, mehrere Chat-Verläufe. Nutze new_chat, list_chats, switch_chat und rename_chat, wenn der Nutzer neue Chats, getrennte Themen, Chatlisten, Umbenennungen oder Chatwechsel wünscht."
                 messagesList.add(
                     Message(
                         role = "system",
@@ -1138,55 +1139,59 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
 
     private fun resolveToolCallsIfNeeded(messagesList: MutableList<Message>): List<Message> {
-        val request = OpenAIRequest(
-            model = getVlmModel(),
-            messages = messagesList,
-            maxTokens = getVlmMaxTokens(),
-            stream = false,
-            tools = assistantTools(),
-            toolChoice = "auto"
-        )
-        val jsonBody = gson.toJson(request)
-        val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
-        val httpRequest = Request.Builder()
-            .url(getChatApiUrl())
-            .addHeader("Content-Type", "application/json")
-            .addHeader("Authorization", "Bearer ${getApiToken()}")
-            .post(requestBody)
-            .build()
+        repeat(3) { iteration ->
+            val request = OpenAIRequest(
+                model = getVlmModel(),
+                messages = messagesList,
+                maxTokens = getVlmMaxTokens(),
+                stream = false,
+                tools = assistantTools(),
+                toolChoice = "auto"
+            )
+            val jsonBody = gson.toJson(request)
+            val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
+            val httpRequest = Request.Builder()
+                .url(getChatApiUrl())
+                .addHeader("Content-Type", "application/json")
+                .addHeader("Authorization", "Bearer ${getApiToken()}")
+                .post(requestBody)
+                .build()
 
-        return try {
-            executeTracked(httpRequest).use { response ->
-                if (!response.isSuccessful) {
-                    Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
-                    return messagesList
-                }
-                val responseBody = response.body?.string() ?: return messagesList
-                val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
-                val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return messagesList
-                val toolCalls = assistantMessage.toolCalls.orEmpty()
-                if (toolCalls.isEmpty()) {
+            try {
+                executeTracked(httpRequest).use { response ->
+                    if (!response.isSuccessful) {
+                        Log.w(appTag, "Tool planning skipped: ${response.code} - ${response.body?.string()}")
+                        return messagesList
+                    }
+                    val responseBody = response.body?.string() ?: return messagesList
+                    val chatResponse = gson.fromJson(responseBody, ChatCompletionResponse::class.java)
+                    val assistantMessage = chatResponse.choices.firstOrNull()?.message ?: return messagesList
+                    val toolCalls = assistantMessage.toolCalls.orEmpty()
+                    if (toolCalls.isEmpty()) {
+                        messagesList.add(assistantMessage)
+                        return messagesList
+                    }
+
                     messagesList.add(assistantMessage)
-                    return messagesList
-                }
-
-                messagesList.add(assistantMessage)
-                toolCalls.forEach { toolCall ->
-                    val result = executeAssistantTool(toolCall)
-                    messagesList.add(
-                        Message(
-                            role = "tool",
-                            content = result,
-                            toolCallId = toolCall.id
+                    toolCalls.forEach { toolCall ->
+                        val result = executeAssistantTool(toolCall)
+                        messagesList.add(
+                            Message(
+                                role = "tool",
+                                content = result,
+                                toolCallId = toolCall.id
+                            )
                         )
-                    )
+                    }
+                    if (shouldStopAssistantTurn) return messagesList
+                    Log.d(appTag, "Completed tool planning round ${iteration + 1}")
                 }
-                messagesList
+            } catch (e: Exception) {
+                Log.e(appTag, "Tool planning failed; continuing without tools", e)
+                return messagesList
             }
-        } catch (e: Exception) {
-            Log.e(appTag, "Tool planning failed; continuing without tools", e)
-            messagesList
         }
+        return messagesList
     }
 
     /**
