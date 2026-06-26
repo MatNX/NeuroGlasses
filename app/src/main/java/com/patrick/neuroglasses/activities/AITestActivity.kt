@@ -73,6 +73,7 @@ class AITestActivity : AppCompatActivity() {
     private var pendingInstruction: String? = null
     private var pendingInstructionNeedsImage = false
     private var isEndingConversation = false
+    private var ignoreNextAudioStopCallback = false
 
     // Streaming state
     private var streamingBuffer = StringBuilder()
@@ -187,6 +188,12 @@ class AITestActivity : AppCompatActivity() {
 
             override fun onAudioRecordingStopped(savedFilePath: String?) {
                 runOnUiThread {
+                    if (ignoreNextAudioStopCallback) {
+                        ignoreNextAudioStopCallback = false
+                        Log.i(appTag, "Ignored stale audio stop callback")
+                        return@runOnUiThread
+                    }
+
                     if (savedFilePath != null) {
                         recordedAudioFile = File(savedFilePath)
                         updateProcessingStatus("Audio gespeichert: ${recordedAudioFile?.name}")
@@ -387,7 +394,12 @@ class AITestActivity : AppCompatActivity() {
             override fun onSceneClosed() {
                 runOnUiThread {
                     Log.d(appTag, "Custom scene closed")
-                    endConversation("Custom view closed", closeCustomView = false, finishActivity = true)
+                    // The glasses can briefly close/reopen the custom view while the assistant
+                    // turn is still active. Do not finish the activity here, because releasing
+                    // the SDK listeners is what makes the next AI activation appear to flash
+                    // and then stop until the phone app is reopened.
+                    isAiSceneOpen = false
+                    updateProcessingStatus("Brillenanzeige geschlossen – Assistent bleibt bereit")
                 }
             }
 
@@ -480,13 +492,20 @@ class AITestActivity : AppCompatActivity() {
             }
 
             override fun onAiKeyUp() {
-                // Not used
+                runOnUiThread {
+                    Log.d(appTag, "AI key released - stopping recording")
+                    stopAudioRecordingIfNeeded(processRecording = true)
+                }
             }
 
             override fun onAiExit() {
                 runOnUiThread {
                     Log.d(appTag, "AI scene exited")
-                    endConversation("AI scene exited", closeCustomView = false, finishActivity = true)
+                    // Keep this activity and its SDK listeners alive in the background so the
+                    // next glasses AI-key press does not depend on reopening the phone app.
+                    stopAudioRecordingIfNeeded(processRecording = false)
+                    isAiSceneOpen = false
+                    updateStatus("Bereit. Drücke die KI-Taste an der Brille.")
                 }
             }
         })
@@ -512,7 +531,12 @@ class AITestActivity : AppCompatActivity() {
         imageCaptureFinished = !imageCaptureRequested
         capturedImageView.visibility = View.GONE
 
-        // Always start audio recording (SDK requirement)
+        // Always start audio recording (SDK requirement). Reset a stale recorder first;
+        // otherwise the SDK can report that it is listening while no fresh audio chunks
+        // are delivered.
+        if (audioHelper.isRecording) {
+            stopAudioRecordingIfNeeded(processRecording = false)
+        }
         startAudioRecording()
 
         // Capture image if configured
@@ -539,9 +563,18 @@ class AITestActivity : AppCompatActivity() {
     private fun startAudioRecording() {
         if (!audioHelper.isRecording) {
             Log.i(appTag, "Starting audio recording")
+            audioHelper.setAudioStreamListener(true)
             audioHelper.clearAudioCache()
             audioHelper.openAudioRecord(codecType = 1, streamType = "AI_assistant")
             updateProcessingStatus("Recording audio...")
+        }
+    }
+
+    private fun stopAudioRecordingIfNeeded(processRecording: Boolean) {
+        if (audioHelper.isRecording) {
+            ignoreNextAudioStopCallback = !processRecording
+            updateProcessingStatus("Audioaufnahme wird beendet…")
+            audioHelper.closeAudioRecord("AI_assistant")
         }
     }
 
@@ -647,7 +680,7 @@ class AITestActivity : AppCompatActivity() {
 
         openAIHelper.cancelActiveRequests()
         if (audioHelper.isRecording) {
-            audioHelper.closeAudioRecord("AI_assistant")
+            stopAudioRecordingIfNeeded(processRecording = false)
         }
         streamingAudioPlayer.stop()
         customSceneHelper.stopAudio()
