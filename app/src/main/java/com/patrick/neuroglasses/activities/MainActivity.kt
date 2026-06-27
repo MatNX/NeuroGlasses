@@ -14,6 +14,7 @@ import android.widget.ArrayAdapter
 import android.widget.Button
 import android.widget.EditText
 import android.widget.ListView
+import android.widget.Spinner
 import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.enableEdgeToEdge
@@ -49,6 +50,7 @@ class MainActivity : AppCompatActivity() {
         private const val ROKID_AUTH_RESULT_EXTRA = "auth_result"
         private const val ROKID_AUTH_RESULT_SUCCESS = 2001
         private const val ROKID_AUTH_RESULT_CANCEL = 2003
+        private const val MAX_DEBUG_OUTPUT_CHARS = 12_000
     }
 
     private lateinit var bluetoothHelper: BluetoothHelper
@@ -60,6 +62,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mainTabLayout: TabLayout
     private lateinit var devicesTabContent: View
     private lateinit var conversationsTabContent: View
+    private lateinit var debugTabContent: View
     private lateinit var conversationModeTextView: TextView
     private lateinit var conversationInfoTextView: TextView
     private lateinit var conversationListView: ListView
@@ -68,6 +71,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var renameConversationButton: Button
     private lateinit var deleteConversationButton: Button
     private lateinit var refreshConversationsButton: Button
+    private lateinit var debugToolStatusTextView: TextView
+    private lateinit var debugToolSpinner: Spinner
+    private lateinit var debugToolNameEditText: EditText
+    private lateinit var debugToolArgumentsEditText: EditText
+    private lateinit var debugToolInstructionEditText: EditText
+    private lateinit var debugRunToolButton: Button
+    private lateinit var debugClearOutputButton: Button
+    private lateinit var debugToolOutputTextView: TextView
     private lateinit var deviceListAdapter: ArrayAdapter<String>
     private lateinit var conversationListAdapter: ArrayAdapter<String>
     private lateinit var openAIHelper: OpenAIHelper
@@ -75,6 +86,8 @@ class MainActivity : AppCompatActivity() {
     private val deviceMap = mutableMapOf<String, BluetoothDevice>()
     private val conversationDisplayList = mutableListOf<String>()
     private val conversationSummaries = mutableListOf<PersistentConversationSummary>()
+    private val debugToolSpecs = mutableListOf<OpenAIHelper.DebugToolSpec>()
+    private val debugOutput = StringBuilder()
     private var selectedConversationId: String? = null
     private var pendingAuthorizationDeviceName: String? = null
     private var isWaitingForRokidAuthorization = false
@@ -116,6 +129,7 @@ class MainActivity : AppCompatActivity() {
         mainTabLayout = findViewById(R.id.mainTabLayout)
         devicesTabContent = findViewById(R.id.devicesTabContent)
         conversationsTabContent = findViewById(R.id.conversationsTabContent)
+        debugTabContent = findViewById(R.id.debugTabContent)
         conversationModeTextView = findViewById(R.id.conversationModeTextView)
         conversationInfoTextView = findViewById(R.id.conversationInfoTextView)
         conversationListView = findViewById(R.id.conversationListView)
@@ -124,6 +138,14 @@ class MainActivity : AppCompatActivity() {
         renameConversationButton = findViewById(R.id.renameConversationButton)
         deleteConversationButton = findViewById(R.id.deleteConversationButton)
         refreshConversationsButton = findViewById(R.id.refreshConversationsButton)
+        debugToolStatusTextView = findViewById(R.id.debugToolStatusTextView)
+        debugToolSpinner = findViewById(R.id.debugToolSpinner)
+        debugToolNameEditText = findViewById(R.id.debugToolNameEditText)
+        debugToolArgumentsEditText = findViewById(R.id.debugToolArgumentsEditText)
+        debugToolInstructionEditText = findViewById(R.id.debugToolInstructionEditText)
+        debugRunToolButton = findViewById(R.id.debugRunToolButton)
+        debugClearOutputButton = findViewById(R.id.debugClearOutputButton)
+        debugToolOutputTextView = findViewById(R.id.debugToolOutputTextView)
         openAIHelper = OpenAIHelper(this, appTag)
 
         // Setup device list adapter
@@ -133,6 +155,7 @@ class MainActivity : AppCompatActivity() {
         conversationListView.adapter = conversationListAdapter
         setupTabs()
         setupConversationControls()
+        setupDebugControls()
         RokidHostConnection.setConnectionListener(object : RokidHostConnection.ConnectionListener {
             override fun onConnectionChanged(cxrConnected: Boolean, glassesConnected: Boolean) {
                 runOnUiThread {
@@ -224,6 +247,7 @@ class MainActivity : AppCompatActivity() {
     private fun showMainTab(position: Int) {
         devicesTabContent.visibility = if (position == 0) View.VISIBLE else View.GONE
         conversationsTabContent.visibility = if (position == 1) View.VISIBLE else View.GONE
+        debugTabContent.visibility = if (position == 2) View.VISIBLE else View.GONE
         if (position == 1) refreshConversationList()
     }
 
@@ -290,6 +314,106 @@ class MainActivity : AppCompatActivity() {
             refreshConversationList()
         }
     }
+
+    private fun setupDebugControls() {
+        debugToolSpecs.clear()
+        debugToolSpecs.addAll(openAIHelper.availableDebugTools())
+
+        val toolNames = debugToolSpecs.map { it.name }
+        val adapter = ArrayAdapter(this, android.R.layout.simple_spinner_item, toolNames)
+        adapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item)
+        debugToolSpinner.adapter = adapter
+        debugToolSpinner.onItemSelectedListener = object : android.widget.AdapterView.OnItemSelectedListener {
+            override fun onItemSelected(
+                parent: android.widget.AdapterView<*>?,
+                view: View?,
+                position: Int,
+                id: Long
+            ) {
+                debugToolSpecs.getOrNull(position)?.let(::applyDebugToolSpec)
+            }
+
+            override fun onNothingSelected(parent: android.widget.AdapterView<*>?) = Unit
+        }
+
+        debugRunToolButton.setOnClickListener {
+            runDebugToolCall()
+        }
+
+        debugClearOutputButton.setOnClickListener {
+            debugOutput.clear()
+            debugToolOutputTextView.text = "Noch keine Toolcalls ausgeführt."
+        }
+
+        debugToolSpecs.firstOrNull()?.let(::applyDebugToolSpec)
+    }
+
+    private fun applyDebugToolSpec(spec: OpenAIHelper.DebugToolSpec) {
+        debugToolNameEditText.setText(spec.name)
+        debugToolArgumentsEditText.setText(spec.argumentTemplate)
+        debugToolStatusTextView.text = "${spec.name} (${spec.internalName})\n${spec.description}"
+    }
+
+    private fun runDebugToolCall() {
+        val toolName = debugToolNameEditText.text.toString().trim()
+        if (toolName.isBlank()) {
+            Toast.makeText(this, "Bitte einen Toolnamen eingeben", Toast.LENGTH_SHORT).show()
+            return
+        }
+
+        val argumentsJson = debugToolArgumentsEditText.text.toString()
+        val instruction = debugToolInstructionEditText.text.toString()
+        debugRunToolButton.isEnabled = false
+        debugToolStatusTextView.text = "Führe $toolName lokal aus…"
+        appendDebugOutput("[${debugTimestamp()}] START $toolName\nArgs:\n$argumentsJson")
+
+        Thread {
+            val result = openAIHelper.executeDebugTool(
+                toolName = toolName,
+                argumentsJson = argumentsJson,
+                instruction = instruction
+            )
+            runOnUiThread {
+                debugRunToolButton.isEnabled = true
+                debugToolStatusTextView.text = if (result.error == null) {
+                    "Fertig: ${result.exposedName} (${result.durationMillis} ms)"
+                } else {
+                    "Fehler: ${result.error}"
+                }
+                appendDebugOutput(formatDebugToolResult(result))
+            }
+        }.start()
+    }
+
+    private fun formatDebugToolResult(result: OpenAIHelper.DebugToolResult): String {
+        val status = if (result.error == null) "OK" else "ERROR"
+        val arguments = if (result.arguments.isEmpty()) {
+            "{}"
+        } else {
+            result.arguments.entries.joinToString("\n") { (key, value) -> "$key = $value" }
+        }
+        return buildString {
+            append("[${debugTimestamp()}] $status ${result.exposedName} (${result.internalName})")
+            append(" in ${result.durationMillis} ms\n")
+            append("Requested: ${result.requestedName}\n")
+            append("Decoded args:\n$arguments\n")
+            append("Result:\n${result.result}\n")
+        }
+    }
+
+    private fun appendDebugOutput(entry: String) {
+        if (debugOutput.isNotEmpty()) {
+            debugOutput.append("\n\n")
+        }
+        debugOutput.append(entry.trim())
+        if (debugOutput.length > MAX_DEBUG_OUTPUT_CHARS) {
+            debugOutput.delete(0, debugOutput.length - MAX_DEBUG_OUTPUT_CHARS)
+        }
+        debugToolOutputTextView.text = debugOutput.toString()
+    }
+
+    private fun debugTimestamp(): String =
+        DateFormat.getTimeInstance(DateFormat.MEDIUM, Locale.GERMANY).format(Date())
 
     private fun refreshConversationList() {
         val summaries = openAIHelper.listPersistentConversations()

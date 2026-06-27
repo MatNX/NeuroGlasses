@@ -5,6 +5,7 @@ import android.Manifest
 import android.app.Activity
 import android.app.ActivityOptions
 import android.app.AlarmManager
+import android.content.ContentUris
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -43,10 +44,16 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 import java.text.DateFormat
+import java.text.Normalizer
+import java.util.Calendar
 import java.util.Date
 import java.util.Locale
 import java.util.UUID
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Data classes for OpenAI API request/response
@@ -174,14 +181,54 @@ data class PersistentConversationSummary(
     val isActive: Boolean
 )
 
+data class SemanticMemoryRecord(
+    val id: String,
+    val content: String,
+    val category: String,
+    val tags: List<String> = emptyList(),
+    val importance: Int = 3,
+    val createdAt: Long,
+    val updatedAt: Long
+)
+
+data class SavedPlaceRecord(
+    val id: String,
+    val name: String,
+    val description: String = "",
+    val address: String = "",
+    val latitude: Double,
+    val longitude: Double,
+    val createdAt: Long,
+    val updatedAt: Long
+)
+
 /**
  * Groq AI Helper
  * Handles AI-related API calls including ASR (speech-to-text) and OpenAI chat completion
  */
 class OpenAIHelper(private val context: Context, private val appTag: String = "OpenAIHelper") {
 
+    data class DebugToolSpec(
+        val name: String,
+        val internalName: String,
+        val description: String,
+        val argumentTemplate: String
+    )
+
+    data class DebugToolResult(
+        val requestedName: String,
+        val exposedName: String,
+        val internalName: String,
+        val arguments: Map<String, String>,
+        val result: String,
+        val durationMillis: Long,
+        val error: String? = null
+    )
+
     private val gson = Gson()
     private val chatPrefs by lazy { context.getSharedPreferences("assistant_chats", Context.MODE_PRIVATE) }
+    private val memoryPrefs by lazy { context.getSharedPreferences("assistant_semantic_memory", Context.MODE_PRIVATE) }
+    private val placePrefs by lazy { context.getSharedPreferences("assistant_saved_places", Context.MODE_PRIVATE) }
     private val navigationDestinationResolver by lazy { NavigationDestinationResolver(context, appTag) }
     @Volatile private var activeAsrCall: Call? = null
 
@@ -205,8 +252,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val PREF_ACTIVE_CHAT_EXPLICIT = "active_chat_explicit"
         private const val WEB_SEARCH_MAX_OUTPUT_CHARS = 5000
         private const val WEB_SEARCH_RESULT_LIMIT = 5
+        private const val MEMORY_CONTEXT_LIMIT = 5
+        private const val MEMORY_TOOL_RESULT_LIMIT = 8
+        private const val SAVED_PLACE_RESULT_LIMIT = 8
+        private const val NEARBY_RESULT_LIMIT = 6
+        private const val TRANSIT_RESULT_LIMIT = 8
+        private const val OEBB_API_BASE_URL = "https://v6.oebb.transport.rest"
+        private const val OEBB_SCOTTY_BASE_URL = "https://fahrplan.oebb.at"
+        private const val OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
         private const val WEB_SEARCH_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) NeuroGlasses/1.0 Mobile Safari/537.36"
+        private val SEMANTIC_STOP_WORDS = setOf(
+            "der", "die", "das", "und", "oder", "aber", "ich", "du", "wir", "mir", "mich",
+            "mein", "meine", "dein", "eine", "einen", "einem", "ist", "sind", "war", "mit",
+            "for", "the", "and", "or", "but", "this", "that", "what", "where", "when", "how",
+            "about", "into", "from", "have", "has", "had", "please", "bitte"
+        )
     }
 
     private data class ContactPhone(
@@ -247,6 +308,31 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val title: String,
         val url: String,
         val snippet: String
+    )
+
+    private data class NearbyPlace(
+        val name: String,
+        val category: String,
+        val latitude: Double,
+        val longitude: Double,
+        val distanceMeters: Float,
+        val detail: String
+    )
+
+    private data class TransitStop(
+        val id: String,
+        val name: String,
+        val distanceMeters: Double? = null
+    )
+
+    private data class TransitStopLookup(
+        val stops: List<TransitStop> = emptyList(),
+        val error: String? = null
+    )
+
+    private data class TransitDeparturesLookup(
+        val departures: List<String> = emptyList(),
+        val error: String? = null
     )
 
     // Get configuration from SharedPreferences
@@ -447,45 +533,298 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             !chatId.isNullOrBlank() -> sessions.firstOrNull { it.id == chatId }
             !title.isNullOrBlank() -> sessions.firstOrNull { it.title.equals(title, ignoreCase = true) }
             else -> null
-        } ?: return "Chat not found. Use list_chats to see available chat ids and titles."
+        } ?: return "Chat nicht gefunden. Nutze chats_auflisten, um verfügbare Chat-IDs und Titel zu sehen."
         chatPrefs.edit()
             .putString(PREF_ACTIVE_CHAT_ID, session.id)
             .putBoolean(PREF_ACTIVE_CHAT_EXPLICIT, true)
             .apply()
-        return "Switched to chat '${session.title}' (${session.id})."
+        return "Zu Chat '${session.title}' (${session.id}) gewechselt."
     }
 
     private fun listChats(): String {
         val active = activeChatIdOrNull()
         val sessions = getChatSessions()
-        if (sessions.isEmpty()) return "No chats exist yet."
+        if (sessions.isEmpty()) return "Es gibt noch keine Chats."
         return sessions.joinToString("\n") { session ->
             val marker = if (session.id == active) "*" else "-"
-            "$marker ${session.title} [${session.id}] (${session.messages.size} messages)"
+            "$marker ${session.title} [${session.id}] (${session.messages.size} Nachrichten)"
         }
     }
 
     private fun renameChat(chatId: String?, title: String): String {
-        if (title.isBlank()) return "A new chat title is required."
+        if (title.isBlank()) return "Ein neuer Chattitel ist erforderlich."
         val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatIdOrNull()
-            ?: return "No persistent chat is active."
+            ?: return "Kein persistenter Chat ist aktiv."
         val updated = updateChatSession(targetId) { it.copy(title = title) }
-        return if (updated == null) "Chat not found." else "Renamed chat to '${updated.title}'."
+        return if (updated == null) "Chat nicht gefunden." else "Chat in '${updated.title}' umbenannt."
     }
 
     private fun leaveChat(): String {
         leavePersistentConversation()
-        return "Left persistent chat. The main conversation is ephemeral again."
+        return "Persistenten Chat verlassen. Die Hauptkonversation ist wieder flüchtig."
     }
 
     private fun deleteChat(chatId: String?): String {
         val targetId = chatId?.takeIf { it.isNotBlank() } ?: activeChatIdOrNull()
-            ?: return "No persistent chat is active."
+            ?: return "Kein persistenter Chat ist aktiv."
         return if (deletePersistentConversation(targetId)) {
-            "Deleted persistent chat."
+            "Persistenten Chat gelöscht."
         } else {
-            "Chat not found."
+            "Chat nicht gefunden."
         }
+    }
+
+    private fun getSemanticMemories(): MutableList<SemanticMemoryRecord> {
+        val json = memoryPrefs.getString("items", null) ?: return mutableListOf()
+        return runCatching {
+            gson.fromJson(json, Array<SemanticMemoryRecord>::class.java).toMutableList()
+        }.getOrElse {
+            Log.w(appTag, "Could not read semantic memories", it)
+            mutableListOf()
+        }
+    }
+
+    private fun saveSemanticMemories(memories: List<SemanticMemoryRecord>) {
+        memoryPrefs.edit().putString("items", gson.toJson(memories)).apply()
+    }
+
+    private fun rememberMemory(content: String, category: String, tagsRaw: String, importanceRaw: String): String {
+        val cleanContent = content.trim()
+        if (cleanContent.isBlank()) return "Der Erinnerungsinhalt darf nicht leer sein."
+
+        val now = System.currentTimeMillis()
+        val cleanCategory = category.trim().ifBlank { "general" }.take(40)
+        val tags = parseStringList(tagsRaw).take(12)
+        val importance = importanceRaw.toIntOrNull()?.coerceIn(1, 5) ?: 3
+        val memories = getSemanticMemories()
+
+        val existingIndex = memories.indexOfFirst { memory ->
+            semanticText(memory.content) == semanticText(cleanContent) ||
+                semanticOverlapScore(cleanContent, memory.content, memory.tags, memory.category) >= 18.0
+        }
+        val record = if (existingIndex >= 0) {
+            memories[existingIndex].copy(
+                content = cleanContent,
+                category = cleanCategory,
+                tags = tags.ifEmpty { memories[existingIndex].tags },
+                importance = maxOf(importance, memories[existingIndex].importance),
+                updatedAt = now
+            )
+        } else {
+            SemanticMemoryRecord(
+                id = shortId(),
+                content = cleanContent,
+                category = cleanCategory,
+                tags = tags,
+                importance = importance,
+                createdAt = now,
+                updatedAt = now
+            )
+        }
+
+        if (existingIndex >= 0) {
+            memories[existingIndex] = record
+        } else {
+            memories.add(0, record)
+        }
+        saveSemanticMemories(memories.sortedWith(compareByDescending<SemanticMemoryRecord> { it.importance }.thenByDescending { it.updatedAt }))
+        return "Erinnerung gespeichert [${record.id}]: ${record.content}"
+    }
+
+    private fun searchMemory(query: String, category: String, limitRaw: String): String {
+        val memories = rankedMemories(query, category, limitRaw.toIntOrNull() ?: MEMORY_TOOL_RESULT_LIMIT)
+        if (memories.isEmpty()) return "Keine passenden Erinnerungen gefunden."
+        return memories.joinToString("\n") { memory ->
+            "- [${memory.id}] ${memory.content}${memory.categoryLabel()}${memory.tagsLabel()}"
+        }
+    }
+
+    private fun listMemories(category: String, limitRaw: String): String {
+        val cleanCategory = category.trim()
+        val limit = (limitRaw.toIntOrNull() ?: MEMORY_TOOL_RESULT_LIMIT).coerceIn(1, 30)
+        val memories = getSemanticMemories()
+            .asSequence()
+            .filter { cleanCategory.isBlank() || it.category.equals(cleanCategory, ignoreCase = true) }
+            .sortedWith(compareByDescending<SemanticMemoryRecord> { it.importance }.thenByDescending { it.updatedAt })
+            .take(limit)
+            .toList()
+        if (memories.isEmpty()) return "Keine Erinnerungen gespeichert."
+        return memories.joinToString("\n") { memory ->
+            "- [${memory.id}] ${memory.content}${memory.categoryLabel()}${memory.tagsLabel()}"
+        }
+    }
+
+    private fun forgetMemory(selection: String): String {
+        val cleanSelection = selection.trim()
+        if (cleanSelection.isBlank()) return "Sag mir, welche Erinnerungs-ID oder welches Thema ich vergessen soll."
+        val memories = getSemanticMemories()
+        val index = memories.indexOfFirst { it.id.equals(cleanSelection, ignoreCase = true) }
+            .takeIf { it >= 0 }
+            ?: memories.withIndex()
+                .maxByOrNull { (_, memory) ->
+                    semanticOverlapScore(cleanSelection, memory.content, memory.tags, memory.category)
+                }
+                ?.takeIf { (_, memory) ->
+                    semanticOverlapScore(cleanSelection, memory.content, memory.tags, memory.category) >= 3.0
+                }
+                ?.index
+            ?: return "Keine passende Erinnerung gefunden."
+
+        val removed = memories.removeAt(index)
+        saveSemanticMemories(memories)
+        return "Erinnerung vergessen [${removed.id}]: ${removed.content}"
+    }
+
+    private fun semanticMemoryContext(instruction: String): String {
+        val relevant = rankedMemories(instruction, "", MEMORY_CONTEXT_LIMIT)
+            .filter { semanticOverlapScore(instruction, it.content, it.tags, it.category) >= 2.0 || it.importance >= 5 }
+        if (relevant.isEmpty()) return ""
+        return relevant.joinToString(
+            prefix = "Relevante gespeicherte Erinnerungen:\n",
+            separator = "\n"
+        ) { memory ->
+            "- ${memory.content}${memory.categoryLabel()}${memory.tagsLabel()}"
+        }
+    }
+
+    private fun rankedMemories(query: String, category: String, limit: Int): List<SemanticMemoryRecord> {
+        val cleanCategory = category.trim()
+        val boundedLimit = limit.coerceIn(1, 30)
+        val memories = getSemanticMemories()
+            .filter { cleanCategory.isBlank() || it.category.equals(cleanCategory, ignoreCase = true) }
+        if (query.isBlank()) {
+            return memories
+                .sortedWith(compareByDescending<SemanticMemoryRecord> { it.importance }.thenByDescending { it.updatedAt })
+                .take(boundedLimit)
+        }
+        return memories
+            .map { memory -> memory to semanticOverlapScore(query, memory.content, memory.tags, memory.category) }
+            .filter { (_, score) -> score > 0.0 }
+            .sortedWith(compareByDescending<Pair<SemanticMemoryRecord, Double>> { it.second }
+                .thenByDescending { it.first.importance }
+                .thenByDescending { it.first.updatedAt })
+            .take(boundedLimit)
+            .map { it.first }
+    }
+
+    private fun SemanticMemoryRecord.categoryLabel(): String =
+        category.takeIf { it.isNotBlank() && it != "general" }?.let { " ($it)" }.orEmpty()
+
+    private fun SemanticMemoryRecord.tagsLabel(): String =
+        tags.takeIf { it.isNotEmpty() }?.joinToString(prefix = " #", separator = " #").orEmpty()
+
+    private fun getSavedPlaces(): MutableList<SavedPlaceRecord> {
+        val json = placePrefs.getString("items", null) ?: return mutableListOf()
+        return runCatching {
+            gson.fromJson(json, Array<SavedPlaceRecord>::class.java).toMutableList()
+        }.getOrElse {
+            Log.w(appTag, "Could not read saved places", it)
+            mutableListOf()
+        }
+    }
+
+    private fun saveSavedPlaces(places: List<SavedPlaceRecord>) {
+        placePrefs.edit().putString("items", gson.toJson(places)).apply()
+    }
+
+    private fun savePlace(
+        name: String,
+        description: String,
+        address: String,
+        latitudeRaw: String,
+        longitudeRaw: String
+    ): String {
+        val cleanName = name.trim()
+        if (cleanName.isBlank()) return "Ein Ortsname ist erforderlich."
+
+        val coordinates = explicitCoordinates(latitudeRaw, longitudeRaw)
+            ?: resolvedPlaceCoordinates(address)
+            ?: readLastKnownLocation()?.let { LocationCoordinates(it.latitude, it.longitude, it.accuracyMeters) }
+            ?: return "Ich brauche GPS-Berechtigung, Koordinaten oder eine auflösbare Adresse, bevor ich diesen Ort speichern kann."
+
+        val now = System.currentTimeMillis()
+        val places = getSavedPlaces()
+        val existingIndex = places.indexOfFirst { it.name.equals(cleanName, ignoreCase = true) }
+        val record = SavedPlaceRecord(
+            id = if (existingIndex >= 0) places[existingIndex].id else shortId(),
+            name = cleanName,
+            description = description.trim(),
+            address = address.trim(),
+            latitude = coordinates.latitude,
+            longitude = coordinates.longitude,
+            createdAt = if (existingIndex >= 0) places[existingIndex].createdAt else now,
+            updatedAt = now
+        )
+        if (existingIndex >= 0) {
+            places[existingIndex] = record
+        } else {
+            places.add(0, record)
+        }
+        saveSavedPlaces(places.sortedByDescending { it.updatedAt })
+        return "Ort gespeichert [${record.id}]: ${record.name} bei ${formatCoordinates(record.latitude, record.longitude)}."
+    }
+
+    private fun listSavedPlaces(query: String, limitRaw: String): String {
+        val limit = (limitRaw.toIntOrNull() ?: SAVED_PLACE_RESULT_LIMIT).coerceIn(1, 30)
+        val places = rankedSavedPlaces(query, limit)
+        if (places.isEmpty()) return "Keine gespeicherten Orte gefunden."
+        return places.joinToString("\n") { place ->
+            "- [${place.id}] ${place.name}: ${formatCoordinates(place.latitude, place.longitude)}${placeDetail(place)}"
+        }
+    }
+
+    private fun navigateSavedPlace(nameOrId: String, mode: String): String {
+        val place = findSavedPlace(nameOrId) ?: return "Gespeicherter Ort nicht gefunden."
+        return RokidConnectionService.startNavigation(
+            context = context,
+            destination = place.name,
+            mode = normalizeNavigationMode(mode),
+            latitude = place.latitude,
+            longitude = place.longitude
+        )
+    }
+
+    private fun forgetSavedPlace(nameOrId: String): String {
+        val clean = nameOrId.trim()
+        if (clean.isBlank()) return "Sag mir, welchen gespeicherten Ort ich vergessen soll."
+        val places = getSavedPlaces()
+        val index = places.indexOfFirst {
+            it.id.equals(clean, ignoreCase = true) || it.name.equals(clean, ignoreCase = true)
+        }.takeIf { it >= 0 }
+            ?: places.withIndex()
+                .maxByOrNull { (_, place) ->
+                    semanticOverlapScore(clean, "${place.name} ${place.description} ${place.address}", emptyList(), "place")
+                }
+                ?.takeIf { (_, place) ->
+                    semanticOverlapScore(clean, "${place.name} ${place.description} ${place.address}", emptyList(), "place") >= 3.0
+                }
+                ?.index
+            ?: return "Gespeicherter Ort nicht gefunden."
+
+        val removed = places.removeAt(index)
+        saveSavedPlaces(places)
+        return "Gespeicherten Ort gelöscht [${removed.id}]: ${removed.name}."
+    }
+
+    private fun findSavedPlace(nameOrId: String): SavedPlaceRecord? =
+        rankedSavedPlaces(nameOrId, 1).firstOrNull()
+
+    private fun rankedSavedPlaces(query: String, limit: Int): List<SavedPlaceRecord> {
+        val places = getSavedPlaces()
+        if (query.isBlank()) return places.sortedByDescending { it.updatedAt }.take(limit)
+        return places
+            .map { place ->
+                place to semanticOverlapScore(
+                    query,
+                    "${place.name} ${place.description} ${place.address}",
+                    emptyList(),
+                    "place"
+                )
+            }
+            .filter { (_, score) -> score > 0.0 }
+            .sortedWith(compareByDescending<Pair<SavedPlaceRecord, Double>> { it.second }.thenByDescending { it.first.updatedAt })
+            .take(limit)
+            .map { it.first }
     }
 
     /**
@@ -571,6 +910,92 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
      */
     fun setListener(listener: OpenAIListener) {
         this.listener = listener
+    }
+
+    fun availableDebugTools(): List<DebugToolSpec> =
+        assistantTools(allowGlassesPhotoTool = false, includeChatTools = true)
+            .map { tool ->
+                val internalName = internalToolName(tool.function.name)
+                DebugToolSpec(
+                    name = tool.function.name,
+                    internalName = internalName,
+                    description = tool.function.description,
+                    argumentTemplate = debugArgumentTemplate(tool.function.parameters)
+                )
+            }
+
+    fun executeDebugTool(
+        toolName: String,
+        argumentsJson: String,
+        instruction: String = ""
+    ): DebugToolResult {
+        val requestedName = toolName.trim()
+        val internalName = internalToolName(requestedName)
+        val exposedName = exposedToolName(internalName)
+        val startedAt = System.currentTimeMillis()
+        var decodedArguments = emptyMap<String, String>()
+
+        return try {
+            val normalizedArguments = normalizeDebugArguments(argumentsJson)
+            decodedArguments = decodeToolArguments(normalizedArguments)
+            val toolCall = ToolCall(
+                id = "debug-${System.currentTimeMillis()}",
+                type = "function",
+                function = ToolCallFunction(
+                    name = requestedName,
+                    arguments = normalizedArguments
+                )
+            )
+            val result = executeAssistantTool(
+                toolCall = toolCall,
+                instruction = instruction,
+                notifyListener = false
+            )
+            DebugToolResult(
+                requestedName = requestedName,
+                exposedName = exposedName,
+                internalName = internalName,
+                arguments = decodedArguments,
+                result = result,
+                durationMillis = System.currentTimeMillis() - startedAt
+            )
+        } catch (e: Exception) {
+            Log.e(appTag, "Debug tool call failed for $requestedName", e)
+            DebugToolResult(
+                requestedName = requestedName,
+                exposedName = exposedName,
+                internalName = internalName,
+                arguments = decodedArguments,
+                result = "Debug tool call failed: ${e.message}",
+                durationMillis = System.currentTimeMillis() - startedAt,
+                error = e.message
+            )
+        }
+    }
+
+    private fun normalizeDebugArguments(argumentsJson: String): String {
+        val cleanArguments = argumentsJson.trim().ifBlank { "{}" }
+        val decoded = gson.fromJson(cleanArguments, JsonElement::class.java)
+        require(decoded != null && decoded.isJsonObject) { "Arguments must be a JSON object." }
+        return decoded.asJsonObject.toString()
+    }
+
+    private fun debugArgumentTemplate(parameters: Map<String, Any>): String {
+        val properties = parameters["properties"] as? Map<*, *> ?: return "{}"
+        if (properties.isEmpty()) return "{}"
+
+        val template = JSONObject()
+        properties.forEach { (rawName, rawProperty) ->
+            val name = rawName as? String ?: return@forEach
+            val property = rawProperty as? Map<*, *>
+            template.put(name, debugArgumentDefault(property))
+        }
+        return template.toString(2)
+    }
+
+    private fun debugArgumentDefault(property: Map<*, *>?): String {
+        val enumValues = property?.get("enum") as? List<*>
+        return enumValues?.firstOrNull()?.toString().orEmpty()
     }
 
     private fun replaceActiveAsrCall(call: Call) {
@@ -708,6 +1133,98 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .build()
     }
 
+    private fun exposedToolName(internalName: String): String = when (internalName) {
+        "place_phone_call" -> "telefon_anrufen"
+        "send_sms" -> "sms_senden"
+        "find_contact_phone" -> "kontakt_telefon_suchen"
+        "stop_conversation" -> "konversation_beenden"
+        "open_rokid_native_app" -> "rokid_app_oeffnen"
+        "navigation" -> "navigation"
+        "start_navigation" -> "navigation_starten"
+        "confirm_navigation_destination" -> "navigationsziel_bestaetigen"
+        "stop_navigation" -> "navigation_stoppen"
+        "open_rokid_translator" -> "rokid_uebersetzer_oeffnen"
+        "get_gps_location" -> "standort_abrufen"
+        "get_weather" -> "wetter_abrufen"
+        "web_search" -> "web_suche"
+        "set_timer" -> "timer_stellen"
+        "create_reminder" -> "erinnerung_erstellen"
+        "list_reminders" -> "erinnerungen_auflisten"
+        "create_calendar_event" -> "kalendertermin_erstellen"
+        "open_app" -> "app_oeffnen"
+        "share_text" -> "text_teilen"
+        "get_battery_status" -> "akku_status"
+        "memory" -> "gedaechtnis"
+        "remember_memory" -> "merken"
+        "search_memory" -> "gedaechtnis_suchen"
+        "list_memories" -> "gedaechtnis_auflisten"
+        "forget_memory" -> "vergessen"
+        "saved_place" -> "orte"
+        "save_place" -> "ort_speichern"
+        "list_saved_places" -> "orte_auflisten"
+        "navigate_saved_place" -> "zu_gespeichertem_ort_navigieren"
+        "forget_saved_place" -> "ort_vergessen"
+        "get_agenda" -> "agenda_abrufen"
+        "find_nearby_places" -> "nahe_orte_finden"
+        "get_transit_departures" -> "abfahrten_abrufen"
+        "open_accessibility_settings" -> "bedienungshilfen_oeffnen"
+        "snap_glasses_photo" -> "brillenfoto_aufnehmen"
+        "chat" -> "chat"
+        "new_chat" -> "chat_neu"
+        "list_chats" -> "chats_auflisten"
+        "switch_chat" -> "chat_wechseln"
+        "rename_chat" -> "chat_umbenennen"
+        "leave_chat" -> "chat_verlassen"
+        "delete_chat" -> "chat_loeschen"
+        else -> internalName
+    }
+
+    private fun internalToolName(toolName: String): String = when (toolName) {
+        "telefon_anrufen" -> "place_phone_call"
+        "sms_senden" -> "send_sms"
+        "kontakt_telefon_suchen" -> "find_contact_phone"
+        "konversation_beenden" -> "stop_conversation"
+        "rokid_app_oeffnen" -> "open_rokid_native_app"
+        "navigation" -> "navigation"
+        "navigation_starten" -> "start_navigation"
+        "navigationsziel_bestaetigen" -> "confirm_navigation_destination"
+        "navigation_stoppen" -> "stop_navigation"
+        "rokid_uebersetzer_oeffnen" -> "open_rokid_translator"
+        "standort_abrufen" -> "get_gps_location"
+        "wetter_abrufen" -> "get_weather"
+        "web_suche" -> "web_search"
+        "timer_stellen" -> "set_timer"
+        "erinnerung_erstellen" -> "create_reminder"
+        "erinnerungen_auflisten" -> "list_reminders"
+        "kalendertermin_erstellen" -> "create_calendar_event"
+        "app_oeffnen" -> "open_app"
+        "text_teilen" -> "share_text"
+        "akku_status" -> "get_battery_status"
+        "gedaechtnis", "memory" -> "memory"
+        "merken" -> "remember_memory"
+        "gedaechtnis_suchen" -> "search_memory"
+        "gedaechtnis_auflisten" -> "list_memories"
+        "vergessen" -> "forget_memory"
+        "orte", "saved_places", "places" -> "saved_place"
+        "ort_speichern" -> "save_place"
+        "orte_auflisten" -> "list_saved_places"
+        "zu_gespeichertem_ort_navigieren" -> "navigate_saved_place"
+        "ort_vergessen" -> "forget_saved_place"
+        "agenda_abrufen" -> "get_agenda"
+        "nahe_orte_finden" -> "find_nearby_places"
+        "abfahrten_abrufen" -> "get_transit_departures"
+        "bedienungshilfen_oeffnen" -> "open_accessibility_settings"
+        "brillenfoto_aufnehmen" -> "snap_glasses_photo"
+        "chat" -> "chat"
+        "chat_neu" -> "new_chat"
+        "chats_auflisten" -> "list_chats"
+        "chat_wechseln" -> "switch_chat"
+        "chat_umbenennen" -> "rename_chat"
+        "chat_verlassen" -> "leave_chat"
+        "chat_loeschen" -> "delete_chat"
+        else -> toolName
+    }
+
 
     private fun assistantTools(
         allowGlassesPhotoTool: Boolean,
@@ -725,129 +1242,110 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         val tools = listOf(
             AssistantTool(function = ToolFunction(
-                name = "place_phone_call",
-                description = "Hands-free: place a phone call. A contact name is enough; do not ask for a phone number when the user supplied a name. The app resolves contact names and falls back to the dialer if CALL_PHONE permission is missing.",
-                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Phone number or contact name; names are valid recipients.")))
+                name = exposedToolName("place_phone_call"),
+                description = "Freihändig telefonieren. Ein Kontaktname reicht; frage nicht nach der Telefonnummer, wenn der Nutzer einen Namen gesagt hat. Die App löst Kontakte auf und fällt bei fehlender CALL_PHONE-Berechtigung auf den Dialer zurück.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Telefonnummer oder Kontaktname; Namen sind gültige Empfänger.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "send_sms",
-                description = "Hands-free: send an SMS. A contact name is enough; do not ask for a phone number when the user supplied a name. The app resolves contact names and falls back to the SMS composer if direct sending is unavailable.",
+                name = exposedToolName("send_sms"),
+                description = "Freihändig eine SMS senden. Ein Kontaktname reicht; frage nicht nach der Telefonnummer, wenn der Nutzer einen Namen gesagt hat. Die App löst Kontakte auf und öffnet bei Bedarf den SMS-Composer.",
                 parameters = objectSchema(listOf("recipient", "message"), mapOf(
-                    "recipient" to stringProp("Phone number or contact name; names are valid recipients."),
-                    "message" to stringProp("Message body to send.")
+                    "recipient" to stringProp("Telefonnummer oder Kontaktname; Namen sind gültige Empfänger."),
+                    "message" to stringProp("Zu sendender Nachrichtentext.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "find_contact_phone",
-                description = "Look up a contact name in the phone contacts and return the best matching phone number before calling or texting.",
-                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Contact name to look up.")))
+                name = exposedToolName("find_contact_phone"),
+                description = "Kontakt im Telefonbuch suchen und die beste passende Telefonnummer zurückgeben.",
+                parameters = objectSchema(listOf("recipient"), mapOf("recipient" to stringProp("Kontaktname, nach dem gesucht werden soll.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "stop_conversation",
-                description = "Close the active NeuroGlasses conversation when the user clearly wants to stop, cancel, say goodbye, or end the session. Do not use this for ordinary conversation.",
+                name = exposedToolName("stop_conversation"),
+                description = "Aktive NeuroGlasses-Konversation schließen, wenn der Nutzer klar stoppen, abbrechen, sich verabschieden oder die Sitzung beenden will. Nicht für normale Unterhaltung verwenden.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "open_rokid_native_app",
-                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. Use camera only when the user explicitly wants the native camera app opened; for a quick photo/visual context use snap_glasses_photo. For navigation with a destination, use start_navigation so NeuroGlasses can resolve and confirm the address first.",
+                name = exposedToolName("open_rokid_native_app"),
+                description = "Native Rokid-App auf der Brille über Hi Rokid CXR-L öffnen. Für Rokid-Übersetzung, Galerie, Einstellungen, Helligkeit, Lautstärke, Teleprompter, Recorder oder andere Brillen-Apps verwenden. Musikplayer sind nicht unterstützt. Kamera nur öffnen, wenn der Nutzer ausdrücklich die native Kamera-App will; für schnelle Sichtfragen brillenfoto_aufnehmen nutzen. Für Navigation mit Ziel navigation_starten verwenden.",
                 parameters = objectSchema(listOf("app"), mapOf(
                     "app" to mapOf(
                         "type" to "string",
-                        "description" to "Native glasses app to open.",
+                        "description" to "Zu öffnende native Brillen-App.",
                         "enum" to listOf(
-                            "translator",
+                            "uebersetzer",
                             "navigation",
-                            "camera",
-                            "gallery",
-                            "settings",
-                            "bluetooth_settings",
-                            "system_info",
-                            "brightness",
-                            "volume",
+                            "kamera",
+                            "galerie",
+                            "einstellungen",
+                            "bluetooth_einstellungen",
+                            "systeminfo",
+                            "helligkeit",
+                            "lautstaerke",
                             "teleprompter",
-                            "music",
-                            "recorder",
+                            "aufnahme",
                             "browser",
-                            "launcher",
-                            "manager"
+                            "start"
                         )
                     )
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "start_navigation",
-                description = "Resolve an Austrian destination before starting NeuroGlasses background navigation. Use this for navigation, maps, routes, or directions. The resolver usually picks the best match directly and only asks for confirmation when results are weak or genuinely ambiguous. Default mode is public_transit; use foot only when the user explicitly asks to walk or go by foot.",
-                parameters = objectSchema(listOf("destination"), mapOf(
-                    "destination" to stringProp("Best transcript of the destination/address, preserving all heard German street/place words, house numbers, postcodes, and city names."),
+                name = exposedToolName("navigation"),
+                description = "Navigation starten, Kandidat bestätigen oder Navigation stoppen. Eine laufende Zielauswahl wird mit action=confirm bestätigt.",
+                parameters = objectSchema(listOf("action"), mapOf(
+                    "action" to mapOf(
+                        "type" to "string",
+                        "description" to "Navigationsaktion.",
+                        "enum" to listOf("start", "confirm", "stop")
+                    ),
+                    "target" to stringProp("Zieladresse, Ortsname oder korrigiertes Ziel bei action=start/confirm."),
+                    "selection" to stringProp("Auswahl wie 1, erste, zweite oder Kandidatenname bei action=confirm."),
                     "mode" to mapOf(
                         "type" to "string",
-                        "description" to "Route preference. Default public_transit; use foot for explicit walking/by-foot requests.",
-                        "enum" to listOf("public_transit", "foot")
+                        "description" to "Routenmodus. Standard oeffi; zu_fuss nur bei ausdrücklichem Gehen/Fußweg.",
+                        "enum" to listOf("oeffi", "zu_fuss")
                     )
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "confirm_navigation_destination",
-                description = "Confirm or refine a pending navigation destination after start_navigation returned candidate options. Use this when the user says 'eins', 'die zweite', 'ja die erste', a candidate name, or gives a corrected address. If corrected, pass the corrected text as destination.",
-                parameters = objectSchema(listOf("selection"), mapOf(
-                    "selection" to stringProp("The user's choice such as '1', 'eins', 'zweite', a candidate name, 'nein', or the corrected spoken text."),
-                    "destination" to stringProp("Optional corrected full destination/address if the user did not choose one of the numbered options."),
-                    "mode" to mapOf(
-                        "type" to "string",
-                        "description" to "Optional route preference to keep or override.",
-                        "enum" to listOf("public_transit", "foot")
-                    )
-                ))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "stop_navigation",
-                description = "Stop the active NeuroGlasses background navigation session when the user asks to end, cancel, or stop navigation.",
+                name = exposedToolName("get_gps_location"),
+                description = "Letzten bekannten GPS-/Netzwerkstandort des Telefons lesen und Koordinaten für freihändige Nutzung zurückgeben.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "open_rokid_translator",
-                description = "Open the native Rokid/glasses-side real-time translator or translation app through Hi Rokid CXR-L. Use this for translate/übersetzen requests, not Google Translate on the phone.",
-                parameters = objectSchema(emptyList(), emptyMap())
+                name = exposedToolName("get_weather"),
+                description = "Kurzen Wetterbericht für aktuellen GPS-Standort oder genannten Ort abrufen, ohne Browser zu öffnen.",
+                parameters = objectSchema(emptyList(), mapOf("location" to stringProp("Optionale Stadt/Ort; leer lassen für aktuellen GPS-Standort.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "get_gps_location",
-                description = "Read the phone's last known GPS/network location and return coordinates for the assistant to use hands-free.",
-                parameters = objectSchema(emptyList(), emptyMap())
+                name = exposedToolName("web_search"),
+                description = "Websuchergebnisse und Ausschnitte für aktuelle Fragen abrufen, damit der Assistent freihändig antworten kann. Öffnet keinen Browser.",
+                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Suchanfrage.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "get_weather",
-                description = "Fetch a concise weather report for the current GPS location or a named place without opening a browser.",
-                parameters = objectSchema(emptyList(), mapOf("location" to stringProp("Optional city/place; omit for current GPS location.")))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "web_search",
-                description = "Fetch web search results and snippets for current/web questions so the assistant can answer hands-free. Never opens the phone browser.",
-                parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "set_timer",
-                description = "Create a hands-free Android timer. Convert the user's requested duration yourself and pass a positive seconds value as decimal digits.",
+                name = exposedToolName("set_timer"),
+                description = "Freihändig Android-Timer erstellen. Dauer selbst in Sekunden umrechnen und als positive Dezimalzahl übergeben.",
                 parameters = objectSchema(listOf("seconds"), mapOf(
-                    "seconds" to numericStringProp("Timer duration in seconds, as decimal digits. Must be greater than zero."),
-                    "label" to stringProp("Optional timer label.")
+                    "seconds" to numericStringProp("Timerdauer in Sekunden als Dezimalziffern; muss größer als null sein."),
+                    "label" to stringProp("Optionale Timer-Bezeichnung.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "create_reminder",
-                description = "Create a reminder. If the user gives a due time, calculate the exact local epoch milliseconds yourself and pass due_at_epoch_millis as decimal digits; the app will not interpret natural time text.",
+                name = exposedToolName("create_reminder"),
+                description = "Erinnerung erstellen. Wenn der Nutzer eine Fälligkeit nennt, exakte lokale epoch milliseconds selbst berechnen und als due_at_epoch_millis übergeben; die App interpretiert keinen natürlichen Zeittext.",
                 parameters = objectSchema(listOf("text"), mapOf(
-                    "text" to stringProp("Reminder text."),
-                    "when" to stringProp("Optional human-readable due time for display only."),
-                    "due_at_epoch_millis" to numericStringProp("Optional exact local due time as Unix epoch milliseconds, as decimal digits.")
+                    "text" to stringProp("Erinnerungstext."),
+                    "when" to stringProp("Optionale lesbare Fälligkeitszeit nur zur Anzeige."),
+                    "due_at_epoch_millis" to numericStringProp("Optionale exakte lokale Fälligkeit als Unix epoch milliseconds, als Dezimalziffern.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "list_reminders",
-                description = "Read reminders previously stored by the assistant.",
+                name = exposedToolName("list_reminders"),
+                description = "Vom Assistenten gespeicherte Erinnerungen auflisten.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "create_calendar_event",
+                name = exposedToolName("create_calendar_event"),
                 description = "Deutschsprachig: Lege einen Kalendertermin per Sprache an. Berechne Start/Ende selbst und uebergib epoch milliseconds als Dezimalziffern, wenn der Nutzer Zeiten nennt.",
                 parameters = objectSchema(listOf("title"), mapOf(
                     "title" to stringProp("Titel des Termins."),
@@ -860,91 +1358,313 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 ))
             )),
             AssistantTool(function = ToolFunction(
-                name = "open_app",
+                name = exposedToolName("open_app"),
                 description = "Deutschsprachig: Öffne eine installierte App anhand von Paketname oder bekanntem App-Namen.",
                 parameters = objectSchema(listOf("app"), mapOf("app" to stringProp("Paketname oder App-Name, z. B. Maps, WhatsApp, Kalender.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "share_text",
+                name = exposedToolName("share_text"),
                 description = "Deutschsprachig: Teile oder diktiere Text über den Android-Teilen-Dialog.",
                 parameters = objectSchema(listOf("text"), mapOf("text" to stringProp("Zu teilender Text.")))
             )),
             AssistantTool(function = ToolFunction(
-                name = "get_battery_status",
+                name = exposedToolName("get_battery_status"),
                 description = "Deutschsprachig: Lies den Akkustand und Ladezustand des Telefons aus.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "open_accessibility_settings",
+                name = exposedToolName("memory"),
+                description = "Dauerhaftes Gedächtnis verwalten: stabile Fakten speichern, durchsuchen, auflisten oder löschen.",
+                parameters = objectSchema(listOf("action"), mapOf(
+                    "action" to mapOf(
+                        "type" to "string",
+                        "description" to "Gedächtnisaktion.",
+                        "enum" to listOf("save", "search", "list", "delete")
+                    ),
+                    "content" to stringProp("Eigenständiger Erinnerungssatz bei action=save."),
+                    "query" to stringProp("Suchfrage, Thema, ID oder Löschziel bei search/delete."),
+                    "category" to stringProp("Optionale Kategorie, z. B. vorliebe, identitaet, routine, projekt, barrierefreiheit, reise oder allgemein."),
+                    "tags" to stringProp("Optionale kommagetrennte Schlagwörter."),
+                    "importance" to numericStringProp("Optionale Wichtigkeit 1-5; 5 bedeutet fast immer relevant."),
+                    "limit" to numericStringProp("Optionale maximale Trefferzahl.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = exposedToolName("saved_place"),
+                description = "Gespeicherte Orte verwalten: speichern, suchen/listen, dorthin navigieren oder löschen.",
+                parameters = objectSchema(listOf("action"), mapOf(
+                    "action" to mapOf(
+                        "type" to "string",
+                        "description" to "Ortsaktion.",
+                        "enum" to listOf("save", "list", "navigate", "delete")
+                    ),
+                    "name" to stringProp("Ortsname, ID oder Lösch-/Navigationsziel."),
+                    "query" to stringProp("Suchtext für action=list oder Alternative zu name."),
+                    "description" to stringProp("Optionale Beschreibung oder Merkhilfe."),
+                    "address" to stringProp("Optionale Adresse oder Ortsangabe zum Auflösen."),
+                    "latitude" to numericStringProp("Optionaler Breitengrad als Dezimalzahl."),
+                    "longitude" to numericStringProp("Optionaler Längengrad als Dezimalzahl."),
+                    "mode" to mapOf(
+                        "type" to "string",
+                        "description" to "Routenmodus. Standard oeffi; zu_fuss nur bei ausdrücklichem Gehen/Fußweg.",
+                        "enum" to listOf("oeffi", "zu_fuss")
+                    ),
+                    "limit" to numericStringProp("Optionale maximale Trefferzahl.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = exposedToolName("get_agenda"),
+                description = "Bevorstehende Kalendertermine vom Telefon lesen. Für Agenda, Tagesplan, Kalenderabfrage, nächsten Termin, heute, morgen oder diese Woche verwenden. Benötigt READ_CALENDAR.",
+                parameters = objectSchema(emptyList(), mapOf(
+                    "range" to mapOf(
+                        "type" to "string",
+                        "description" to "Zeitraum, wenn keine exakten Millisekunden übergeben werden.",
+                        "enum" to listOf("heute", "morgen", "naechste_24_stunden", "woche")
+                    ),
+                    "start_epoch_millis" to numericStringProp("Optionaler exakter Start des Zeitraums als Unix epoch milliseconds."),
+                    "end_epoch_millis" to numericStringProp("Optionales exaktes Ende des Zeitraums als Unix epoch milliseconds."),
+                    "query" to stringProp("Optionaler Textfilter für Titel oder Ort.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = exposedToolName("find_nearby_places"),
+                description = "Nahe reale Orte über aktuellen GPS-Standort und OpenStreetMap finden, z. B. Apotheke, WC, Bankomat, Supermarkt, Haltestelle, Restaurant, Café, Krankenhaus, Trinkwasser, Parkplatz, Hotel oder freier Suchtext.",
+                parameters = objectSchema(listOf("category"), mapOf(
+                    "category" to stringProp("Ortskategorie oder Suchtext."),
+                    "radius_meters" to numericStringProp("Optionaler Radius in Metern, Standard 1000."),
+                    "limit" to numericStringProp("Optionale maximale Trefferzahl.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = exposedToolName("get_transit_departures"),
+                description = "Nahe österreichische Öffi-Haltestellen oder eine genannte Haltestelle finden und kommende OEBB/HAFAS-Abfahrten lesen. Für Zug, Bim, Bus, U-Bahn, Abfahrtstafel oder nächste Abfahrten verwenden.",
+                parameters = objectSchema(emptyList(), mapOf(
+                    "stop" to stringProp("Optionaler Haltestellen-/Stationsname; leer lassen für nächste Haltestellen per GPS."),
+                    "radius_meters" to numericStringProp("Optionaler Suchradius in Metern, Standard 1200."),
+                    "limit" to numericStringProp("Optionale maximale Zahl an Abfahrten.")
+                ))
+            )),
+            AssistantTool(function = ToolFunction(
+                name = exposedToolName("open_accessibility_settings"),
                 description = "Deutschsprachig: Öffne Bedienungshilfen, falls der Nutzer Freisprech- oder Barrierefreiheitsrechte einrichten will.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "snap_glasses_photo",
-                description = "Capture a fresh Rokid glasses camera photo for the assistant without opening the native camera UI. Use this when the user asks to take a quick photo for context, asks what you see, or asks about the current view, scene, objects, people, hands, counts, colors, visible text, translation of visible text, or anything that needs eyesight. Do not answer visual questions from memory when no image is attached.",
+                name = exposedToolName("snap_glasses_photo"),
+                description = "Frisches Rokid-Brillenfoto für den Assistenten aufnehmen, ohne die native Kameraoberfläche zu öffnen. Für schnelle Sichtfragen nutzen: was zu sehen ist, aktuelle Szene, Objekte, Personen, Hände, Anzahl, Farben, sichtbarer Text, Übersetzung, QR-Codes, Barcodes, Produktlabels oder alles, was Sehen braucht. Sichtfragen nicht aus Erinnerung beantworten, wenn kein Bild angehängt ist.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "new_chat",
-                description = "Create and switch to a fresh persistent chat thread when the user asks for a new topic, new chat, or separate conversation.",
-                parameters = objectSchema(emptyList(), mapOf("title" to stringProp("Optional title for the new chat.")))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "list_chats",
-                description = "List persistent chat threads with ids, titles, and the active chat marker.",
-                parameters = objectSchema(emptyList(), emptyMap())
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "switch_chat",
-                description = "Switch the active persistent chat thread by id or exact title before answering.",
-                parameters = objectSchema(emptyList(), mapOf(
-                    "chat_id" to stringProp("Chat id returned by list_chats."),
-                    "title" to stringProp("Chat title to switch to if no id is known.")
-                ))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "rename_chat",
-                description = "Rename the active persistent chat or a specified chat.",
-                parameters = objectSchema(listOf("title"), mapOf(
-                    "title" to stringProp("New title."),
-                    "chat_id" to stringProp("Optional chat id; omit to rename active chat.")
-                ))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "leave_chat",
-                description = "Leave the active persistent chat and return to the ephemeral main conversation when the user asks to stop using saved chat history.",
-                parameters = objectSchema(emptyList(), emptyMap())
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "delete_chat",
-                description = "Delete a persistent chat only when the user explicitly asks to remove it.",
-                parameters = objectSchema(emptyList(), mapOf(
-                    "chat_id" to stringProp("Optional chat id; omit to delete the active persistent chat.")
+                name = exposedToolName("chat"),
+                description = "Persistente Chats verwalten: neu, auflisten, wechseln, umbenennen, verlassen oder löschen.",
+                parameters = objectSchema(listOf("action"), mapOf(
+                    "action" to mapOf(
+                        "type" to "string",
+                        "description" to "Chat-Aktion.",
+                        "enum" to listOf("new", "list", "switch", "rename", "leave", "delete")
+                    ),
+                    "title" to stringProp("Chat-Titel für new, switch oder rename."),
+                    "chat_id" to stringProp("Optionale Chat-ID für switch, rename oder delete.")
                 ))
             ))
         )
 
-        return tools.filter { tool ->
-            when (tool.function.name) {
-                "new_chat", "list_chats", "switch_chat", "rename_chat", "leave_chat", "delete_chat" -> includeChatTools
-                "snap_glasses_photo" -> allowGlassesPhotoTool
-                else -> true
+        return tools
+            .map(::compactAssistantTool)
+            .filter { tool ->
+                when (internalToolName(tool.function.name)) {
+                    "chat", "new_chat", "list_chats", "switch_chat", "rename_chat", "leave_chat", "delete_chat" -> includeChatTools
+                    "snap_glasses_photo" -> allowGlassesPhotoTool
+                    else -> true
+                }
             }
+    }
+
+    private fun compactAssistantTool(tool: AssistantTool): AssistantTool {
+        val internalName = internalToolName(tool.function.name)
+        return tool.copy(
+            function = tool.function.copy(
+                description = compactToolDescription(internalName, tool.function.description),
+                parameters = compactToolParameters(tool.function.parameters)
+            )
+        )
+    }
+
+    private fun compactToolDescription(internalName: String, fallback: String): String = when (internalName) {
+        "place_phone_call" -> "Anrufen; Kontaktname oder Telefonnummer genügt."
+        "send_sms" -> "SMS senden; Kontaktname/Nummer und Nachricht."
+        "find_contact_phone" -> "Telefonnummer eines Kontakts suchen."
+        "stop_conversation" -> "Konversation nur bei klarem Stopp, Abbruch oder Abschied beenden."
+        "open_rokid_native_app" -> "Native Rokid-App öffnen; nicht für Zielnavigation oder schnelle Sichtfragen."
+        "navigation" -> "Navigation starten, bestätigen oder stoppen."
+        "start_navigation" -> "Österreichisches Ziel auflösen und Navigation starten; Standardmodus oeffi."
+        "confirm_navigation_destination" -> "Offenes Navigationsziel per Nummer, Name oder korrigierter Adresse bestätigen."
+        "stop_navigation" -> "Aktive Hintergrundnavigation stoppen."
+        "open_rokid_translator" -> "Native Rokid-Echtzeitübersetzung öffnen."
+        "get_gps_location" -> "Letzten bekannten Telefonstandort abrufen."
+        "get_weather" -> "Wetter für aktuellen Standort oder genannten Ort abrufen."
+        "web_search" -> "Aktuelle Webinfos abrufen; keinen Browser öffnen."
+        "set_timer" -> "Android-Timer stellen; Dauer vorher in Sekunden umrechnen."
+        "create_reminder" -> "Erinnerung speichern; genannte Fälligkeit als epoch millis berechnen."
+        "list_reminders" -> "Gespeicherte Erinnerungen auflisten."
+        "create_calendar_event" -> "Kalendertermin erstellen; genannte Zeiten als epoch millis berechnen."
+        "open_app" -> "Installierte App per Paketname oder App-Name öffnen."
+        "share_text" -> "Text über den Android-Teilen-Dialog teilen."
+        "get_battery_status" -> "Akkustand und Ladezustand abrufen."
+        "memory" -> "Dauerhaftes Gedächtnis speichern, suchen, listen oder löschen."
+        "remember_memory" -> "Stabile Nutzerfakten, Vorlieben oder Kontext speichern."
+        "search_memory" -> "Gespeichertes semantisches Gedächtnis durchsuchen."
+        "list_memories" -> "Gespeicherte Erinnerungen optional gefiltert auflisten."
+        "forget_memory" -> "Gespeicherte Erinnerung nur auf ausdrücklichen Wunsch löschen."
+        "saved_place" -> "Gespeicherte Orte speichern, suchen, navigieren oder löschen."
+        "save_place" -> "Benannten Ort dauerhaft speichern; GPS oder Adresse nutzen."
+        "list_saved_places" -> "Gespeicherte Orte optional gefiltert auflisten."
+        "navigate_saved_place" -> "Navigation zu gespeichertem Ort per ID oder Name starten."
+        "forget_saved_place" -> "Gespeicherten Ort nur auf ausdrücklichen Wunsch löschen."
+        "get_agenda" -> "Bevorstehende Kalendertermine lesen."
+        "find_nearby_places" -> "Nahe reale Orte per GPS und OpenStreetMap finden."
+        "get_transit_departures" -> "Nahe oder genannte Öffi-Haltestelle finden und Abfahrten lesen."
+        "open_accessibility_settings" -> "Android-Bedienungshilfen öffnen."
+        "snap_glasses_photo" -> "Frisches Brillenfoto für Sichtfragen aufnehmen."
+        "chat" -> "Persistente Chats verwalten."
+        "new_chat" -> "Neuen persistenten Chat erstellen und aktivieren."
+        "list_chats" -> "Persistente Chats mit IDs und aktivem Chat auflisten."
+        "switch_chat" -> "Zu persistentem Chat per ID oder Titel wechseln."
+        "rename_chat" -> "Aktiven oder angegebenen Chat umbenennen."
+        "leave_chat" -> "Persistenten Chat verlassen und flüchtig weiterreden."
+        "delete_chat" -> "Persistenten Chat nur auf ausdrücklichen Wunsch löschen."
+        else -> fallback.collapseWhitespace().take(160)
+    }
+
+    private fun compactToolParameters(parameters: Map<String, Any>): Map<String, Any> {
+        val rawProperties = parameters["properties"] as? Map<*, *> ?: return parameters
+        if (rawProperties.isEmpty()) return parameters
+
+        val compactProperties = rawProperties.mapNotNull { (rawName, rawProperty) ->
+            val name = rawName as? String ?: return@mapNotNull null
+            val property = rawProperty as? Map<*, *> ?: return@mapNotNull null
+            name to compactToolProperty(property)
+        }.toMap()
+
+        return parameters.toMutableMap().apply {
+            this["properties"] = compactProperties
         }
     }
 
-    private fun executeAssistantTool(toolCall: ToolCall, instruction: String): String {
+    private fun compactToolProperty(property: Map<*, *>): Map<String, Any> {
+        val compact = mutableMapOf<String, Any>()
+        (property["type"] as? String)?.let { compact["type"] = it }
+        property["enum"]?.let { compact["enum"] = it }
+        return compact
+    }
+
+    private fun Map<String, String>.firstArg(vararg names: String): String =
+        names.firstNotNullOfOrNull { name -> this[name]?.trim()?.takeIf { it.isNotBlank() } }.orEmpty()
+
+    private fun normalizedToolAction(action: String): String =
+        action.trim().lowercase(Locale.ROOT)
+
+    private fun executeNavigationTool(args: Map<String, String>): String {
+        val action = normalizedToolAction(args.firstArg("action", "operation")).ifBlank {
+            if (args.firstArg("selection").isNotBlank()) "confirm" else "start"
+        }
+        val target = args.firstArg("target", "destination", "address")
+        val selection = args.firstArg("selection", "choice")
+        val mode = args.firstArg("mode")
+
+        return when (action) {
+            "stop", "cancel", "end" -> stopOsmNavigation()
+            "confirm", "choose", "select" -> confirmOsmNavigationDestination(
+                selection.ifBlank { target },
+                target,
+                mode
+            )
+            else -> startOsmNavigation(target, mode)
+        }
+    }
+
+    private fun executeMemoryTool(args: Map<String, String>): String {
+        val action = normalizedToolAction(args.firstArg("action", "operation")).ifBlank {
+            when {
+                args.firstArg("content").isNotBlank() -> "save"
+                args.firstArg("query", "selection", "id").isNotBlank() -> "search"
+                else -> "list"
+            }
+        }
+        val query = args.firstArg("query", "selection", "id", "content")
+
+        return when (action) {
+            "save", "remember", "add" -> rememberMemory(
+                args.firstArg("content"),
+                args.firstArg("category"),
+                args.firstArg("tags"),
+                args.firstArg("importance")
+            )
+            "delete", "remove", "forget" -> forgetMemory(query)
+            "search", "find" -> searchMemory(query, args.firstArg("category"), args.firstArg("limit"))
+            else -> listMemories(args.firstArg("category"), args.firstArg("limit"))
+        }
+    }
+
+    private fun executeSavedPlaceTool(args: Map<String, String>): String {
+        val action = normalizedToolAction(args.firstArg("action", "operation")).ifBlank {
+            when {
+                args.firstArg("address", "latitude", "longitude").isNotBlank() -> "save"
+                args.firstArg("name", "name_or_id", "id").isNotBlank() -> "navigate"
+                else -> "list"
+            }
+        }
+        val nameOrQuery = args.firstArg("name", "name_or_id", "id", "query")
+
+        return when (action) {
+            "save", "add" -> savePlace(
+                args.firstArg("name").ifBlank { nameOrQuery },
+                args.firstArg("description"),
+                args.firstArg("address"),
+                args.firstArg("latitude"),
+                args.firstArg("longitude")
+            )
+            "navigate", "go", "route" -> navigateSavedPlace(nameOrQuery, args.firstArg("mode"))
+            "delete", "remove", "forget" -> forgetSavedPlace(nameOrQuery)
+            else -> listSavedPlaces(args.firstArg("query").ifBlank { nameOrQuery }, args.firstArg("limit"))
+        }
+    }
+
+    private fun executeChatTool(args: Map<String, String>): String {
+        val action = normalizedToolAction(args.firstArg("action", "operation")).ifBlank { "list" }
+        return when (action) {
+            "new", "create", "start" -> {
+                val session = createChatSession(args.firstArg("title"))
+                "Neuen Chat '${session.title}' (${session.id}) erstellt und dorthin gewechselt."
+            }
+            "switch", "open", "select" -> switchChat(args.firstArg("chat_id", "id"), args.firstArg("title"))
+            "rename" -> renameChat(args.firstArg("chat_id", "id"), args.firstArg("title"))
+            "leave", "exit" -> leaveChat()
+            "delete", "remove" -> deleteChat(args.firstArg("chat_id", "id"))
+            else -> listChats()
+        }
+    }
+
+    private fun executeAssistantTool(
+        toolCall: ToolCall,
+        instruction: String,
+        notifyListener: Boolean = true
+    ): String {
         val args = decodeToolArguments(toolCall.function.arguments)
-        listener?.onAssistantToolCall(toolCall.function.name, args)?.let { return it }
+        val toolName = internalToolName(toolCall.function.name)
+        if (notifyListener) {
+            listener?.onAssistantToolCall(toolName, args)?.let { return it }
+        }
 
         fun arg(name: String): String = args[name].orEmpty()
 
-        return when (toolCall.function.name) {
+        return when (toolName) {
             "place_phone_call" -> placePhoneCall(arg("recipient"))
             "send_sms" -> sendSms(arg("recipient"), arg("message"))
             "find_contact_phone" -> findContactPhone(arg("recipient"))
-            "stop_conversation" -> "Conversation stopped."
+            "stop_conversation" -> "Konversation beendet."
             "open_rokid_native_app" -> openRokidNativeApp(arg("app"))
+            "navigation" -> executeNavigationTool(args)
             "start_navigation" -> startOsmNavigation(arg("destination"), arg("mode"))
             "confirm_navigation_destination" -> confirmOsmNavigationDestination(arg("selection"), arg("destination"), arg("mode"))
             "stop_navigation" -> stopOsmNavigation()
@@ -967,17 +1687,44 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "open_app" -> openApp(arg("app"))
             "share_text" -> shareText(arg("text"))
             "get_battery_status" -> getBatteryStatus()
+            "memory" -> executeMemoryTool(args)
+            "remember_memory" -> rememberMemory(arg("content"), arg("category"), arg("tags"), arg("importance"))
+            "search_memory" -> searchMemory(arg("query"), arg("category"), arg("limit"))
+            "list_memories" -> listMemories(arg("category"), arg("limit"))
+            "forget_memory" -> forgetMemory(arg("selection"))
+            "saved_place" -> executeSavedPlaceTool(args)
+            "save_place" -> savePlace(arg("name"), arg("description"), arg("address"), arg("latitude"), arg("longitude"))
+            "list_saved_places" -> listSavedPlaces(arg("query"), arg("limit"))
+            "navigate_saved_place" -> navigateSavedPlace(arg("name_or_id"), arg("mode"))
+            "forget_saved_place" -> forgetSavedPlace(arg("name_or_id"))
+            "get_agenda" -> getAgenda(
+                arg("range"),
+                arg("start_epoch_millis").toLongOrNull(),
+                arg("end_epoch_millis").toLongOrNull(),
+                arg("query")
+            )
+            "find_nearby_places" -> findNearbyPlaces(
+                arg("category"),
+                arg("radius_meters").toIntOrNull(),
+                arg("limit").toIntOrNull()
+            )
+            "get_transit_departures" -> getTransitDepartures(
+                arg("stop"),
+                arg("radius_meters").toIntOrNull(),
+                arg("limit").toIntOrNull()
+            )
             "open_accessibility_settings" -> launchIntent(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS), "Bedienungshilfen")
+            "chat" -> executeChatTool(args)
             "new_chat" -> {
                 val session = createChatSession(arg("title"))
-                "Created and switched to new chat '${session.title}' (${session.id})."
+                "Neuen Chat '${session.title}' (${session.id}) erstellt und dorthin gewechselt."
             }
             "list_chats" -> listChats()
             "switch_chat" -> switchChat(arg("chat_id"), arg("title"))
             "rename_chat" -> renameChat(arg("chat_id"), arg("title"))
             "leave_chat" -> leaveChat()
             "delete_chat" -> deleteChat(arg("chat_id"))
-            else -> "Unknown tool: ${toolCall.function.name}"
+            else -> "Unbekanntes Werkzeug: ${toolCall.function.name}"
         }
     }
 
@@ -1001,28 +1748,38 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun shouldDeferAfterToolResult(toolName: String, result: String): Boolean =
-        toolName in setOf("start_navigation", "confirm_navigation_destination")
+        toolName in setOf("navigation", "start_navigation", "confirm_navigation_destination", "navigate_saved_place") ||
+            navigationActuallyStarted(result)
 
     private fun navigationActuallyStarted(result: String): Boolean =
-        result.startsWith("Navigation mode started", ignoreCase = true)
+        result.startsWith("Navigation gestartet", ignoreCase = true) ||
+            result.startsWith("Navigation mode started", ignoreCase = true)
 
     private fun toolResultLooksFailed(result: String): Boolean =
         result.startsWith("Could not", ignoreCase = true) ||
+            result.startsWith("Konnte", ignoreCase = true) ||
             result.startsWith("I need", ignoreCase = true) ||
+            result.startsWith("Ich brauche", ignoreCase = true) ||
             result.contains("permission is required", ignoreCase = true) ||
-            result.contains("failed", ignoreCase = true)
+            result.contains("Berechtigung", ignoreCase = true) ||
+            result.contains("failed", ignoreCase = true) ||
+            result.contains("fehlgeschlagen", ignoreCase = true)
 
     private fun buildToolResultFallback(results: List<String>): String {
         if (results.isEmpty()) return ""
         val last = results.last()
-        val toolName = last.substringBefore(":").trim()
+        val toolName = internalToolName(last.substringBefore(":").trim())
         val lastResult = last.substringAfter(":").trim()
         return when {
             toolName == "web_search" ->
                 "Ich habe die Websuche ausgeführt, aber danach keinen KI-Antworttext bekommen. Hier sind die Rohfunde:\n${lastResult.take(2600)}"
+            lastResult.startsWith("Gestartet:", ignoreCase = true) -> "Erledigt: ${lastResult.removePrefix("Gestartet:").trim()}"
             lastResult.startsWith("Started ", ignoreCase = true) -> "Erledigt: ${lastResult.removePrefix("Started ").removeSuffix(" hands-free.")} gestartet."
+            lastResult.startsWith("Angefordert:", ignoreCase = true) -> lastResult
             lastResult.startsWith("Requested ", ignoreCase = true) -> lastResult
+            lastResult.startsWith("Konnte", ignoreCase = true) -> "Das hat leider nicht geklappt: $lastResult"
             lastResult.startsWith("Could not", ignoreCase = true) -> "Das hat leider nicht geklappt: $lastResult"
+            lastResult.contains("Berechtigung", ignoreCase = true) -> "Dafür fehlt noch eine Berechtigung: $lastResult"
             lastResult.contains("permission", ignoreCase = true) -> "Dafür fehlt noch eine Berechtigung: $lastResult"
             else -> lastResult
         }
@@ -1053,21 +1810,22 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun visionInstruction(instruction: String): String =
         "Beantworte die Nutzerfrage anhand des angehängten Kamerabildes. " +
             "Prüfe das Bild selbst und nutze keine früheren Beschreibungen als Ersatz für das Bild. " +
-            "Wenn die Frage nach Anzahl, Farbe, Text, Übersetzung oder Details fragt, antworte direkt aus dem Bild. " +
+            "Wenn die Frage nach Anzahl, Farbe, Text, Übersetzung, QR-Code, Barcode, Produktlabel oder Details fragt, antworte direkt aus dem Bild. " +
+            "Bei QR-Codes oder Barcodes gib den sichtbaren/erkennbaren Inhalt, Link oder Codewert aus; wenn er nicht sicher lesbar ist, sag das knapp. " +
             "Wenn ein Detail nicht sicher erkennbar ist, sag das knapp. Nutzerfrage: $instruction"
 
     private fun launchIntent(intent: Intent, label: String): String = try {
         val launchIntent = Intent(intent).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         if (context is Activity) {
             context.startActivity(launchIntent)
-            "Started $label hands-free."
+            "Gestartet: $label."
         } else {
             launchIntentFromBackground(launchIntent, label)
         }
     } catch (e: Exception) {
         Log.e(appTag, "Could not start $label", e)
-        val lockedSuffix = if (isDeviceLocked()) " The phone is locked; unlock it and try again if Android blocked the target app." else ""
-        "Could not start $label: ${e.message}.$lockedSuffix"
+        val lockedSuffix = if (isDeviceLocked()) " Das Telefon ist gesperrt; entsperre es und versuche es erneut, falls Android die Ziel-App blockiert hat." else ""
+        "Konnte $label nicht starten: ${e.message}.$lockedSuffix"
     }
 
     private fun launchIntentFromBackground(intent: Intent, label: String): String {
@@ -1086,16 +1844,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return try {
             pendingIntent.send(context, 0, null, null, null, null, sendOptions)
             if (notificationPosted) {
-                "Requested $label via Android and posted a launch notification in case Android blocks background opening."
+                "Angefordert: $label über Android. Zusätzlich wurde eine Startbenachrichtigung angezeigt, falls Android das Öffnen im Hintergrund blockiert."
             } else {
-                "Requested $label via Android. If nothing opens, Android blocked this background launch."
+                "Angefordert: $label über Android. Falls nichts geöffnet wird, hat Android diesen Hintergrundstart blockiert."
             }
         } catch (e: PendingIntent.CanceledException) {
             Log.e(appTag, "Could not send pending intent for $label", e)
-            "Could not start $label: ${e.message}."
+            "Konnte $label nicht starten: ${e.message}."
         } catch (e: Exception) {
             Log.e(appTag, "Could not request $label", e)
-            "Could not start $label: ${e.message}."
+            "Konnte $label nicht starten: ${e.message}."
         }
     }
 
@@ -1129,8 +1887,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         val notification = Notification.Builder(context, TOOL_LAUNCH_CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_launcher)
-            .setContentTitle("Open $label")
-            .setContentText("Android may require this tap for background launches.")
+            .setContentTitle("$label öffnen")
+            .setContentText("Android kann dieses Tippen für Starts im Hintergrund verlangen.")
             .setCategory(Notification.CATEGORY_CALL)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setPriority(Notification.PRIORITY_MAX)
@@ -1157,7 +1915,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         if (manager.getNotificationChannel(TOOL_LAUNCH_CHANNEL_ID) != null) return
         val channel = NotificationChannel(
             TOOL_LAUNCH_CHANNEL_ID,
-            "NeuroGlasses tool launches",
+            "NeuroGlasses Werkzeugstarts",
             NotificationManager.IMPORTANCE_HIGH
         )
         channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
@@ -1257,10 +2015,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun findContactPhone(recipient: String): String {
         val target = resolvePhoneTarget(recipient)
         return when {
-            target.number != null && target.displayName != null -> "Found ${target.displayName}: ${target.number}."
-            target.number != null -> "Recipient is already a phone number: ${target.number}."
-            target.contactPermissionMissing -> "READ_CONTACTS permission is required before I can look up $recipient."
-            else -> "I could not find a phone number for $recipient."
+            target.number != null && target.displayName != null -> "Gefunden: ${target.displayName}: ${target.number}."
+            target.number != null -> "Der Empfänger ist bereits eine Telefonnummer: ${target.number}."
+            target.contactPermissionMissing -> "Die READ_CONTACTS-Berechtigung ist erforderlich, bevor ich $recipient im Telefonbuch suchen kann."
+            else -> "Ich konnte keine Telefonnummer für $recipient finden."
         }
     }
 
@@ -1270,13 +2028,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val phone = target.number
         if (phone.isNullOrBlank()) {
             return if (target.contactPermissionMissing) {
-                "READ_CONTACTS permission is required before I can find $recipient. Provide a phone number or grant contacts permission."
+                "Die READ_CONTACTS-Berechtigung ist erforderlich, bevor ich $recipient finden kann. Gib eine Telefonnummer an oder erteile die Kontakte-Berechtigung."
             } else {
-                "I could not find a phone number for $recipient."
+                "Ich konnte keine Telefonnummer für $recipient finden."
             }
         }
 
-        val label = target.displayName?.let { "phone call to $it" } ?: "phone call"
+        val label = target.displayName?.let { "Anruf an $it" } ?: "Anruf"
         if (hasPermission(Manifest.permission.CALL_PHONE)) {
             val callUri = Uri.parse("tel:${Uri.encode(phone)}")
             val telecomManager = context.getSystemService(TelecomManager::class.java)
@@ -1284,7 +2042,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 runCatching {
                     telecomManager.placeCall(callUri, Bundle.EMPTY)
                 }.onSuccess {
-                    return "Started $label hands-free."
+                    return "Gestartet: $label."
                 }.onFailure { error ->
                     Log.e(appTag, "TelecomManager.placeCall failed", error)
                 }
@@ -1293,28 +2051,28 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             return launchIntent(Intent(Intent.ACTION_CALL, callUri), label)
         }
 
-        val dialResult = launchIntent(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "dialer for $label")
-        return if (dialResult.startsWith("Could not")) {
-            "CALL_PHONE permission is missing and I could not open the dialer: $dialResult"
+        val dialResult = launchIntent(Intent(Intent.ACTION_DIAL, Uri.parse("tel:${Uri.encode(phone)}")), "Wählhilfe für $label")
+        return if (dialResult.startsWith("Could not", ignoreCase = true) || dialResult.startsWith("Konnte", ignoreCase = true)) {
+            "CALL_PHONE-Berechtigung fehlt und ich konnte die Wählhilfe nicht öffnen: $dialResult"
         } else {
-            "CALL_PHONE permission is missing, so I opened the dialer for ${target.displayName ?: phone}."
+            "CALL_PHONE-Berechtigung fehlt, daher habe ich die Wählhilfe für ${target.displayName ?: phone} geöffnet."
         }
     }
 
     private fun sendSms(recipient: String, message: String): String {
-        if (message.isBlank()) return "I need a message before sending SMS."
+        if (message.isBlank()) return "Ich brauche eine Nachricht, bevor ich eine SMS senden kann."
         val target = resolvePhoneTarget(recipient)
         val phone = target.number
         if (phone.isNullOrBlank()) {
             return if (target.contactPermissionMissing) {
-                "READ_CONTACTS permission is required before I can find $recipient. Provide a phone number or grant contacts permission."
+                "Die READ_CONTACTS-Berechtigung ist erforderlich, bevor ich $recipient finden kann. Gib eine Telefonnummer an oder erteile die Kontakte-Berechtigung."
             } else {
-                "I could not find a phone number for $recipient."
+                "Ich konnte keine Telefonnummer für $recipient finden."
             }
         }
 
         if (!hasPermission(Manifest.permission.SEND_SMS)) {
-            return openSmsComposer(phone, message, "SEND_SMS permission is missing, so I opened the SMS composer instead.")
+            return openSmsComposer(phone, message, "SEND_SMS-Berechtigung fehlt, daher habe ich stattdessen den SMS-Composer geöffnet.")
         }
 
         return try {
@@ -1325,10 +2083,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             } else {
                 smsManager.sendTextMessage(phone, null, message, null, null)
             }
-            "SMS sent to ${target.displayName ?: phone}."
+            "SMS an ${target.displayName ?: phone} gesendet."
         } catch (e: Exception) {
             Log.e(appTag, "Could not send SMS directly", e)
-            openSmsComposer(phone, message, "Could not send SMS directly (${e.message}); opened the SMS composer instead.")
+            openSmsComposer(phone, message, "Konnte SMS nicht direkt senden (${e.message}); habe stattdessen den SMS-Composer geöffnet.")
         }
     }
 
@@ -1336,15 +2094,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val result = launchIntent(
             Intent(Intent.ACTION_SENDTO, Uri.parse("smsto:${Uri.encode(phone)}"))
                 .putExtra("sms_body", message),
-            "SMS composer"
+            "SMS-Composer"
         )
-        return if (result.startsWith("Could not")) "$prefix $result" else prefix
+        return if (result.startsWith("Could not", ignoreCase = true) || result.startsWith("Konnte", ignoreCase = true)) "$prefix $result" else prefix
     }
 
     private fun openRokidTranslator(): String = openRokidNativeApp("translator")
 
     private fun startOsmNavigation(destination: String, mode: String): String {
-        val cleanMode = mode.ifBlank { "public_transit" }
+        val cleanMode = normalizeNavigationMode(mode)
         val resolution = navigationDestinationResolver.resolve(destination, cleanMode)
         return when (resolution.status) {
             NavigationDestinationResolver.Status.CONFIRMED -> {
@@ -1368,7 +2126,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val resolution = navigationDestinationResolver.confirm(
             selection = selection,
             refinedDestination = destination.takeIf { it.isNotBlank() },
-            modeOverride = mode.takeIf { it.isNotBlank() }
+            modeOverride = mode.takeIf { it.isNotBlank() }?.let(::normalizeNavigationMode)
         )
         return when (resolution.status) {
             NavigationDestinationResolver.Status.CONFIRMED -> {
@@ -1376,7 +2134,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 RokidConnectionService.startNavigation(
                     context = context,
                     destination = selected.shortLabel,
-                    mode = resolution.mode.ifBlank { "public_transit" },
+                    mode = normalizeNavigationMode(resolution.mode),
                     latitude = selected.latitude,
                     longitude = selected.longitude
                 )
@@ -1391,6 +2149,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun stopOsmNavigation(): String =
         RokidConnectionService.stopNavigation(context)
 
+    private fun normalizeNavigationMode(mode: String): String =
+        when (mode.trim().lowercase(Locale.ROOT)) {
+            "zu_fuss", "zu_fuss.", "zu fuss", "zu fuß", "zu_fuß", "fuss", "fuß", "foot", "walk", "walking", "pedestrian" -> "foot"
+            "oeffi", "öffi", "offi", "oepnv", "öpnv", "oeffentlich", "öffentlich", "public_transit", "transit", "default", "" -> "public_transit"
+            else -> mode
+        }
+
     private fun openRokidNavigation(destination: String): String {
         val launchResult = RokidHostConnection.openGlassApp(rokidNavigationTargets())
         if (!launchResult.success) return launchResult.detail
@@ -1399,19 +2164,19 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (cleanDestination.isNotBlank()) {
             val commandResult = RokidHostConnection.sendNavigationDestination(cleanDestination)
             if (commandResult.success) {
-                "Opened ${launchResult.label} on the glasses and sent destination: $cleanDestination."
+                "${launchResult.label} auf der Brille geöffnet und Ziel gesendet: $cleanDestination."
             } else {
-                "Opened ${launchResult.label} on the glasses, but could not send destination '$cleanDestination': ${commandResult.detail}"
+                "${launchResult.label} auf der Brille geöffnet, aber Ziel '$cleanDestination' konnte nicht gesendet werden: ${commandResult.detail}"
             }
         } else {
-            "Opened ${launchResult.label} on the glasses."
+            "${launchResult.label} auf der Brille geöffnet."
         }
     }
 
     private fun openRokidNativeApp(app: String): String {
         val normalized = app.trim().lowercase(Locale.ROOT)
         val targets = when {
-            normalized in setOf("translator", "translate", "translation", "übersetzer", "uebersetzer", "übersetzung", "rt translation", "live translation") ->
+            normalized in setOf("translator", "translate", "translation", "übersetzer", "uebersetzer", "uebersetzer", "übersetzung", "uebersetzung", "rt translation", "live translation") ->
                 rokidTranslatorTargets()
             normalized in setOf("navigation", "maps", "map", "route", "directions", "navigate", "navi", "smartlife") ->
                 rokidNavigationTargets()
@@ -1425,7 +2190,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 spriteLauncherTarget("Rokid Settings", ".setting.SettingPageActivity") +
                     glassTargets("Rokid Settings", "com.rokid.settings", "com.rokid.glass.settings", "com.android.settings") +
                     glassTargets("Rokid Manager", "com.example.advancedsettingsmanager")
-            normalized in setOf("bluetooth_settings", "bluetooth", "bt", "bluetooth settings", "bluetooth-einstellungen") ->
+            normalized in setOf("bluetooth_settings", "bluetooth_einstellungen", "bluetooth", "bt", "bluetooth settings", "bluetooth-einstellungen") ->
                 spriteLauncherTarget("Rokid Bluetooth Settings", ".setting.bluetooth.SettingBluetoothActivity")
             normalized in setOf("system_info", "systeminfo", "system info", "info", "geräteinfo", "geraeteinfo") ->
                 spriteLauncherTarget("Rokid System Info", ".setting.info.SettingSystemInfoActivity")
@@ -1435,8 +2200,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 spriteLauncherTarget("Rokid Volume", ".page.volume.SettingVolumeActivity")
             normalized in setOf("teleprompter", "wordtips", "word tips", "worttipps", "spickzettel") ->
                 spriteLauncherTarget("Rokid Word Tips", ".page.wordtips.WordTipsPageActivity")
-            normalized in setOf("music", "musik", "lyrics", "songtext", "songtexte") ->
-                spriteLauncherTarget("Rokid Music", ".page.music.MusicPageActivity")
             normalized in setOf("recorder", "audio_recorder", "audio recorder", "aufnahme", "audioaufnahme", "recording") ->
                 spriteLauncherTarget("Rokid Audio Recorder", ".page.audio.AudioPageActivity")
             normalized in setOf("browser", "web") ->
@@ -1448,12 +2211,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             else -> emptyList()
         }
         if (targets.isEmpty()) {
-            return "Unknown Rokid native app '$app'. Supported: translator, navigation, camera, gallery, settings, bluetooth_settings, system_info, brightness, volume, teleprompter, music, recorder, browser, launcher."
+            return "Unbekannte native Rokid-App '$app'. Unterstützt: uebersetzer, navigation, kamera, galerie, einstellungen, bluetooth_einstellungen, systeminfo, helligkeit, lautstaerke, teleprompter, aufnahme, browser, start."
         }
 
         val result = RokidHostConnection.openGlassApp(targets)
         return if (result.success) {
-            "Opened ${result.label} on the glasses."
+            "${result.label} auf der Brille geöffnet."
         } else {
             result.detail
         }
@@ -1535,17 +2298,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun getGpsLocation(): String {
         if (!hasPermission(Manifest.permission.ACCESS_FINE_LOCATION) && !hasPermission(Manifest.permission.ACCESS_COARSE_LOCATION)) {
-            return "Location permission is required before I can read GPS hands-free."
+            return "Standort-Berechtigung ist erforderlich, bevor ich GPS freihändig lesen kann."
         }
         return try {
             val location = readLastKnownLocation()
             if (location == null) {
-                "No last known location is available yet."
+                "Noch kein letzter bekannter Standort verfügbar."
             } else {
-                "Current location: latitude=${location.latitude}, longitude=${location.longitude}, accuracy=${location.accuracyMeters}m."
+                "Aktueller Standort: Breitengrad=${location.latitude}, Längengrad=${location.longitude}, Genauigkeit=${location.accuracyMeters}m."
             }
         } catch (e: Exception) {
-            "Could not read location: ${e.message}"
+            "Konnte Standort nicht lesen: ${e.message}"
         }
     }
 
@@ -1555,27 +2318,27 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         } else {
             readLastKnownLocation()?.let { "${it.latitude},${it.longitude}" }.orEmpty()
         }
-        if (query.isBlank()) return "I need a location or GPS permission to fetch weather."
-        return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "weather")
+        if (query.isBlank()) return "Ich brauche einen Ort oder GPS-Berechtigung, um Wetter abzurufen."
+        return fetchText("https://wttr.in/${URLEncoder.encode(query, "UTF-8")}?format=3", "Wetter")
     }
 
     private fun webSearch(query: String): String {
         val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) return "I need a query to search the web."
+        if (cleanQuery.isBlank()) return "Ich brauche einen Suchbegriff für die Websuche."
 
         val sections = mutableListOf<String>()
         val instantAnswer = fetchDuckDuckGoInstantAnswer(cleanQuery)
         if (instantAnswer.isNotBlank()) {
-            sections += "Instant answer:\n$instantAnswer"
+            sections += "Direktantwort:\n$instantAnswer"
         }
 
         val searchResults = fetchDuckDuckGoSearchResults(cleanQuery)
         if (searchResults.isNotEmpty()) {
-            sections += "Web results for \"$cleanQuery\":\n${formatWebSearchResults(searchResults)}"
+            sections += "Web-Ergebnisse für \"$cleanQuery\":\n${formatWebSearchResults(searchResults)}"
         }
 
         return if (sections.isEmpty()) {
-            "I could not fetch web results for \"$cleanQuery\"."
+            "Ich konnte keine Web-Ergebnisse für \"$cleanQuery\" abrufen."
         } else {
             sections.joinToString("\n\n").take(WEB_SEARCH_MAX_OUTPUT_CHARS)
         }
@@ -1583,8 +2346,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun fetchDuckDuckGoInstantAnswer(query: String): String {
         val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
-        val raw = fetchText(url, "DuckDuckGo instant answer", maxChars = 120_000)
-        if (raw.startsWith("Could not", ignoreCase = true)) {
+        val raw = fetchText(url, "DuckDuckGo-Direktantwort", maxChars = 120_000)
+        if (raw.startsWith("Could not", ignoreCase = true) || raw.startsWith("Konnte", ignoreCase = true)) {
             Log.w(appTag, raw)
             return ""
         }
@@ -1601,8 +2364,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun fetchDuckDuckGoSearchResults(query: String): List<WebSearchResult> {
         val url = "https://html.duckduckgo.com/html/?q=${URLEncoder.encode(query, "UTF-8")}"
-        val html = fetchText(url, "DuckDuckGo search results", maxChars = 180_000)
-        if (html.startsWith("Could not", ignoreCase = true)) {
+        val html = fetchText(url, "DuckDuckGo-Suchergebnisse", maxChars = 180_000)
+        if (html.startsWith("Could not", ignoreCase = true) || html.startsWith("Konnte", ignoreCase = true)) {
             Log.w(appTag, html)
             return emptyList()
         }
@@ -1697,33 +2460,33 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .build()
         getWebFetchClient().newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                "Could not fetch $label: HTTP ${response.code}"
+                "Konnte $label nicht abrufen: HTTP ${response.code}"
             } else {
                 val text = response.body?.string()?.trim().orEmpty()
                 if (maxChars == Int.MAX_VALUE) text else text.take(maxChars)
             }
         }
     } catch (e: Exception) {
-        "Could not fetch $label: ${e.message}"
+        "Konnte $label nicht abrufen: ${e.message}"
     }
 
     private fun setTimer(seconds: Int, label: String): String {
-        if (seconds <= 0) return "Timer duration must be greater than zero seconds."
+        if (seconds <= 0) return "Die Timerdauer muss größer als null Sekunden sein."
         val intent = Intent(AlarmClock.ACTION_SET_TIMER)
             .putExtra(AlarmClock.EXTRA_LENGTH, seconds)
-            .putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "NeuroGlasses timer" })
+            .putExtra(AlarmClock.EXTRA_MESSAGE, label.ifBlank { "NeuroGlasses Timer" })
             .putExtra(AlarmClock.EXTRA_SKIP_UI, true)
-        return launchIntent(intent, "${seconds}-second timer")
+        return launchIntent(intent, "${seconds}-Sekunden-Timer")
     }
 
     private fun createReminder(text: String, dueTime: String, dueAtMillis: Long?): String {
-        if (text.isBlank()) return "Reminder text cannot be empty."
+        if (text.isBlank()) return "Der Erinnerungstext darf nicht leer sein."
         val prefs = context.getSharedPreferences("assistant_reminders", Context.MODE_PRIVATE)
         val existing = prefs.getStringSet("items", emptySet()).orEmpty().toMutableSet()
         existing.add("${System.currentTimeMillis()}|$text|$dueTime|${dueAtMillis ?: ""}")
         prefs.edit().putStringSet("items", existing).apply()
 
-        val savedMessage = "Reminder saved: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
+        val savedMessage = "Erinnerung gespeichert: $text${if (dueTime.isNotBlank()) " ($dueTime)" else ""}."
         val androidResult = scheduleAndroidReminder(text, dueAtMillis)
         return listOf(savedMessage, androidResult).filter { it.isNotBlank() }.joinToString(" ")
     }
@@ -1736,7 +2499,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun scheduleReminderNotification(text: String, triggerAtMillis: Long): String {
         return try {
             val alarmManager = context.getSystemService(AlarmManager::class.java)
-                ?: return "Reminder saved, but Android AlarmManager is unavailable."
+                ?: return "Erinnerung gespeichert, aber Android AlarmManager ist nicht verfügbar."
             val notificationId = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt()
             val intent = Intent(context, ReminderReceiver::class.java)
                 .putExtra(ReminderReceiver.EXTRA_TEXT, text)
@@ -1751,10 +2514,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             alarmManager.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, triggerAtMillis, pendingIntent)
             val formattedTime = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.GERMANY)
                 .format(Date(triggerAtMillis))
-            "Reminder notification scheduled automatically for $formattedTime."
+            "Erinnerungsbenachrichtigung automatisch für $formattedTime geplant."
         } catch (e: Exception) {
             Log.e(appTag, "Could not schedule reminder notification", e)
-            "Reminder saved, but I could not schedule the notification: ${e.message}"
+            "Erinnerung gespeichert, aber ich konnte die Benachrichtigung nicht planen: ${e.message}"
         }
     }
 
@@ -1769,7 +2532,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             }
             "- ${parts.getOrNull(1).orEmpty()}${dueLabel?.let { " ($it)" }.orEmpty()}"
         }
-        return if (reminders.isEmpty()) "No reminders saved." else reminders.joinToString("\n")
+        return if (reminders.isEmpty()) "Keine Erinnerungen gespeichert." else reminders.joinToString("\n")
     }
 
     private fun openApp(app: String): String {
@@ -1829,6 +2592,623 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
         return launchIntent(intent, "Kalendertermin")
     }
+
+    private fun getAgenda(
+        range: String,
+        startEpochMillis: Long?,
+        endEpochMillis: Long?,
+        query: String
+    ): String {
+        if (!hasPermission(Manifest.permission.READ_CALENDAR)) {
+            return "READ_CALENDAR-Berechtigung ist erforderlich, bevor ich die Agenda lesen kann."
+        }
+
+        val (startMillis, endMillis) = agendaRange(range, startEpochMillis, endEpochMillis)
+        val builder = CalendarContract.Instances.CONTENT_URI.buildUpon()
+        ContentUris.appendId(builder, startMillis)
+        ContentUris.appendId(builder, endMillis)
+        val projection = arrayOf(
+            CalendarContract.Instances.EVENT_ID,
+            CalendarContract.Instances.TITLE,
+            CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.END,
+            CalendarContract.Instances.EVENT_LOCATION,
+            CalendarContract.Instances.ALL_DAY,
+            CalendarContract.Instances.CALENDAR_DISPLAY_NAME
+        )
+        val cleanQuery = query.trim().lowercase(Locale.ROOT)
+        val events = mutableListOf<String>()
+
+        return try {
+            context.contentResolver.query(
+                builder.build(),
+                projection,
+                null,
+                null,
+                "${CalendarContract.Instances.BEGIN} ASC"
+            )?.use { cursor ->
+                val titleIndex = cursor.getColumnIndex(CalendarContract.Instances.TITLE)
+                val beginIndex = cursor.getColumnIndex(CalendarContract.Instances.BEGIN)
+                val endIndex = cursor.getColumnIndex(CalendarContract.Instances.END)
+                val locationIndex = cursor.getColumnIndex(CalendarContract.Instances.EVENT_LOCATION)
+                val allDayIndex = cursor.getColumnIndex(CalendarContract.Instances.ALL_DAY)
+                val calendarIndex = cursor.getColumnIndex(CalendarContract.Instances.CALENDAR_DISPLAY_NAME)
+
+                while (cursor.moveToNext() && events.size < 12) {
+                    val title = cursor.getStringOrBlank(titleIndex).ifBlank { "(ohne Titel)" }
+                    val location = cursor.getStringOrBlank(locationIndex)
+                    if (cleanQuery.isNotBlank() &&
+                        !title.lowercase(Locale.ROOT).contains(cleanQuery) &&
+                        !location.lowercase(Locale.ROOT).contains(cleanQuery)
+                    ) {
+                        continue
+                    }
+                    val begin = cursor.getLongOrDefault(beginIndex, startMillis)
+                    val end = cursor.getLongOrDefault(endIndex, begin)
+                    val allDay = cursor.getIntOrDefault(allDayIndex, 0) == 1
+                    val calendarName = cursor.getStringOrBlank(calendarIndex)
+                    val place = location.takeIf { it.isNotBlank() }?.let { " @ $it" }.orEmpty()
+                    val calendarLabel = calendarName.takeIf { it.isNotBlank() }?.let { " [$it]" }.orEmpty()
+                    events += "- ${formatAgendaTime(begin, end, allDay)}: $title$place$calendarLabel"
+                }
+            }
+
+            if (events.isEmpty()) {
+                "Keine Kalendertermine für ${formatDateRange(startMillis, endMillis)} gefunden."
+            } else {
+                "Agenda für ${formatDateRange(startMillis, endMillis)}:\n${events.joinToString("\n")}"
+            }
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not read agenda", e)
+            "Konnte Agenda nicht lesen: ${e.message}"
+        }
+    }
+
+    private fun findNearbyPlaces(category: String, radiusMeters: Int?, limit: Int?): String {
+        val location = readLastKnownLocation()
+            ?: return "Standort-Berechtigung oder ein aktueller GPS-Fix ist erforderlich, bevor ich nahe Orte finden kann."
+        val cleanCategory = category.trim().ifBlank { "Orte" }
+        val radius = (radiusMeters ?: 1000).coerceIn(100, 5000)
+        val boundedLimit = (limit ?: NEARBY_RESULT_LIMIT).coerceIn(1, 12)
+        val query = buildOverpassNearbyQuery(cleanCategory, location.latitude, location.longitude, radius, boundedLimit)
+        val raw = fetchTextPost(OVERPASS_API_URL, query, "nahe Orte", maxChars = 400_000)
+        if (raw.startsWith("Could not", ignoreCase = true) || raw.startsWith("Konnte", ignoreCase = true)) return raw
+
+        val places = runCatching {
+            parseNearbyPlaces(raw, cleanCategory, location.latitude, location.longitude)
+        }.getOrElse {
+            Log.e(appTag, "Could not parse nearby places", it)
+            return "Konnte nahe Orte nicht auswerten: ${it.message}"
+        }
+            .sortedBy { it.distanceMeters }
+            .take(boundedLimit)
+
+        if (places.isEmpty()) {
+            return "Keine nahen Orte für '$cleanCategory' im Umkreis von ${radius}m gefunden."
+        }
+        return places.mapIndexed { index, place ->
+            "${index + 1}. ${place.name} (${formatDistance(place.distanceMeters.toDouble())}) - " +
+                "${place.category}; ${formatCoordinates(place.latitude, place.longitude)}${place.detail.takeIf { it.isNotBlank() }?.let { "; $it" }.orEmpty()}"
+        }.joinToString(prefix = "Nahe $cleanCategory:\n", separator = "\n")
+    }
+
+    private fun getTransitDepartures(stop: String, radiusMeters: Int?, limit: Int?): String {
+        val boundedLimit = (limit ?: TRANSIT_RESULT_LIMIT).coerceIn(1, 12)
+        val lookup = if (stop.isBlank()) {
+            val location = readLastKnownLocation()
+                ?: return "Standort-Berechtigung oder ein aktueller GPS-Fix ist erforderlich, bevor ich nahe Öffi-Haltestellen finden kann."
+            val radius = (radiusMeters ?: 1200).coerceIn(100, 5000)
+            searchOebbNearbyStops(location.latitude, location.longitude, radius)
+        } else {
+            searchOebbStopsByName(stop)
+        }
+
+        val selectedStop = lookup.stops.firstOrNull()
+            ?: lookup.error?.let { return it }
+            ?: return if (stop.isBlank()) "Keine nahen OEBB-Öffi-Haltestellen gefunden." else "Keine OEBB-Haltestelle für '$stop' gefunden."
+
+        val scottyDepartures = fetchOebbScottyDepartures(selectedStop, boundedLimit)
+        if (scottyDepartures.departures.isNotEmpty()) {
+            val stopDistance = selectedStop.distanceMeters?.let { " (${formatDistance(it)})" }.orEmpty()
+            return scottyDepartures.departures.joinToString(
+                prefix = "Abfahrten von ${selectedStop.name}$stopDistance:\n",
+                separator = "\n"
+            )
+        }
+
+        val departuresRaw = fetchOebbText(
+            "/stops/${Uri.encode(selectedStop.id)}/departures?duration=90&results=$boundedLimit",
+            "OEBB-Abfahrten",
+            maxChars = 120_000
+        )
+        if (departuresRaw.startsWith("Could not", ignoreCase = true) || departuresRaw.startsWith("Konnte", ignoreCase = true)) {
+            return scottyDepartures.error ?: departuresRaw
+        }
+
+        val departures = runCatching { parseOebbDepartures(departuresRaw, boundedLimit) }.getOrElse {
+            Log.e(appTag, "Could not parse OEBB departures", it)
+            return scottyDepartures.error ?: "Konnte OEBB-Abfahrten nicht auswerten: ${it.message}"
+        }
+        if (departures.isEmpty()) return "Keine bevorstehenden Abfahrten für ${selectedStop.name} gefunden."
+
+        val stopDistance = selectedStop.distanceMeters?.let { " (${formatDistance(it)})" }.orEmpty()
+        return departures.joinToString(
+            prefix = "Abfahrten von ${selectedStop.name}$stopDistance:\n",
+            separator = "\n"
+        )
+    }
+
+    private fun agendaRange(range: String, startEpochMillis: Long?, endEpochMillis: Long?): Pair<Long, Long> {
+        if (startEpochMillis != null && endEpochMillis != null && endEpochMillis > startEpochMillis) {
+            return startEpochMillis to endEpochMillis
+        }
+
+        val now = System.currentTimeMillis()
+        val calendar = Calendar.getInstance(Locale.GERMANY)
+        fun startOfDay(offsetDays: Int): Long {
+            calendar.timeInMillis = now
+            calendar.add(Calendar.DAY_OF_YEAR, offsetDays)
+            calendar.set(Calendar.HOUR_OF_DAY, 0)
+            calendar.set(Calendar.MINUTE, 0)
+            calendar.set(Calendar.SECOND, 0)
+            calendar.set(Calendar.MILLISECOND, 0)
+            return calendar.timeInMillis
+        }
+
+        return when (range.trim().lowercase(Locale.ROOT)) {
+            "tomorrow", "morgen" -> {
+                val start = startOfDay(1)
+                start to (start + 24 * 60 * 60 * 1000L - 1)
+            }
+            "next_24_hours", "naechste_24_stunden", "nächste_24_stunden", "24h", "next24" -> now to (now + 24 * 60 * 60 * 1000L)
+            "week", "woche", "this_week" -> now to (now + 7 * 24 * 60 * 60 * 1000L)
+            else -> {
+                val start = startOfDay(0)
+                start to (start + 24 * 60 * 60 * 1000L - 1)
+            }
+        }
+    }
+
+    private fun formatAgendaTime(begin: Long, end: Long, allDay: Boolean): String {
+        if (allDay) return "ganztägig"
+        val timeFormat = DateFormat.getTimeInstance(DateFormat.SHORT, Locale.GERMANY)
+        return if (end > begin) {
+            "${timeFormat.format(Date(begin))}-${timeFormat.format(Date(end))}"
+        } else {
+            timeFormat.format(Date(begin))
+        }
+    }
+
+    private fun formatDateRange(startMillis: Long, endMillis: Long): String {
+        val dateFormat = DateFormat.getDateInstance(DateFormat.SHORT, Locale.GERMANY)
+        val startDate = dateFormat.format(Date(startMillis))
+        val endDate = dateFormat.format(Date(endMillis))
+        return if (startDate == endDate) startDate else "$startDate-$endDate"
+    }
+
+    private fun buildOverpassNearbyQuery(
+        category: String,
+        latitude: Double,
+        longitude: Double,
+        radiusMeters: Int,
+        limit: Int
+    ): String {
+        val filters = osmFiltersForCategory(category)
+        val body = filters.joinToString("\n") { filter ->
+            """
+                node(around:$radiusMeters,$latitude,$longitude)$filter;
+                way(around:$radiusMeters,$latitude,$longitude)$filter;
+                relation(around:$radiusMeters,$latitude,$longitude)$filter;
+            """.trimIndent()
+        }
+        val outputLimit = (limit * 4).coerceAtLeast(12)
+        return """
+            [out:json][timeout:8];
+            (
+            $body
+            );
+            out center tags $outputLimit;
+        """.trimIndent()
+    }
+
+    private fun osmFiltersForCategory(category: String): List<String> {
+        val normalized = semanticText(category)
+        return when {
+            normalized.contains("pharmacy") || normalized.contains("apotheke") ->
+                listOf("[amenity=pharmacy]")
+            normalized.contains("toilet") || normalized.contains("wc") || normalized.contains("restroom") || normalized.contains("klo") ->
+                listOf("[amenity=toilets]")
+            normalized.contains("atm") || normalized.contains("bankomat") || normalized.contains("geldautomat") ->
+                listOf("[amenity=atm]")
+            normalized.contains("supermarket") || normalized.contains("grocery") || normalized.contains("lebensmittel") || normalized.contains("supermarkt") ->
+                listOf("[shop=supermarket]", "[shop=convenience]", "[shop=grocery]")
+            normalized.contains("station") || normalized.contains("stop") || normalized.contains("haltestelle") || normalized.contains("bahnhof") ->
+                listOf("[public_transport=station]", "[public_transport=platform]", "[railway=station]", "[railway=tram_stop]", "[highway=bus_stop]", "[amenity=bus_station]")
+            normalized.contains("restaurant") || normalized.contains("essen") ->
+                listOf("[amenity=restaurant]", "[amenity=fast_food]")
+            normalized.contains("cafe") || normalized.contains("kaffee") ->
+                listOf("[amenity=cafe]")
+            normalized.contains("hospital") || normalized.contains("arzt") || normalized.contains("clinic") || normalized.contains("krankenhaus") ->
+                listOf("[amenity=hospital]", "[amenity=clinic]", "[amenity=doctors]")
+            normalized.contains("water") || normalized.contains("wasser") || normalized.contains("trink") ->
+                listOf("[amenity=drinking_water]")
+            normalized.contains("parking") || normalized.contains("parkplatz") || normalized.contains("parken") ->
+                listOf("[amenity=parking]")
+            normalized.contains("hotel") ->
+                listOf("[tourism=hotel]", "[tourism=hostel]", "[tourism=guest_house]")
+            else -> listOf("[name~\"${overpassRegexLiteral(category)}\",i]")
+        }
+    }
+
+    private fun parseNearbyPlaces(rawJson: String, requestedCategory: String, originLat: Double, originLon: Double): List<NearbyPlace> {
+        val elements = JSONObject(rawJson).optJSONArray("elements") ?: JSONArray()
+        return buildList {
+            for (index in 0 until elements.length()) {
+                val element = elements.optJSONObject(index) ?: continue
+                val center = element.optJSONObject("center")
+                val lat = if (element.has("lat")) element.optDouble("lat") else center?.optDouble("lat") ?: Double.NaN
+                val lon = if (element.has("lon")) element.optDouble("lon") else center?.optDouble("lon") ?: Double.NaN
+                if (!lat.isFinite() || !lon.isFinite()) continue
+                val tags = element.optJSONObject("tags") ?: JSONObject()
+                val name = tags.optString("name")
+                    .ifBlank { tags.optString("operator") }
+                    .ifBlank { categoryFromTags(tags, requestedCategory) }
+                val category = categoryFromTags(tags, requestedCategory)
+                val distance = distanceMeters(originLat, originLon, lat, lon)
+                val detail = nearbyDetail(tags)
+                add(NearbyPlace(name, category, lat, lon, distance, detail))
+            }
+        }.distinctBy { "${it.name}:${it.latitude}:${it.longitude}" }
+    }
+
+    private fun categoryFromTags(tags: JSONObject, fallback: String): String =
+        listOf("amenity", "shop", "tourism", "railway", "public_transport", "highway")
+            .firstNotNullOfOrNull { key -> tags.optString(key).takeIf { it.isNotBlank() } }
+            ?: fallback
+
+    private fun nearbyDetail(tags: JSONObject): String {
+        val address = listOf(
+            tags.optString("addr:street"),
+            tags.optString("addr:housenumber"),
+            tags.optString("addr:postcode"),
+            tags.optString("addr:city")
+        ).filter { it.isNotBlank() }.joinToString(" ")
+        val opening = tags.optString("opening_hours").takeIf { it.isNotBlank() }?.let { "open: $it" }
+        return listOf(address.takeIf { it.isNotBlank() }, opening).filterNotNull().joinToString("; ")
+    }
+
+    private fun searchOebbNearbyStops(latitude: Double, longitude: Double, radiusMeters: Int): TransitStopLookup {
+        val body = fetchOebbText(
+            "/stops/nearby?latitude=$latitude&longitude=$longitude&distance=$radiusMeters&results=5",
+            "nahe OEBB-Haltestellen",
+            maxChars = 120_000
+        )
+        if (body.startsWith("Could not", ignoreCase = true) || body.startsWith("Konnte", ignoreCase = true)) {
+            Log.w(appTag, body)
+            return TransitStopLookup(error = body)
+        }
+        return runCatching {
+            TransitStopLookup(stops = parseOebbStops(body))
+        }.getOrElse {
+            Log.e(appTag, "Could not parse nearby OEBB stops", it)
+            TransitStopLookup(error = "Konnte nahe OEBB-Haltestellen nicht auswerten: ${it.message}")
+        }
+    }
+
+    private fun searchOebbStopsByName(stop: String): TransitStopLookup {
+        val scottyLookup = searchOebbScottyStopsByName(stop)
+        if (scottyLookup.stops.isNotEmpty()) return scottyLookup
+
+        val body = fetchOebbText(
+            "/locations?query=${URLEncoder.encode(stop, "UTF-8")}&results=5&stops=true&addresses=false&poi=false",
+            "OEBB-Haltestellensuche",
+            maxChars = 120_000
+        )
+        if (body.startsWith("Could not", ignoreCase = true) || body.startsWith("Konnte", ignoreCase = true)) {
+            Log.w(appTag, body)
+            return if (scottyLookup.error != null) {
+                TransitStopLookup(error = "${scottyLookup.error}; $body")
+            } else {
+                TransitStopLookup(error = body)
+            }
+        }
+        return runCatching {
+            TransitStopLookup(stops = parseOebbStops(body))
+        }.getOrElse {
+            Log.e(appTag, "Could not parse OEBB stop search", it)
+            TransitStopLookup(error = scottyLookup.error ?: "Konnte OEBB-Haltestellensuche nicht auswerten: ${it.message}")
+        }
+    }
+
+    private fun searchOebbScottyStopsByName(stop: String): TransitStopLookup {
+        val cleanStop = stop.trim()
+        if (cleanStop.isBlank()) return TransitStopLookup()
+        val url = "$OEBB_SCOTTY_BASE_URL/bin/ajax-getstop.exe/dn?REQ0JourneyStopsS0A=1&S=${URLEncoder.encode(cleanStop, "UTF-8")}&js=true&"
+        val body = fetchText(url, "OEBB-Scotty-Haltestellensuche", maxChars = 120_000)
+        if (body.startsWith("Could not", ignoreCase = true) || body.startsWith("Konnte", ignoreCase = true)) {
+            Log.w(appTag, body)
+            return TransitStopLookup(error = body)
+        }
+        return runCatching {
+            val obj = JSONObject(extractJavascriptObject(body, "SLs.sls"))
+            val suggestions = obj.optJSONArray("suggestions") ?: JSONArray()
+            val stops = buildList {
+                for (index in 0 until suggestions.length()) {
+                    val suggestion = suggestions.optJSONObject(index) ?: continue
+                    val name = decodeHtmlEntities(suggestion.optString("value")).trim()
+                    val extId = suggestion.optString("extId")
+                        .ifBlank { Regex("@L=([^@]+)").find(suggestion.optString("id"))?.groupValues?.getOrNull(1).orEmpty() }
+                    val id = normalizeOebbEvaId(extId)
+                    if (name.isBlank() || id.isBlank()) continue
+                    add(TransitStop(id = id, name = name))
+                }
+            }
+            TransitStopLookup(stops = stops)
+        }.getOrElse {
+            Log.e(appTag, "Could not parse OEBB Scotty stop search", it)
+            TransitStopLookup(error = "Konnte OEBB-Scotty-Haltestellensuche nicht auswerten: ${it.message}")
+        }
+    }
+
+    private fun parseOebbStops(rawJson: String): List<TransitStop> {
+        val array = jsonArrayFromResponse(rawJson, "stops", "locations")
+        return buildList {
+            for (index in 0 until array.length()) {
+                val stop = array.optJSONObject(index) ?: continue
+                val type = stop.optString("type")
+                if (type.isNotBlank() && type !in setOf("stop", "station", "location")) continue
+                val id = stop.optString("id").ifBlank { stop.optString("stationId") }
+                val name = stop.optString("name")
+                if (id.isBlank() || name.isBlank()) continue
+                val distance = if (stop.has("distance") && !stop.isNull("distance")) stop.optDouble("distance") else null
+                add(TransitStop(id, name, distance))
+            }
+        }
+    }
+
+    private fun fetchOebbScottyDepartures(stop: TransitStop, limit: Int): TransitDeparturesLookup {
+        val evaId = normalizeOebbEvaId(stop.id)
+        if (evaId.isBlank()) return TransitDeparturesLookup(error = "Keine gültige OEBB-Haltestellen-ID für ${stop.name}.")
+        val url = "$OEBB_SCOTTY_BASE_URL/bin/stboard.exe/dn?" +
+            "L=vs_liveticker&evaId=${Uri.encode(evaId)}&dirInput=&boardType=dep&selectDate=today&time=now&" +
+            "productsFilter=1111111111&additionalTime=0&useEquiv=no&outputMode=tickerDataOnly&maxJourneys=${limit.coerceAtLeast(1)}&start=yes"
+        val body = fetchText(url, "OEBB-Scotty-Abfahrten", maxChars = 120_000)
+        if (body.startsWith("Could not", ignoreCase = true) || body.startsWith("Konnte", ignoreCase = true)) {
+            Log.w(appTag, body)
+            return TransitDeparturesLookup(error = body)
+        }
+        return runCatching {
+            val obj = JSONObject(extractJavascriptObject(body, "journeysObj"))
+            val journeys = obj.optJSONArray("journey") ?: JSONArray()
+            val departures = buildList {
+                for (index in 0 until journeys.length()) {
+                    if (size >= limit) break
+                    val journey = journeys.optJSONObject(index) ?: continue
+                    val time = journey.optString("rti")
+                        .ifBlank { journey.optString("ti") }
+                        .ifBlank { "bald" }
+                    val line = decodeHtmlEntities(journey.optString("pr")).trim().ifBlank { "Linie" }
+                    val direction = decodeHtmlEntities(
+                        journey.optString("st")
+                            .ifBlank { journey.optString("lastStop") }
+                    ).trim().ifBlank { "unbekannt" }
+                    val plannedTime = journey.optString("ti")
+                    val delay = if (time != plannedTime && plannedTime.isNotBlank()) " statt $plannedTime" else ""
+                    val platform = decodeHtmlEntities(journey.optString("tr"))
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                        ?.let { " Gleis/Steig $it" }
+                        .orEmpty()
+                    add("- $time$delay: $line nach $direction$platform")
+                }
+            }
+            TransitDeparturesLookup(departures = departures)
+        }.getOrElse {
+            Log.e(appTag, "Could not parse OEBB Scotty departures", it)
+            TransitDeparturesLookup(error = "Konnte OEBB-Scotty-Abfahrten nicht auswerten: ${it.message}")
+        }
+    }
+
+    private fun parseOebbDepartures(rawJson: String, limit: Int): List<String> {
+        val array = jsonArrayFromResponse(rawJson, "departures", "results")
+        return buildList {
+            for (index in 0 until array.length()) {
+                if (size >= limit) break
+                val departure = array.optJSONObject(index) ?: continue
+                val line = departure.optJSONObject("line")
+                val lineName = line?.optString("name")?.ifBlank { line.optString("fahrtNr") } ?: "Linie"
+                val direction = departure.optString("direction").ifBlank { departure.optString("destination") }
+                val whenIso = departure.optString("when").ifBlank { departure.optString("plannedWhen") }
+                val time = formatIsoTime(whenIso).ifBlank { "bald" }
+                val delaySeconds = if (departure.has("delay") && !departure.isNull("delay")) departure.optInt("delay") else 0
+                val delay = if (delaySeconds > 0) " +${delaySeconds / 60}min" else ""
+                val platform = departure.optString("platform")
+                    .ifBlank { departure.optString("plannedPlatform") }
+                    .takeIf { it.isNotBlank() }
+                    ?.let { " Gleis/Steig $it" }
+                    .orEmpty()
+                add("- $time$delay: $lineName nach ${direction.ifBlank { "unbekannt" }}$platform")
+            }
+        }
+    }
+
+    private fun jsonArrayFromResponse(rawJson: String, vararg fieldNames: String): JSONArray {
+        val trimmed = rawJson.trim()
+        if (trimmed.startsWith("[")) return JSONArray(trimmed)
+        val obj = JSONObject(trimmed)
+        fieldNames.forEach { name ->
+            obj.optJSONArray(name)?.let { return it }
+        }
+        return JSONArray()
+    }
+
+    private fun extractJavascriptObject(raw: String, assignmentName: String): String {
+        val assignmentIndex = raw.indexOf(assignmentName)
+        if (assignmentIndex < 0) throw IllegalArgumentException("$assignmentName nicht gefunden")
+        val equalsIndex = raw.indexOf('=', assignmentIndex)
+        if (equalsIndex < 0) throw IllegalArgumentException("$assignmentName ohne Zuweisung")
+        val start = raw.indexOf('{', equalsIndex)
+        if (start < 0) throw IllegalArgumentException("$assignmentName ohne Objekt")
+        var depth = 0
+        var inString = false
+        var escaping = false
+        for (index in start until raw.length) {
+            val ch = raw[index]
+            if (inString) {
+                when {
+                    escaping -> escaping = false
+                    ch == '\\' -> escaping = true
+                    ch == '"' -> inString = false
+                }
+            } else {
+                when (ch) {
+                    '"' -> inString = true
+                    '{' -> depth++
+                    '}' -> {
+                        depth--
+                        if (depth == 0) return raw.substring(start, index + 1)
+                    }
+                }
+            }
+        }
+        throw IllegalArgumentException("$assignmentName unvollständig")
+    }
+
+    private fun normalizeOebbEvaId(value: String): String =
+        value.trim().trimStart('0').ifBlank { value.trim() }
+
+    private fun fetchOebbText(path: String, label: String, maxChars: Int): String {
+        val api = fetchText("$OEBB_API_BASE_URL/api$path", label, maxChars)
+        if (!api.contains("HTTP 404", ignoreCase = true)) return api
+        return fetchText("$OEBB_API_BASE_URL$path", label, maxChars)
+    }
+
+    private fun fetchTextPost(url: String, bodyText: String, label: String, maxChars: Int = Int.MAX_VALUE): String = try {
+        val request = Request.Builder()
+            .url(url)
+            .post(bodyText.toRequestBody("text/plain; charset=utf-8".toMediaType()))
+            .header("User-Agent", WEB_SEARCH_USER_AGENT)
+            .header("Accept-Language", "de,en;q=0.8")
+            .build()
+        getWebFetchClient().newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                "Konnte $label nicht abrufen: HTTP ${response.code}"
+            } else {
+                val text = response.body?.string()?.trim().orEmpty()
+                if (maxChars == Int.MAX_VALUE) text else text.take(maxChars)
+            }
+        }
+    } catch (e: Exception) {
+        "Konnte $label nicht abrufen: ${e.message}"
+    }
+
+    private fun explicitCoordinates(latitudeRaw: String, longitudeRaw: String): LocationCoordinates? {
+        val latitude = latitudeRaw.toDoubleOrNull()
+        val longitude = longitudeRaw.toDoubleOrNull()
+        if (latitude == null || longitude == null) return null
+        if (latitude !in -90.0..90.0 || longitude !in -180.0..180.0) return null
+        return LocationCoordinates(latitude, longitude, 0f)
+    }
+
+    private fun resolvedPlaceCoordinates(address: String): LocationCoordinates? {
+        val cleanAddress = address.trim()
+        if (cleanAddress.isBlank()) return null
+        return runCatching {
+            navigationDestinationResolver.resolve(cleanAddress, "foot", maxCandidates = 1).selected?.let {
+                LocationCoordinates(it.latitude, it.longitude, 0f)
+            }
+        }.getOrNull()
+    }
+
+    private fun placeDetail(place: SavedPlaceRecord): String =
+        listOf(place.description, place.address)
+            .filter { it.isNotBlank() }
+            .joinToString(" - ")
+            .takeIf { it.isNotBlank() }
+            ?.let { "; $it" }
+            .orEmpty()
+
+    private fun parseStringList(raw: String): List<String> {
+        val clean = raw.trim()
+        if (clean.isBlank()) return emptyList()
+        if (clean.startsWith("[")) {
+            return runCatching {
+                val array = JSONArray(clean)
+                buildList {
+                    for (index in 0 until array.length()) {
+                        array.optString(index).trim().takeIf { it.isNotBlank() }?.let { add(it.take(40)) }
+                    }
+                }
+            }.getOrDefault(emptyList())
+        }
+        return clean.split(',', ';', '#')
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .map { it.take(40) }
+    }
+
+    private fun semanticOverlapScore(query: String, content: String, tags: List<String>, category: String): Double {
+        val queryTokens = semanticTokens(query)
+        if (queryTokens.isEmpty()) return 0.0
+        val contentTokens = semanticTokens("$content ${tags.joinToString(" ")} $category")
+        if (contentTokens.isEmpty()) return 0.0
+        val overlap = queryTokens.count { it in contentTokens }
+        val phraseBonus = if (semanticText(content).contains(semanticText(query))) 4.0 else 0.0
+        val tagBonus = tags.count { tag -> semanticTokens(tag).any { it in queryTokens } } * 1.5
+        return overlap * 2.0 + phraseBonus + tagBonus
+    }
+
+    private fun semanticTokens(value: String): Set<String> =
+        semanticText(value)
+            .split(' ')
+            .asSequence()
+            .map { it.trim() }
+            .filter { it.length >= 3 && it !in SEMANTIC_STOP_WORDS }
+            .toSet()
+
+    private fun semanticText(value: String): String {
+        val normalized = Normalizer.normalize(value.lowercase(Locale.ROOT), Normalizer.Form.NFD)
+            .replace(Regex("\\p{Mn}+"), "")
+        return normalized.map { char ->
+            if (char.isLetterOrDigit()) char else ' '
+        }.joinToString("").collapseWhitespace()
+    }
+
+    private fun shortId(): String =
+        UUID.randomUUID().toString().substring(0, 8)
+
+    private fun formatCoordinates(latitude: Double, longitude: Double): String =
+        "%.5f, %.5f".format(Locale.US, latitude, longitude)
+
+    private fun formatDistance(meters: Double): String =
+        if (meters >= 1000.0) {
+            "%.1f km".format(Locale.GERMANY, meters / 1000.0)
+        } else {
+            "${meters.toInt()} m"
+        }
+
+    private fun distanceMeters(fromLat: Double, fromLon: Double, toLat: Double, toLon: Double): Float {
+        val result = FloatArray(1)
+        android.location.Location.distanceBetween(fromLat, fromLon, toLat, toLon, result)
+        return result[0]
+    }
+
+    private fun overpassRegexLiteral(value: String): String =
+        value.trim().take(80).replace("\\", "\\\\").replace("\"", "\\\"")
+
+    private fun formatIsoTime(iso: String): String =
+        runCatching {
+            ZonedDateTime.parse(iso).format(DateTimeFormatter.ofPattern("HH:mm", Locale.GERMANY))
+        }.getOrDefault("")
+
+    private fun android.database.Cursor.getStringOrBlank(index: Int): String =
+        if (index >= 0 && !isNull(index)) getString(index).orEmpty() else ""
+
+    private fun android.database.Cursor.getLongOrDefault(index: Int, defaultValue: Long): Long =
+        if (index >= 0 && !isNull(index)) getLong(index) else defaultValue
+
+    private fun android.database.Cursor.getIntOrDefault(index: Int, defaultValue: Int): Int =
+        if (index >= 0 && !isNull(index)) getInt(index) else defaultValue
 
     /**
      * Call OpenAI API for chat completion with streaming
@@ -2138,11 +3518,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
         val requestChatId = activeChatIdOrNull()
         val messagesList = mutableListOf<Message>()
+        val memoryContext = semanticMemoryContext(instruction)
         val sessionPrompt = when {
             hasImage ->
-                "Diese Anfrage enthält ein frisches Kamerabild. Verwende dieses Bild als primäre Quelle und ziehe keine älteren Bildbeschreibungen oder Tool-Ergebnisse heran."
+                "Diese Anfrage enthält ein frisches Kamerabild. Verwende dieses Bild als primäre Quelle und ziehe keine älteren Bildbeschreibungen oder Werkzeug-Ergebnisse heran."
             requestChatId != null ->
-                "Du bist in einem explizit gewählten persistenten Chat. Verwende dessen Verlauf. Nutze Chat-Verwaltungstools nur, wenn der Nutzer neue Chats, Chatlisten, Umbenennungen, Löschungen, Wechsel oder das Verlassen des persistenten Chats wünscht."
+                "Du bist in einem explizit gewählten persistenten Chat. Verwende dessen Verlauf. Nutze Chat-Verwaltungswerkzeuge nur, wenn der Nutzer neue Chats, Chatlisten, Umbenennungen, Löschungen, Wechsel oder das Verlassen des persistenten Chats wünscht."
             conversationHistory.isNotEmpty() ->
                 "Du bist in der ephemeren Hauptkonversation. Du hast nur den Verlauf dieser gerade aktiven Brillen-Konversation. Erstelle oder betrete persistente Chats nur bei ausdrücklicher Nutzerbitte."
             else ->
@@ -2150,10 +3531,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
         val systemPrompt = getSystemPrompt() +
             "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. ${currentAssistantTimeHint()} " +
-            "Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. " +
-            "Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Tool-Antwort fragt ausdrücklich nach Auswahl; Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. " +
+            "Nutze Werkzeuge nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen brillenfoto_aufnehmen. " +
+            "Navigation: nutze navigation mit action=start, confirm oder stop; target ist das Ziel, selection die Nutzerwahl. oeffi ist Standard, zu_fuss nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Werkzeug-Antwort fragt ausdrücklich nach Auswahl. " +
             "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings. Erwarte keine Textinterpretation durch die App. " +
-            "Aktuelles/Web/Preise/Öffnungszeiten: web_search und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
+            "Semantische Erinnerung: gedaechtnis action=save nur für ausdrückliches Merken oder stabile persönliche Fakten; search/list/delete für Erinnerungsfragen oder Löschwunsch. " +
+            "Gespeicherte Orte: orte action=save/list/navigate/delete für Parkplatz, Hotel, Eingang, Treffpunkt und ähnliche Orte; nutze delete statt vagem 'vergessen'. " +
+            "Kalender: agenda_abrufen für Termin-/Agenda-Abfragen. Umgebung: nahe_orte_finden für nahe Orte; abfahrten_abrufen für Bus/Bahn/Bim/U-Bahn-Abfahrten. " +
+            "QR-/Barcode-Fragen sind Sichtfragen und brauchen brillenfoto_aufnehmen; lies sichtbaren Code/URL/Text aus dem frischen Bild, soweit erkennbar. " +
+            "Rokid-Brillenapps: rokid_app_oeffnen, auch für uebersetzer. Aktuelles/Web/Preise/Öffnungszeiten: web_suche und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. Persistente Chats: chat action=new/list/switch/rename/leave/delete nur bei ausdrücklichem Wunsch. $sessionPrompt" +
+            memoryContext.takeIf { it.isNotBlank() }?.let { "\n\n$it" }.orEmpty()
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
@@ -2187,7 +3573,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             toolMessages.add(
                 Message(
                     role = "user",
-                    content = "Gib jetzt eine knappe deutschsprachige Erfolgsmeldung oder Fehlermeldung zu diesen Tool-Ergebnissen aus. Frage nicht erneut nach bereits aufgelösten Daten:\n${toolResolution.results.joinToString("\n")}"
+                    content = "Gib jetzt eine knappe deutschsprachige Erfolgsmeldung oder Fehlermeldung zu diesen Werkzeug-Ergebnissen aus. Frage nicht erneut nach bereits aufgelösten Daten:\n${toolResolution.results.joinToString("\n")}"
                 )
             )
         }
@@ -2285,7 +3671,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             listener?.onOpenAIStreamingChunk(finalResponse, true)
         }
         val persistentModeEnded = chatContext.toolResults.any {
-            it.startsWith("leave_chat:") || it.startsWith("delete_chat:")
+            val toolName = internalToolName(it.substringBefore(":").trim())
+            toolName == "leave_chat" ||
+                toolName == "delete_chat" ||
+                (toolName == "chat" && (
+                    it.contains("Persistenten Chat verlassen", ignoreCase = true) ||
+                        it.contains("Persistenten Chat gelöscht", ignoreCase = true)
+                    ))
         }
         val targetChatId = if (persistentModeEnded) null else activeChatIdOrNull() ?: chatContext.requestChatId
         if (targetChatId != null) {
@@ -2381,15 +3773,16 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
                     Log.d(appTag, "Executing ${toolCalls.size} tool call(s), round ${round + 1}")
                     toolCalls.forEach { toolCall ->
+                        val toolName = internalToolName(toolCall.function.name)
                         val result = executeAssistantTool(toolCall, instruction)
                         if (result == DEFERRED_PHOTO_TOOL_RESULT || result == LOCAL_TOOL_HANDLED_RESULT) {
-                            Log.d(appTag, "Tool ${toolCall.function.name} handled locally; deferring final assistant response")
+                            Log.d(appTag, "Tool $toolName handled locally; deferring final assistant response")
                             return ToolResolutionResult(messagesList, toolResults, deferred = true)
                         }
-                        toolResults += "${toolCall.function.name}: $result"
-                        listener?.onAssistantToolResult(toolCall.function.name, result)
-                        if (shouldDeferAfterToolResult(toolCall.function.name, result)) {
-                            Log.d(appTag, "Tool ${toolCall.function.name} completed locally; deferring final assistant response")
+                        toolResults += "${exposedToolName(toolName)}: $result"
+                        listener?.onAssistantToolResult(toolName, result)
+                        if (shouldDeferAfterToolResult(toolName, result)) {
+                            Log.d(appTag, "Tool $toolName completed locally; deferring final assistant response")
                             return ToolResolutionResult(messagesList, toolResults, deferred = true)
                         }
                         messagesList.add(
@@ -2401,7 +3794,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                         )
                     }
 
-                    if (toolCalls.any { it.function.name == "stop_conversation" }) return ToolResolutionResult(messagesList, toolResults)
+                    if (toolCalls.any { internalToolName(it.function.name) == "stop_conversation" }) return ToolResolutionResult(messagesList, toolResults)
                 }
             }
             Log.w(appTag, "Tool planning reached max rounds ($MAX_TOOL_ROUNDS); continuing with accumulated tool results")

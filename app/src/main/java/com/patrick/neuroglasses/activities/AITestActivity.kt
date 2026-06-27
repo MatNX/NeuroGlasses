@@ -448,7 +448,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onAssistantToolResult(toolName: String, result: String) {
                 runOnUiThread {
                     if (!isConversationActive || isClosingConversation) return@runOnUiThread
-                    if (isNavigationStartTool(toolName) && navigationActuallyStarted(result)) {
+                    if (navigationActuallyStarted(result)) {
                         Log.d(appTag, "Navigation tool result: $result")
                         closeConversation("Navigation gestartet.")
                         return@runOnUiThread
@@ -638,6 +638,7 @@ class AITestActivity : AppCompatActivity() {
         toolName in setOf(
             "place_phone_call",
             "send_sms",
+            "navigation",
             "set_timer",
             "create_reminder",
             "create_calendar_event",
@@ -661,6 +662,7 @@ class AITestActivity : AppCompatActivity() {
         "send_sms" -> "SMS"
         "find_contact_phone" -> "Kontakt-Suche"
         "open_rokid_native_app" -> "Rokid-App"
+        "navigation" -> "Navigation"
         "start_navigation" -> "Navigation"
         "confirm_navigation_destination" -> "Navigationsziel"
         "stop_navigation" -> "Navigation stoppen"
@@ -675,27 +677,57 @@ class AITestActivity : AppCompatActivity() {
         "open_app" -> "App"
         "share_text" -> "Teilen"
         "get_battery_status" -> "Akku"
+        "memory" -> "Gedächtnis"
+        "remember_memory" -> "Erinnerung speichern"
+        "search_memory" -> "Gedächtnis"
+        "list_memories" -> "Gedächtnis"
+        "forget_memory" -> "Erinnerung löschen"
+        "saved_place" -> "Orte"
+        "save_place" -> "Ort speichern"
+        "list_saved_places" -> "Gespeicherte Orte"
+        "navigate_saved_place" -> "Ort-Navigation"
+        "forget_saved_place" -> "Ort löschen"
+        "get_agenda" -> "Agenda"
+        "find_nearby_places" -> "Umgebung"
+        "get_transit_departures" -> "Abfahrten"
         "open_accessibility_settings" -> "Bedienungshilfen"
         "snap_glasses_photo" -> "Foto"
+        "chat" -> "Chat"
+        "new_chat" -> "Neuer Chat"
+        "list_chats" -> "Chats"
+        "switch_chat" -> "Chat wechseln"
+        "rename_chat" -> "Chat umbenennen"
+        "leave_chat" -> "Chat verlassen"
+        "delete_chat" -> "Chat löschen"
         "stop_conversation" -> "Stopp"
         else -> toolName
     }
 
     private fun localizeToolResult(result: String): String = when {
+        result.startsWith("Gestartet:", ignoreCase = true) -> "gestartet"
         result.startsWith("Started ", ignoreCase = true) -> "gestartet"
+        result.startsWith("Angefordert:", ignoreCase = true) -> "angefragt"
         result.startsWith("Requested ", ignoreCase = true) -> "angefragt"
+        result.startsWith("SMS an", ignoreCase = true) -> "gesendet"
         result.startsWith("SMS sent", ignoreCase = true) -> "gesendet"
+        result.startsWith("Gefunden:", ignoreCase = true) -> result
         result.startsWith("Found ", ignoreCase = true) -> result
+        result.startsWith("Konnte", ignoreCase = true) -> "fehlgeschlagen: $result"
         result.startsWith("Could not", ignoreCase = true) -> "fehlgeschlagen: $result"
+        result.contains("Berechtigung", ignoreCase = true) -> "Berechtigung fehlt: $result"
         result.contains("permission", ignoreCase = true) -> "Berechtigung fehlt: $result"
         else -> result
     }
 
     private fun isNavigationStartTool(toolName: String): Boolean =
-        toolName == "start_navigation" || toolName == "confirm_navigation_destination"
+        toolName == "navigation" ||
+            toolName == "start_navigation" ||
+            toolName == "confirm_navigation_destination" ||
+            toolName == "navigate_saved_place"
 
     private fun navigationActuallyStarted(result: String): Boolean =
-        result.startsWith("Navigation mode started", ignoreCase = true)
+        result.startsWith("Navigation gestartet", ignoreCase = true) ||
+            result.startsWith("Navigation mode started", ignoreCase = true)
 
     private fun isNativeRokidTool(toolName: String): Boolean =
         toolName == "open_rokid_native_app" ||
