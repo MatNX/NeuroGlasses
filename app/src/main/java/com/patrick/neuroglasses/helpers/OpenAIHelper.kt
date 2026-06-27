@@ -199,6 +199,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val PREF_ACTIVE_CHAT_ID = "active_chat_id"
         private const val PREF_ACTIVE_CHAT_EXPLICIT = "active_chat_explicit"
         private const val WEB_SEARCH_MAX_OUTPUT_CHARS = 5000
+        private const val WEB_SEARCH_RESULT_LIMIT = 5
         private const val WEB_SEARCH_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) NeuroGlasses/1.0 Mobile Safari/537.36"
     }
@@ -235,6 +236,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val latitude: Double,
         val longitude: Double,
         val accuracyMeters: Float
+    )
+
+    private data class WebSearchResult(
+        val title: String,
+        val url: String,
+        val snippet: String
     )
 
     // Get configuration from SharedPreferences
@@ -737,7 +744,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "open_rokid_native_app",
-                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, camera, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. For navigation with a destination, use start_navigation so NeuroGlasses can resolve and confirm the address first.",
+                description = "Open a native/glasses-side Rokid app through Hi Rokid CXR-L. Use this instead of phone apps for Rokid translation, gallery, settings, brightness, volume, teleprompter, music/lyrics, recorder, or other glasses-native requests. Use camera only when the user explicitly wants the native camera app opened; for a quick photo/visual context use snap_glasses_photo. For navigation with a destination, use start_navigation so NeuroGlasses can resolve and confirm the address first.",
                 parameters = objectSchema(listOf("app"), mapOf(
                     "app" to mapOf(
                         "type" to "string",
@@ -764,7 +771,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "start_navigation",
-                description = "Resolve an Austrian destination before starting NeuroGlasses background navigation. Use this for navigation, maps, routes, or directions. The tool may return candidate locations and ask the user to confirm one by number. Default mode is public_transit; use foot only when the user explicitly asks to walk or go by foot.",
+                description = "Resolve an Austrian destination before starting NeuroGlasses background navigation. Use this for navigation, maps, routes, or directions. The resolver usually picks the best match directly and only asks for confirmation when results are weak or genuinely ambiguous. Default mode is public_transit; use foot only when the user explicitly asks to walk or go by foot.",
                 parameters = objectSchema(listOf("destination"), mapOf(
                     "destination" to stringProp("Best transcript of the destination/address, preserving all heard German street/place words, house numbers, postcodes, and city names."),
                     "mode" to mapOf(
@@ -794,10 +801,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "play_youtube_music",
-                description = "Play requested music/video hands-free. If you know a direct YouTube URL, pass video_url. Otherwise pass query. The app will try Android media playback first for background-capable apps, then fall back to browser.",
+                description = "Play requested music hands-free by sending a media search query to YouTube Music or YouTube. Do not pass URLs; use the song, artist, playlist, album, or video title as the query.",
                 parameters = objectSchema(listOf("query"), mapOf(
-                    "query" to stringProp("Song, artist, playlist, video title, or search query to play."),
-                    "video_url" to stringProp("Optional direct YouTube URL if known.")
+                    "query" to stringProp("Song, artist, playlist, album, video title, or search query to play.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
@@ -817,7 +823,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "web_search",
-                description = "Use DuckDuckGo instant answers for current/web questions. If no structured instant answer exists, open a visible web search for the user instead of scraping result pages.",
+                description = "Fetch web search results and snippets for current/web questions so the assistant can answer hands-free. Never opens the phone browser.",
                 parameters = objectSchema(listOf("query"), mapOf("query" to stringProp("Search query.")))
             )),
             AssistantTool(function = ToolFunction(
@@ -886,7 +892,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = "snap_glasses_photo",
-                description = "Capture a fresh Rokid glasses camera photo as visual context. Use this whenever the user asks about the current view, scene, objects, people, hands, counts, colors, visible text, translation of visible text, or anything that needs eyesight. Do not answer visual questions from memory when no image is attached.",
+                description = "Capture a fresh Rokid glasses camera photo for the assistant without opening the native camera UI. Use this when the user asks to take a quick photo for context, asks what you see, or asks about the current view, scene, objects, people, hands, counts, colors, visible text, translation of visible text, or anything that needs eyesight. Do not answer visual questions from memory when no image is attached.",
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
@@ -953,7 +959,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "start_navigation" -> startOsmNavigation(arg("destination"), arg("mode"))
             "confirm_navigation_destination" -> confirmOsmNavigationDestination(arg("selection"), arg("destination"), arg("mode"))
             "stop_navigation" -> stopOsmNavigation()
-            "play_youtube_music" -> playYoutubeMusic(arg("query"), arg("video_url"))
+            "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
             "get_weather" -> getWeather(arg("location"))
@@ -1078,18 +1084,17 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun launchIntentFromBackground(intent: Intent, label: String): String {
-        val options = backgroundActivityLaunchOptions()
+        val sendOptions = backgroundActivityLaunchOptions()
         val requestCode = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt()
         val pendingIntent = PendingIntent.getActivity(
             context,
             requestCode,
             intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
-            options
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
         return try {
-            pendingIntent.send(context, 0, null, null, null, null, options)
+            pendingIntent.send(context, 0, null, null, null, null, sendOptions)
             "Requested $label via Android. If nothing opens, Android blocked this background launch."
         } catch (e: PendingIntent.CanceledException) {
             Log.e(appTag, "Could not send pending intent for $label", e)
@@ -1103,17 +1108,12 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun backgroundActivityLaunchOptions(): Bundle? {
         val options = ActivityOptions.makeBasic()
         val mode = backgroundActivityStartMode() ?: return options.toBundle()
-        listOf(
-            "setPendingIntentBackgroundActivityStartMode",
-            "setPendingIntentCreatorBackgroundActivityStartMode"
-        ).forEach { methodName ->
-            runCatching {
-                ActivityOptions::class.java
-                    .getMethod(methodName, Int::class.javaPrimitiveType)
-                    .invoke(options, mode)
-            }.onFailure {
-                Log.d(appTag, "ActivityOptions.$methodName unavailable on API ${Build.VERSION.SDK_INT}")
-            }
+        runCatching {
+            ActivityOptions::class.java
+                .getMethod("setPendingIntentBackgroundActivityStartMode", Int::class.javaPrimitiveType)
+                .invoke(options, mode)
+        }.onFailure {
+            Log.d(appTag, "ActivityOptions.setPendingIntentBackgroundActivityStartMode unavailable on API ${Build.VERSION.SDK_INT}")
         }
         return options.toBundle()
     }
@@ -1305,34 +1305,34 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (result.startsWith("Could not")) "$prefix $result" else prefix
     }
 
-    private fun playYoutubeMusic(query: String, videoUrl: String): String {
-        if (query.isBlank()) return "I need a YouTube video, song, artist, playlist, or search query."
-        val encoded = Uri.encode(query)
-        val searchUrl = "https://www.youtube.com/results?search_query=$encoded"
-        val watchUrl = videoUrl.takeIf { it.startsWith("http://") || it.startsWith("https://") }
-        val mediaIntents = youtubeMediaPackages().map { packageName ->
+    private fun playYoutubeMusic(query: String): String {
+        val cleanQuery = query.trim()
+        if (cleanQuery.isBlank()) return "I need a song, artist, playlist, album, video title, or search query."
+
+        val playbackTargets = youtubeMediaPackages().map { packageName ->
+            packageName to
             Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
                 .setPackage(packageName)
-                .putExtra(SearchManager.QUERY, query)
-                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/video")
+                .putExtra(SearchManager.QUERY, cleanQuery)
+                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/audio")
+                .putExtra(MediaStore.EXTRA_MEDIA_TITLE, cleanQuery)
         }
-        val intents = buildList {
-            watchUrl?.let { add(Intent(Intent.ACTION_VIEW, Uri.parse(it))) }
-            addAll(mediaIntents)
-            add(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)))
+        playbackTargets.forEach { (packageName, intent) ->
+            val result = launchIntent(intent, youtubePackageLabel(packageName))
+            if (!result.startsWith("Could not")) {
+                return "Requested ${youtubePackageLabel(packageName)} to play \"$cleanQuery\"."
+            }
         }
-        val label = "YouTube playback"
-        intents.forEach { intent ->
-            val result = launchIntent(intent, label)
-            if (!result.startsWith("Could not")) return result
-        }
-        return "Could not start YouTube video/search for $query."
+        return "Could not request YouTube Music playback for \"$cleanQuery\"."
     }
 
     private fun youtubeMediaPackages(): List<String> = listOf(
         "com.google.android.apps.youtube.music",
         "com.google.android.youtube"
     )
+
+    private fun youtubePackageLabel(packageName: String): String =
+        if (packageName == "com.google.android.apps.youtube.music") "YouTube Music" else "YouTube"
 
     private fun openRokidTranslator(): String = openRokidNativeApp("translator")
 
@@ -1556,24 +1556,31 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val cleanQuery = query.trim()
         if (cleanQuery.isBlank()) return "I need a query to search the web."
 
+        val sections = mutableListOf<String>()
         val instantAnswer = fetchDuckDuckGoInstantAnswer(cleanQuery)
         if (instantAnswer.isNotBlank()) {
-            return instantAnswer.take(WEB_SEARCH_MAX_OUTPUT_CHARS)
+            sections += "Instant answer:\n$instantAnswer"
         }
 
-        val searchUrl = "https://duckduckgo.com/?q=${URLEncoder.encode(cleanQuery, "UTF-8")}"
-        val result = launchIntent(Intent(Intent.ACTION_VIEW, Uri.parse(searchUrl)), "web search")
-        return if (result.startsWith("Could not", ignoreCase = true)) {
-            "I could not fetch an instant answer or open web search for \"$cleanQuery\": $result"
+        val searchResults = fetchDuckDuckGoSearchResults(cleanQuery)
+        if (searchResults.isNotEmpty()) {
+            sections += "Web results for \"$cleanQuery\":\n${formatWebSearchResults(searchResults)}"
+        }
+
+        return if (sections.isEmpty()) {
+            "I could not fetch web results for \"$cleanQuery\"."
         } else {
-            "Opened web search for \"$cleanQuery\"."
+            sections.joinToString("\n\n").take(WEB_SEARCH_MAX_OUTPUT_CHARS)
         }
     }
 
     private fun fetchDuckDuckGoInstantAnswer(query: String): String {
         val url = "https://api.duckduckgo.com/?q=${URLEncoder.encode(query, "UTF-8")}&format=json&no_html=1&skip_disambig=1"
         val raw = fetchText(url, "DuckDuckGo instant answer", maxChars = 120_000)
-        if (raw.startsWith("Could not", ignoreCase = true)) return raw
+        if (raw.startsWith("Could not", ignoreCase = true)) {
+            Log.w(appTag, raw)
+            return ""
+        }
 
         val parsed = runCatching { gson.fromJson(raw, Map::class.java) as Map<*, *> }.getOrNull() ?: return ""
         val heading = parsed["Heading"]?.toString().orEmpty()
@@ -1584,6 +1591,95 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .joinToString("\n")
             .take(1200)
     }
+
+    private fun fetchDuckDuckGoSearchResults(query: String): List<WebSearchResult> {
+        val url = "https://html.duckduckgo.com/html/?q=${URLEncoder.encode(query, "UTF-8")}"
+        val html = fetchText(url, "DuckDuckGo search results", maxChars = 180_000)
+        if (html.startsWith("Could not", ignoreCase = true)) {
+            Log.w(appTag, html)
+            return emptyList()
+        }
+
+        val titleRegex = Regex("(?is)<a[^>]*class=[\"'][^\"']*result__a[^\"']*[\"'][^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>")
+        val snippetRegex = Regex("(?is)<(?:a|div)[^>]*class=[\"'][^\"']*result__snippet[^\"']*[\"'][^>]*>(.*?)</(?:a|div)>")
+        val matches = titleRegex.findAll(html).toList()
+        return matches.mapIndexedNotNull { index, match ->
+            val title = htmlToPlainText(match.groupValues.getOrNull(2).orEmpty())
+            if (title.isBlank()) return@mapIndexedNotNull null
+
+            val chunkStart = (match.range.last + 1).coerceAtMost(html.length)
+            val chunkEnd = matches.getOrNull(index + 1)?.range?.first ?: (match.range.last + 4000).coerceAtMost(html.length)
+            val chunk = html.substring(chunkStart, chunkEnd.coerceAtLeast(chunkStart))
+            val snippet = snippetRegex.find(chunk)
+                ?.groupValues
+                ?.getOrNull(1)
+                ?.let(::htmlToPlainText)
+                .orEmpty()
+
+            WebSearchResult(
+                title = title,
+                url = cleanDuckDuckGoResultUrl(match.groupValues.getOrNull(1).orEmpty()),
+                snippet = snippet
+            )
+        }
+            .distinctBy { result -> result.url.ifBlank { result.title } }
+            .take(WEB_SEARCH_RESULT_LIMIT)
+    }
+
+    private fun formatWebSearchResults(results: List<WebSearchResult>): String =
+        results.mapIndexed { index, result ->
+            buildString {
+                append("${index + 1}. ${result.title}")
+                if (result.url.isNotBlank()) append("\n   ${result.url}")
+                if (result.snippet.isNotBlank()) append("\n   ${result.snippet}")
+            }
+        }.joinToString("\n")
+
+    private fun cleanDuckDuckGoResultUrl(rawUrl: String): String {
+        val decoded = decodeHtmlEntities(rawUrl).trim()
+        val absolute = when {
+            decoded.startsWith("//") -> "https:$decoded"
+            decoded.startsWith("/") -> "https://duckduckgo.com$decoded"
+            else -> decoded
+        }
+        return runCatching {
+            Uri.parse(absolute).getQueryParameter("uddg")?.takeIf { it.isNotBlank() } ?: absolute
+        }.getOrDefault(absolute)
+    }
+
+    private fun htmlToPlainText(html: String): String =
+        decodeHtmlEntities(
+            html
+                .replace(Regex("(?is)<script.*?</script>"), " ")
+                .replace(Regex("(?is)<style.*?</style>"), " ")
+                .replace(Regex("(?i)<br\\s*/?>"), " ")
+                .replace(Regex("<[^>]+>"), " ")
+        ).collapseWhitespace().trim()
+
+    private fun decodeHtmlEntities(value: String): String =
+        value
+            .replace("&amp;", "&")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace("&apos;", "'")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&nbsp;", " ")
+            .replace(Regex("&#x([0-9a-fA-F]+);")) { match ->
+                match.groupValues.getOrNull(1)
+                    ?.toIntOrNull(16)
+                    ?.let(::codePointToString)
+                    ?: match.value
+            }
+            .replace(Regex("&#(\\d+);")) { match ->
+                match.groupValues.getOrNull(1)
+                    ?.toIntOrNull()
+                    ?.let(::codePointToString)
+                    ?: match.value
+            }
+
+    private fun codePointToString(codePoint: Int): String =
+        runCatching { String(Character.toChars(codePoint)) }.getOrDefault("")
 
     private fun fetchText(url: String, label: String, maxChars: Int = Int.MAX_VALUE): String = try {
         val request = Request.Builder()
@@ -2081,9 +2177,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val systemPrompt = getSystemPrompt() +
             "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. ${currentAssistantTimeHint()} " +
             "Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. " +
-            "Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. " +
+            "Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Tool-Antwort fragt ausdrücklich nach Auswahl; Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. " +
             "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings. Erwarte keine Textinterpretation durch die App. " +
-            "Aktuelles/Web/Preise/Öffnungszeiten: web_search. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
+            "Aktuelles/Web/Preise/Öffnungszeiten: web_search und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. YouTube Music: play_youtube_music mit Suchtext, nie mit URL. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage

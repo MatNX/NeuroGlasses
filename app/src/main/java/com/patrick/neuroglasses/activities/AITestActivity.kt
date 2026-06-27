@@ -92,6 +92,13 @@ class AITestActivity : AppCompatActivity() {
     private var streamingBuffer = StringBuilder()
     private var currentDisplayedCharCount = 0
     private var isStreaming = false
+    private var isCustomSceneExitArmed = false
+    private var sceneExitPollMisses = 0
+    private val sceneExitPollRunnable = object : Runnable {
+        override fun run() {
+            checkCustomSceneStillOpen()
+        }
+    }
 
     companion object {
         const val EXTRA_START_CONVERSATION = "com.patrick.neuroglasses.START_CONVERSATION"
@@ -102,6 +109,9 @@ class AITestActivity : AppCompatActivity() {
         private const val NEW_CONVERSATION_RESTART_DELAY_MS = 350L
         private const val MAX_SESSION_HISTORY_MESSAGES = 20
         private const val ASR_TIMEOUT_MS = 30_000L
+        private const val SCENE_EXIT_POLL_FIRST_DELAY_MS = 900L
+        private const val SCENE_EXIT_POLL_INTERVAL_MS = 500L
+        private const val SCENE_EXIT_POLL_REQUIRED_MISSES = 2
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -551,6 +561,9 @@ class AITestActivity : AppCompatActivity() {
         customSceneHelper.setListener(object : CustomSceneHelper.CustomSceneListener {
             override fun onSceneOpened() {
                 runOnUiThread {
+                    if (isConversationActive && !isClosingConversation) {
+                        startSceneExitPolling()
+                    }
                     updateProcessingStatus("Ergebnis auf der Brille angezeigt")
                     Toast.makeText(this@AITestActivity, "Ergebnis auf der Brille angezeigt", Toast.LENGTH_SHORT).show()
                 }
@@ -565,7 +578,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onSceneClosed() {
                 runOnUiThread {
                     Log.d(appTag, "Custom scene closed")
-                    if (isConversationActive && !isClosingConversation) {
+                    if (!isClosingConversation) {
                         closeConversation("Konversation beendet.")
                     }
                 }
@@ -832,6 +845,7 @@ class AITestActivity : AppCompatActivity() {
 
         isConversationActive = true
         isClosingConversation = false
+        stopSceneExitPolling()
         ignoreNextAudioStop = false
         audioStartAttempts = 0
         sessionConversationMessages.clear()
@@ -930,6 +944,7 @@ class AITestActivity : AppCompatActivity() {
         isClosingConversation = true
         isConversationActive = false
         isAiSceneOpen = false
+        stopSceneExitPolling()
         isAwaitingPhotoForCurrentRequest = false
         pendingInstructionForPhoto = null
         currentInstructionText = ""
@@ -944,6 +959,7 @@ class AITestActivity : AppCompatActivity() {
         streamingAudioPlayer.stop()
         systemTtsPlayer.stop()
         customSceneHelper.stopAudio()
+        RokidHostConnection.notifyTtsAudioFinished()
 
         ignoreNextAudioStop = true
         audioHelper.abortRecordingForSessionClose()
@@ -956,6 +972,49 @@ class AITestActivity : AppCompatActivity() {
         showProcessingUI(false)
         updateStatus(message)
         isClosingConversation = false
+    }
+
+    private fun startSceneExitPolling() {
+        isCustomSceneExitArmed = true
+        sceneExitPollMisses = 0
+        if (!::processingStatusTextView.isInitialized) return
+        processingStatusTextView.removeCallbacks(sceneExitPollRunnable)
+        processingStatusTextView.postDelayed(sceneExitPollRunnable, SCENE_EXIT_POLL_FIRST_DELAY_MS)
+    }
+
+    private fun stopSceneExitPolling() {
+        isCustomSceneExitArmed = false
+        sceneExitPollMisses = 0
+        if (::processingStatusTextView.isInitialized) {
+            processingStatusTextView.removeCallbacks(sceneExitPollRunnable)
+        }
+    }
+
+    private fun checkCustomSceneStillOpen() {
+        if (!isConversationActive || isClosingConversation || !isCustomSceneExitArmed) {
+            sceneExitPollMisses = 0
+            return
+        }
+
+        if (customSceneHelper.isCustomViewOpen()) {
+            if (sceneExitPollMisses > 0) {
+                Log.d(appTag, "Custom scene open poll recovered")
+            }
+            sceneExitPollMisses = 0
+        } else {
+            sceneExitPollMisses += 1
+            Log.d(
+                appTag,
+                "Custom scene is no longer reported open ($sceneExitPollMisses/$SCENE_EXIT_POLL_REQUIRED_MISSES)"
+            )
+            if (sceneExitPollMisses >= SCENE_EXIT_POLL_REQUIRED_MISSES) {
+                Log.d(appTag, "Custom scene exit detected by open-state poll; ending conversation")
+                closeConversation("Konversation beendet.")
+                return
+            }
+        }
+
+        processingStatusTextView.postDelayed(sceneExitPollRunnable, SCENE_EXIT_POLL_INTERVAL_MS)
     }
 
     private fun handlePhotoCaptureFinished(photoCaptured: Boolean) {
@@ -1166,6 +1225,8 @@ class AITestActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         Log.d(appTag, "Activity destroying")
+
+        stopSceneExitPolling()
 
         // Release resources
         aiCameraHelper.release()

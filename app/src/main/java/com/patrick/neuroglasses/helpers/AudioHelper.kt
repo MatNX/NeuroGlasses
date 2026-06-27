@@ -57,6 +57,7 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         private const val MIN_SPEECH_FRAMES = 3
         private const val SPEECH_RMS_THRESHOLD = 650.0
         private const val SPEECH_PEAK_THRESHOLD = 2000
+        private const val AUDIO_PROGRESS_LOG_INTERVAL_CHUNKS = 50
     }
 
     // Track the most recently saved audio file path
@@ -97,16 +98,12 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
         }
 
         override fun onAudioReceived(data: ByteArray, offset: Int, length: Int) {
-            Log.d(appTag, "Audio data received - Offset: $offset, Length: $length")
-
             if (!isRecording) {
                 Log.v(appTag, "Ignoring audio chunk because no recording is active")
                 return
             }
 
             if (length <= 0) return
-
-            Log.i(appTag, "Audio chunk: $length bytes")
 
             // Extract the actual audio data from the chunk
             val audioChunk = ByteArray(length)
@@ -117,7 +114,9 @@ class AudioHelper(private val context: Context, private val appTag: String = "Au
             totalAudioBytes += length
             updateVoiceActivity(audioChunk)
 
-            Log.d(appTag, "Chunk stored. Total chunks: ${audioChunks.size}, Total bytes: $totalAudioBytes")
+            if (audioChunks.size == 1 || audioChunks.size % AUDIO_PROGRESS_LOG_INTERVAL_CHUNKS == 0) {
+                Log.v(appTag, "Audio buffered: chunks=${audioChunks.size}, bytes=$totalAudioBytes")
+            }
 
             listener?.onAudioDataReceived(length, audioChunks.size, totalAudioBytes)
         }

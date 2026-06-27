@@ -481,6 +481,9 @@ class CustomSceneHelper(
         return success
     }
 
+    fun isCustomViewOpen(): Boolean =
+        RokidHostConnection.customViewIsOpen()
+
     private fun shouldSuppressSceneClosedCallback(): Boolean {
         val now = SystemClock.elapsedRealtime()
         val shouldSuppress = (suppressSceneClosedUntilMs > 0L && now <= suppressSceneClosedUntilMs) ||
