@@ -71,15 +71,8 @@
         <package android:name="com.rokid.ai.translate" />
         <package android:name="com.google.android.apps.maps" />
         <package android:name="com.google.android.youtube" />
-        <package android:name="com.google.android.apps.youtube.music" />
         <package android:name="com.google.android.calendar" />
-        <package android:name="com.google.android.gm" />
         <package android:name="com.whatsapp" />
-        <package android:name="org.mozilla.firefox" />
-        <package android:name="org.mozilla.firefox_beta" />
-        <package android:name="org.mozilla.fenix" />
-        <package android:name="org.mozilla.firefox_nightly" />
-        <package android:name="org.mozilla.focus" />
 
         <intent>
             <action android:name="com.rokid.sprite.aiapp.externalapp.AUTHORIZATION" />
@@ -101,14 +94,6 @@
             <data android:scheme="smsto" />
         </intent>
         <intent>
-            <action android:name="android.intent.action.SENDTO" />
-            <data android:scheme="mailto" />
-        </intent>
-        <intent>
-            <action android:name="android.intent.action.SEND" />
-            <data android:mimeType="message/rfc822" />
-        </intent>
-        <intent>
             <action android:name="android.intent.action.VIEW" />
             <data android:scheme="https" />
         </intent>
@@ -118,9 +103,6 @@
         </intent>
         <intent>
             <action android:name="android.intent.action.SEARCH" />
-        </intent>
-        <intent>
-            <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
         </intent>
         <intent>
             <action android:name="android.intent.action.SET_ALARM" />

@@ -5,6 +5,7 @@ import android.graphics.Bitmap
 import android.app.KeyguardManager
 import android.os.Build
 import android.os.Bundle
+import android.os.SystemClock
 import android.util.Log
 import android.view.View
 import android.view.WindowManager
@@ -93,12 +94,7 @@ class AITestActivity : AppCompatActivity() {
     private var currentDisplayedCharCount = 0
     private var isStreaming = false
     private var isCustomSceneExitArmed = false
-    private var sceneExitPollMisses = 0
-    private val sceneExitPollRunnable = object : Runnable {
-        override fun run() {
-            checkCustomSceneStillOpen()
-        }
-    }
+    private var sceneExitArmedAtMs = 0L
 
     companion object {
         const val EXTRA_START_CONVERSATION = "com.patrick.neuroglasses.START_CONVERSATION"
@@ -106,12 +102,9 @@ class AITestActivity : AppCompatActivity() {
 
         private const val MAX_AUDIO_START_ATTEMPTS = 6
         private const val AUDIO_START_RETRY_DELAY_MS = 350L
-        private const val NEW_CONVERSATION_RESTART_DELAY_MS = 350L
         private const val MAX_SESSION_HISTORY_MESSAGES = 20
         private const val ASR_TIMEOUT_MS = 30_000L
-        private const val SCENE_EXIT_POLL_FIRST_DELAY_MS = 900L
-        private const val SCENE_EXIT_POLL_INTERVAL_MS = 500L
-        private const val SCENE_EXIT_POLL_REQUIRED_MISSES = 2
+        private const val GLASS_APP_RESUME_EXIT_ARM_MS = 1_000L
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -562,7 +555,7 @@ class AITestActivity : AppCompatActivity() {
             override fun onSceneOpened() {
                 runOnUiThread {
                     if (isConversationActive && !isClosingConversation) {
-                        startSceneExitPolling()
+                        armCustomSceneExit()
                     }
                     updateProcessingStatus("Ergebnis auf der Brille angezeigt")
                     Toast.makeText(this@AITestActivity, "Ergebnis auf der Brille angezeigt", Toast.LENGTH_SHORT).show()
@@ -645,11 +638,9 @@ class AITestActivity : AppCompatActivity() {
         toolName in setOf(
             "place_phone_call",
             "send_sms",
-            "play_youtube_music",
             "set_timer",
             "create_reminder",
             "create_calendar_event",
-            "send_email",
             "open_app",
             "share_text",
             "open_accessibility_settings"
@@ -673,7 +664,6 @@ class AITestActivity : AppCompatActivity() {
         "start_navigation" -> "Navigation"
         "confirm_navigation_destination" -> "Navigationsziel"
         "stop_navigation" -> "Navigation stoppen"
-        "play_youtube_music" -> "YouTube"
         "open_rokid_translator" -> "Rokid-Übersetzer"
         "get_gps_location" -> "Standort"
         "get_weather" -> "Wetter"
@@ -682,7 +672,6 @@ class AITestActivity : AppCompatActivity() {
         "create_reminder" -> "Erinnerung"
         "list_reminders" -> "Erinnerungen"
         "create_calendar_event" -> "Kalender"
-        "send_email" -> "E-Mail"
         "open_app" -> "App"
         "share_text" -> "Teilen"
         "get_battery_status" -> "Akku"
@@ -807,7 +796,11 @@ class AITestActivity : AppCompatActivity() {
         RokidHostConnection.setAiEventListener(object : RokidHostConnection.AiEventListener {
             override fun onAiKeyDown() {
                 runOnUiThread {
-                    Log.d(appTag, "AI key pressed - starting conversation")
+                    Log.d(
+                        appTag,
+                        "AI key down delivered: active=$isConversationActive " +
+                            "closing=$isClosingConversation sceneArmed=$isCustomSceneExitArmed"
+                    )
                     RokidHostConnection.setInterruptAiWake(true)
                     RokidHostConnection.interruptAiWakeNow()
                     onAiKeyPressed()
@@ -824,6 +817,12 @@ class AITestActivity : AppCompatActivity() {
                     closeConversation("Konversation beendet.")
                 }
             }
+
+            override fun onGlassAppResumeChanged(firstPackage: String?, secondPackage: String?) {
+                runOnUiThread {
+                    handleGlassAppResumeChange(firstPackage, secondPackage)
+                }
+            }
         })
     }
 
@@ -833,19 +832,20 @@ class AITestActivity : AppCompatActivity() {
      */
     private fun onAiKeyPressed() {
         if (isConversationActive && !isClosingConversation) {
-            Log.d(appTag, "Conversation already active; starting a fresh conversation")
-            closeConversation("Neue Konversation gestartet.")
-            processingStatusTextView.postDelayed({
-                if (!isFinishing && !isDestroyed) {
-                    onAiKeyPressed()
-                }
-            }, NEW_CONVERSATION_RESTART_DELAY_MS)
+            val armedForMs = if (sceneExitArmedAtMs > 0L) {
+                SystemClock.elapsedRealtime() - sceneExitArmedAtMs
+            } else {
+                0L
+            }
+            Log.d(appTag, "AI key pressed while conversation active; ending conversation. armedForMs=$armedForMs")
+            closeConversation("Konversation beendet.")
             return
         }
 
+        Log.d(appTag, "AI key pressed while conversation inactive; starting conversation")
         isConversationActive = true
         isClosingConversation = false
-        stopSceneExitPolling()
+        disarmCustomSceneExit()
         ignoreNextAudioStop = false
         audioStartAttempts = 0
         sessionConversationMessages.clear()
@@ -944,7 +944,7 @@ class AITestActivity : AppCompatActivity() {
         isClosingConversation = true
         isConversationActive = false
         isAiSceneOpen = false
-        stopSceneExitPolling()
+        disarmCustomSceneExit()
         isAwaitingPhotoForCurrentRequest = false
         pendingInstructionForPhoto = null
         currentInstructionText = ""
@@ -974,47 +974,40 @@ class AITestActivity : AppCompatActivity() {
         isClosingConversation = false
     }
 
-    private fun startSceneExitPolling() {
+    private fun armCustomSceneExit() {
         isCustomSceneExitArmed = true
-        sceneExitPollMisses = 0
-        if (!::processingStatusTextView.isInitialized) return
-        processingStatusTextView.removeCallbacks(sceneExitPollRunnable)
-        processingStatusTextView.postDelayed(sceneExitPollRunnable, SCENE_EXIT_POLL_FIRST_DELAY_MS)
+        sceneExitArmedAtMs = SystemClock.elapsedRealtime()
     }
 
-    private fun stopSceneExitPolling() {
+    private fun disarmCustomSceneExit() {
         isCustomSceneExitArmed = false
-        sceneExitPollMisses = 0
-        if (::processingStatusTextView.isInitialized) {
-            processingStatusTextView.removeCallbacks(sceneExitPollRunnable)
-        }
+        sceneExitArmedAtMs = 0L
     }
 
-    private fun checkCustomSceneStillOpen() {
-        if (!isConversationActive || isClosingConversation || !isCustomSceneExitArmed) {
-            sceneExitPollMisses = 0
+    private fun handleGlassAppResumeChange(firstPackage: String?, secondPackage: String?) {
+        if (!isConversationActive || isClosingConversation) return
+        val armedForMs = if (sceneExitArmedAtMs > 0L) {
+            SystemClock.elapsedRealtime() - sceneExitArmedAtMs
+        } else {
+            0L
+        }
+        if (!isCustomSceneExitArmed || armedForMs < GLASS_APP_RESUME_EXIT_ARM_MS) {
+            Log.d(
+                appTag,
+                "Ignoring early glass app resume change: first=$firstPackage second=$secondPackage " +
+                    "armed=$isCustomSceneExitArmed armedForMs=$armedForMs"
+            )
             return
         }
 
-        if (customSceneHelper.isCustomViewOpen()) {
-            if (sceneExitPollMisses > 0) {
-                Log.d(appTag, "Custom scene open poll recovered")
-            }
-            sceneExitPollMisses = 0
-        } else {
-            sceneExitPollMisses += 1
-            Log.d(
-                appTag,
-                "Custom scene is no longer reported open ($sceneExitPollMisses/$SCENE_EXIT_POLL_REQUIRED_MISSES)"
-            )
-            if (sceneExitPollMisses >= SCENE_EXIT_POLL_REQUIRED_MISSES) {
-                Log.d(appTag, "Custom scene exit detected by open-state poll; ending conversation")
-                closeConversation("Konversation beendet.")
-                return
-            }
-        }
-
-        processingStatusTextView.postDelayed(sceneExitPollRunnable, SCENE_EXIT_POLL_INTERVAL_MS)
+        val customViewOpen = customSceneHelper.isCustomViewOpen()
+        val audioStreaming = RokidHostConnection.isAudioStreaming()
+        Log.d(
+            appTag,
+            "Glass app resume changed while custom scene is active: first=$firstPackage " +
+                "second=$secondPackage customViewOpen=$customViewOpen audioStreaming=$audioStreaming"
+        )
+        closeConversation("Konversation beendet.")
     }
 
     private fun handlePhotoCaptureFinished(photoCaptured: Boolean) {
@@ -1226,7 +1219,7 @@ class AITestActivity : AppCompatActivity() {
         super.onDestroy()
         Log.d(appTag, "Activity destroying")
 
-        stopSceneExitPolling()
+        disarmCustomSceneExit()
 
         // Release resources
         aiCameraHelper.release()

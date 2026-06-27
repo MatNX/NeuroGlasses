@@ -5,7 +5,9 @@ import android.Manifest
 import android.app.Activity
 import android.app.ActivityOptions
 import android.app.AlarmManager
-import android.app.SearchManager
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
 import android.content.Context
 import android.content.Intent
 import android.app.KeyguardManager
@@ -15,7 +17,6 @@ import android.os.Build
 import android.os.Bundle
 import android.provider.AlarmClock
 import android.provider.CalendarContract
-import android.provider.MediaStore
 import android.provider.Settings
 import android.provider.ContactsContract
 import android.telephony.PhoneNumberUtils
@@ -29,6 +30,7 @@ import android.util.Log
 import com.google.gson.Gson
 import com.google.gson.JsonElement
 import com.google.gson.annotations.SerializedName
+import com.patrick.neuroglasses.R
 import com.patrick.neuroglasses.activities.SettingsActivity
 import com.patrick.neuroglasses.receivers.ReminderReceiver
 import com.patrick.neuroglasses.services.RokidConnectionService
@@ -196,6 +198,9 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val MIN_TTS_AUDIO_BYTES = 44
         private const val MIN_ASR_TIMEOUT_SECONDS = 30L
         private const val ROKID_SPRITE_LAUNCHER_PACKAGE = "com.rokid.os.sprite.launcher"
+        private const val TOOL_LAUNCH_CHANNEL_ID = "neuro_tool_launch"
+        private const val TOOL_LAUNCH_NOTIFICATION_ID = 44
+        private const val TOOL_LAUNCH_NOTIFICATION_TIMEOUT_MS = 15_000L
         private const val PREF_ACTIVE_CHAT_ID = "active_chat_id"
         private const val PREF_ACTIVE_CHAT_EXPLICIT = "active_chat_explicit"
         private const val WEB_SEARCH_MAX_OUTPUT_CHARS = 5000
@@ -800,13 +805,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 parameters = objectSchema(emptyList(), emptyMap())
             )),
             AssistantTool(function = ToolFunction(
-                name = "play_youtube_music",
-                description = "Play requested music hands-free by sending a media search query to YouTube Music or YouTube. Do not pass URLs; use the song, artist, playlist, album, or video title as the query.",
-                parameters = objectSchema(listOf("query"), mapOf(
-                    "query" to stringProp("Song, artist, playlist, album, video title, or search query to play.")
-                ))
-            )),
-            AssistantTool(function = ToolFunction(
                 name = "open_rokid_translator",
                 description = "Open the native Rokid/glasses-side real-time translator or translation app through Hi Rokid CXR-L. Use this for translate/übersetzen requests, not Google Translate on the phone.",
                 parameters = objectSchema(emptyList(), emptyMap())
@@ -859,15 +857,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                     "end_epoch_millis" to numericStringProp("Optionaler exakter Endzeitpunkt als Unix epoch milliseconds, als Dezimalziffern."),
                     "location" to stringProp("Optionaler Ort."),
                     "notes" to stringProp("Optionale Notizen.")
-                ))
-            )),
-            AssistantTool(function = ToolFunction(
-                name = "send_email",
-                description = "Deutschsprachig: Öffne Gmail oder die Standard-Mail-App mit Empfänger, Betreff und Text. Android/Gmail verlangt Nutzerbestätigung zum Senden; dieses Tool verschickt nicht heimlich im Hintergrund.",
-                parameters = objectSchema(listOf("to", "subject", "body"), mapOf(
-                    "to" to stringProp("E-Mail-Adresse des Empfängers."),
-                    "subject" to stringProp("Betreff."),
-                    "body" to stringProp("Nachrichtentext.")
                 ))
             )),
             AssistantTool(function = ToolFunction(
@@ -959,7 +948,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "start_navigation" -> startOsmNavigation(arg("destination"), arg("mode"))
             "confirm_navigation_destination" -> confirmOsmNavigationDestination(arg("selection"), arg("destination"), arg("mode"))
             "stop_navigation" -> stopOsmNavigation()
-            "play_youtube_music" -> playYoutubeMusic(arg("query"))
             "open_rokid_translator" -> openRokidTranslator()
             "get_gps_location" -> getGpsLocation()
             "get_weather" -> getWeather(arg("location"))
@@ -976,7 +964,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 arg("location"),
                 arg("notes")
             )
-            "send_email" -> sendEmail(arg("to"), arg("subject"), arg("body"))
             "open_app" -> openApp(arg("app"))
             "share_text" -> shareText(arg("text"))
             "get_battery_status" -> getBatteryStatus()
@@ -1084,18 +1071,25 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun launchIntentFromBackground(intent: Intent, label: String): String {
-        val sendOptions = backgroundActivityLaunchOptions()
+        val sendOptions = backgroundActivityLaunchOptions("setPendingIntentBackgroundActivityStartMode")
+        val creatorOptions = backgroundActivityLaunchOptions("setPendingIntentCreatorBackgroundActivityStartMode")
         val requestCode = (System.currentTimeMillis() and Int.MAX_VALUE.toLong()).toInt()
         val pendingIntent = PendingIntent.getActivity(
             context,
             requestCode,
             intent,
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            creatorOptions
         )
+        val notificationPosted = showBackgroundLaunchNotification(label, pendingIntent)
 
         return try {
             pendingIntent.send(context, 0, null, null, null, null, sendOptions)
-            "Requested $label via Android. If nothing opens, Android blocked this background launch."
+            if (notificationPosted) {
+                "Requested $label via Android and posted a launch notification in case Android blocks background opening."
+            } else {
+                "Requested $label via Android. If nothing opens, Android blocked this background launch."
+            }
         } catch (e: PendingIntent.CanceledException) {
             Log.e(appTag, "Could not send pending intent for $label", e)
             "Could not start $label: ${e.message}."
@@ -1105,15 +1099,15 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         }
     }
 
-    private fun backgroundActivityLaunchOptions(): Bundle? {
+    private fun backgroundActivityLaunchOptions(methodName: String): Bundle? {
         val options = ActivityOptions.makeBasic()
         val mode = backgroundActivityStartMode() ?: return options.toBundle()
         runCatching {
             ActivityOptions::class.java
-                .getMethod("setPendingIntentBackgroundActivityStartMode", Int::class.javaPrimitiveType)
+                .getMethod(methodName, Int::class.javaPrimitiveType)
                 .invoke(options, mode)
         }.onFailure {
-            Log.d(appTag, "ActivityOptions.setPendingIntentBackgroundActivityStartMode unavailable on API ${Build.VERSION.SDK_INT}")
+            Log.d(appTag, "ActivityOptions.$methodName unavailable on API ${Build.VERSION.SDK_INT}")
         }
         return options.toBundle()
     }
@@ -1127,6 +1121,48 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 ActivityOptions::class.java.getField(fieldName).getInt(null)
             }.getOrNull()
         }
+
+    private fun showBackgroundLaunchNotification(label: String, pendingIntent: PendingIntent): Boolean {
+        if (!canPostNotifications()) return false
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return false
+        createToolLaunchNotificationChannel(manager)
+
+        val notification = Notification.Builder(context, TOOL_LAUNCH_CHANNEL_ID)
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setContentTitle("Open $label")
+            .setContentText("Android may require this tap for background launches.")
+            .setCategory(Notification.CATEGORY_CALL)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .setPriority(Notification.PRIORITY_MAX)
+            .setAutoCancel(true)
+            .setTimeoutAfter(TOOL_LAUNCH_NOTIFICATION_TIMEOUT_MS)
+            .setContentIntent(pendingIntent)
+            .setFullScreenIntent(pendingIntent, true)
+            .build()
+
+        return runCatching {
+            manager.notify(TOOL_LAUNCH_NOTIFICATION_ID, notification)
+            true
+        }.getOrElse {
+            Log.w(appTag, "Could not post launch notification for $label", it)
+            false
+        }
+    }
+
+    private fun canPostNotifications(): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            hasPermission(Manifest.permission.POST_NOTIFICATIONS)
+
+    private fun createToolLaunchNotificationChannel(manager: NotificationManager) {
+        if (manager.getNotificationChannel(TOOL_LAUNCH_CHANNEL_ID) != null) return
+        val channel = NotificationChannel(
+            TOOL_LAUNCH_CHANNEL_ID,
+            "NeuroGlasses tool launches",
+            NotificationManager.IMPORTANCE_HIGH
+        )
+        channel.lockscreenVisibility = Notification.VISIBILITY_PUBLIC
+        manager.createNotificationChannel(channel)
+    }
 
     private fun hasPermission(permission: String): Boolean = context.checkSelfPermission(permission) == PackageManager.PERMISSION_GRANTED
 
@@ -1304,35 +1340,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         )
         return if (result.startsWith("Could not")) "$prefix $result" else prefix
     }
-
-    private fun playYoutubeMusic(query: String): String {
-        val cleanQuery = query.trim()
-        if (cleanQuery.isBlank()) return "I need a song, artist, playlist, album, video title, or search query."
-
-        val playbackTargets = youtubeMediaPackages().map { packageName ->
-            packageName to
-            Intent(MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH)
-                .setPackage(packageName)
-                .putExtra(SearchManager.QUERY, cleanQuery)
-                .putExtra(MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/audio")
-                .putExtra(MediaStore.EXTRA_MEDIA_TITLE, cleanQuery)
-        }
-        playbackTargets.forEach { (packageName, intent) ->
-            val result = launchIntent(intent, youtubePackageLabel(packageName))
-            if (!result.startsWith("Could not")) {
-                return "Requested ${youtubePackageLabel(packageName)} to play \"$cleanQuery\"."
-            }
-        }
-        return "Could not request YouTube Music playback for \"$cleanQuery\"."
-    }
-
-    private fun youtubeMediaPackages(): List<String> = listOf(
-        "com.google.android.apps.youtube.music",
-        "com.google.android.youtube"
-    )
-
-    private fun youtubePackageLabel(packageName: String): String =
-        if (packageName == "com.google.android.apps.youtube.music") "YouTube Music" else "YouTube"
 
     private fun openRokidTranslator(): String = openRokidNativeApp("translator")
 
@@ -1765,38 +1772,6 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return if (reminders.isEmpty()) "No reminders saved." else reminders.joinToString("\n")
     }
 
-    private fun sendEmail(to: String, subject: String, body: String): String {
-        if (to.isBlank()) return "Ich brauche eine E-Mail-Adresse."
-        val mailUri = Uri.parse(
-            "mailto:${Uri.encode(to)}" +
-                "?subject=${Uri.encode(subject)}" +
-                "&body=${Uri.encode(body)}"
-        )
-        val intents = listOf(
-            Intent(Intent.ACTION_SENDTO, mailUri).setPackage("com.google.android.gm"),
-            Intent(Intent.ACTION_SENDTO, mailUri),
-            Intent(Intent.ACTION_SEND)
-                .setType("message/rfc822")
-                .putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
-                .putExtra(Intent.EXTRA_SUBJECT, subject)
-                .putExtra(Intent.EXTRA_TEXT, body)
-                .setPackage("com.google.android.gm"),
-            Intent(Intent.ACTION_SEND)
-                .setType("message/rfc822")
-                .putExtra(Intent.EXTRA_EMAIL, arrayOf(to))
-                .putExtra(Intent.EXTRA_SUBJECT, subject)
-                .putExtra(Intent.EXTRA_TEXT, body)
-        )
-
-        intents.forEach { intent ->
-            val result = launchIntent(intent, "E-Mail-Entwurf")
-            if (!result.startsWith("Could not")) {
-                return "Opened email draft for $to. Android/Gmail requires you to confirm Send; silent Gmail sending needs OAuth or SMTP configuration."
-            }
-        }
-        return "Could not open an email app for $to."
-    }
-
     private fun openApp(app: String): String {
         if (app.isBlank()) return "Ich brauche einen App-Namen."
         val normalized = app.lowercase(Locale.ROOT)
@@ -1806,8 +1781,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "whatsapp" to "com.whatsapp",
             "kalender" to "com.google.android.calendar",
             "calendar" to "com.google.android.calendar",
-            "youtube" to "com.google.android.youtube",
-            "gmail" to "com.google.android.gm"
+            "youtube" to "com.google.android.youtube"
         )
         val packageName = aliases[normalized] ?: app
         val intent = context.packageManager.getLaunchIntentForPackage(packageName)
@@ -2179,7 +2153,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             "Nutze Tools nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen snap_glasses_photo. " +
             "Navigation: start_navigation mit komplett gehörtem Ziel; public_transit ist Standard, foot nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Tool-Antwort fragt ausdrücklich nach Auswahl; Folgeauswahl wie eins/zwei/drei nutzt confirm_navigation_destination. " +
             "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings. Erwarte keine Textinterpretation durch die App. " +
-            "Aktuelles/Web/Preise/Öffnungszeiten: web_search und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. YouTube Music: play_youtube_music mit Suchtext, nie mit URL. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
+            "Aktuelles/Web/Preise/Öffnungszeiten: web_search und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. Persistente Chats: new_chat, list_chats, switch_chat, rename_chat, leave_chat und delete_chat nur bei ausdrücklichem Wunsch. $sessionPrompt"
         messagesList.add(Message(role = "system", content = systemPrompt))
 
         val includeHistoryForRequest = !hasImage
