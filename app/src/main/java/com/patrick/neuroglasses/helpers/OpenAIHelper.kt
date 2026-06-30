@@ -9,6 +9,7 @@ import android.content.ContentUris
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.app.KeyguardManager
@@ -44,6 +45,12 @@ import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 import java.net.URLEncoder
+import java.time.DayOfWeek
+import java.time.Instant
+import java.time.LocalDate
+import java.time.LocalDateTime
+import java.time.LocalTime
+import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.text.DateFormat
@@ -51,7 +58,9 @@ import java.text.Normalizer
 import java.util.Calendar
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.UUID
+import kotlin.math.cos
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -260,14 +269,18 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         private const val OEBB_API_BASE_URL = "https://v6.oebb.transport.rest"
         private const val OEBB_SCOTTY_BASE_URL = "https://fahrplan.oebb.at"
         private const val OVERPASS_API_URL = "https://overpass-api.de/api/interpreter"
+        private const val OVERPASS_KUMI_API_URL = "https://overpass.kumi.systems/api/interpreter"
+        private const val DEFAULT_CALENDAR_EVENT_DURATION_MILLIS = 30 * 60 * 1000L
         private const val WEB_SEARCH_USER_AGENT =
             "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 (KHTML, like Gecko) NeuroGlasses/1.0 Mobile Safari/537.36"
         private val SEMANTIC_STOP_WORDS = setOf(
             "der", "die", "das", "und", "oder", "aber", "ich", "du", "wir", "mir", "mich",
             "mein", "meine", "dein", "eine", "einen", "einem", "ist", "sind", "war", "mit",
+            "wie", "wer", "was",
             "for", "the", "and", "or", "but", "this", "that", "what", "where", "when", "how",
             "about", "into", "from", "have", "has", "had", "please", "bitte"
         )
+        private val OVERPASS_API_URLS = listOf(OVERPASS_API_URL, OVERPASS_KUMI_API_URL)
     }
 
     private data class ContactPhone(
@@ -317,6 +330,20 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val longitude: Double,
         val distanceMeters: Float,
         val detail: String
+    )
+
+    private data class WritableCalendarCandidate(
+        val id: Long,
+        val displayName: String,
+        val accessLevel: Int,
+        val isPrimary: Boolean,
+        val isOwner: Boolean
+    )
+
+    private data class TextFetchResult(
+        val text: String? = null,
+        val httpCode: Int? = null,
+        val errorMessage: String? = null
     )
 
     private data class TransitStop(
@@ -593,9 +620,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         if (cleanContent.isBlank()) return "Der Erinnerungsinhalt darf nicht leer sein."
 
         val now = System.currentTimeMillis()
-        val cleanCategory = category.trim().ifBlank { "general" }.take(40)
-        val tags = parseStringList(tagsRaw).take(12)
-        val importance = importanceRaw.toIntOrNull()?.coerceIn(1, 5) ?: 3
+        val cleanCategory = category.trim().ifBlank { inferMemoryCategory(cleanContent) }.take(40)
+        val tags = enrichedMemoryTags(parseStringList(tagsRaw), cleanContent, cleanCategory).take(12)
+        val requestedImportance = importanceRaw.toIntOrNull()?.coerceIn(1, 5) ?: 3
+        val importance = maxOf(requestedImportance, inferredMemoryImportance(cleanContent, cleanCategory))
         val memories = getSemanticMemories()
 
         val existingIndex = memories.indexOfFirst { memory ->
@@ -676,8 +704,19 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     }
 
     private fun semanticMemoryContext(instruction: String): String {
-        val relevant = rankedMemories(instruction, "", MEMORY_CONTEXT_LIMIT)
-            .filter { semanticOverlapScore(instruction, it.content, it.tags, it.category) >= 2.0 || it.importance >= 5 }
+        val memoryQuery = passiveMemoryQuery(instruction)
+        val relevant = rankedMemories(memoryQuery, "", MEMORY_CONTEXT_LIMIT)
+            .filter { semanticOverlapScore(memoryQuery, it.content, it.tags, it.category) >= 2.0 || it.importance >= 5 }
+            .ifEmpty {
+                if (looksLikeIdentityMemoryQuestion(instruction)) {
+                    getSemanticMemories()
+                        .filter { isIdentityMemory(it.content, it.category, it.tags) }
+                        .sortedWith(compareByDescending<SemanticMemoryRecord> { it.importance }.thenByDescending { it.updatedAt })
+                        .take(MEMORY_CONTEXT_LIMIT)
+                } else {
+                    emptyList()
+                }
+            }
         if (relevant.isEmpty()) return ""
         return relevant.joinToString(
             prefix = "Relevante gespeicherte Erinnerungen:\n",
@@ -734,15 +773,13 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         latitudeRaw: String,
         longitudeRaw: String
     ): String {
-        val cleanName = name.trim()
-        if (cleanName.isBlank()) return "Ein Ortsname ist erforderlich."
-
         val coordinates = explicitCoordinates(latitudeRaw, longitudeRaw)
             ?: resolvedPlaceCoordinates(address)
             ?: readLastKnownLocation()?.let { LocationCoordinates(it.latitude, it.longitude, it.accuracyMeters) }
             ?: return "Ich brauche GPS-Berechtigung, Koordinaten oder eine auflösbare Adresse, bevor ich diesen Ort speichern kann."
 
         val now = System.currentTimeMillis()
+        val cleanName = name.trim().ifBlank { defaultSavedPlaceName(description, address, coordinates, now) }
         val places = getSavedPlaces()
         val existingIndex = places.indexOfFirst { it.name.equals(cleanName, ignoreCase = true) }
         val record = SavedPlaceRecord(
@@ -775,6 +812,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun navigateSavedPlace(nameOrId: String, mode: String): String {
         val place = findSavedPlace(nameOrId) ?: return "Gespeicherter Ort nicht gefunden."
+        return startNavigationToSavedPlace(place, mode)
+    }
+
+    private fun startNavigationToSavedPlace(place: SavedPlaceRecord, mode: String): String {
         return RokidConnectionService.startNavigation(
             context = context,
             destination = place.name,
@@ -808,6 +849,26 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun findSavedPlace(nameOrId: String): SavedPlaceRecord? =
         rankedSavedPlaces(nameOrId, 1).firstOrNull()
+
+    private fun findSavedPlaceForNavigation(destination: String): SavedPlaceRecord? {
+        val clean = destination.trim()
+        if (clean.isBlank()) return null
+        val normalized = semanticText(clean)
+        val queryTokens = semanticTokens(clean)
+        val places = getSavedPlaces()
+        places.firstOrNull { place ->
+            val nameTokens = semanticTokens(place.name)
+            place.id.equals(clean, ignoreCase = true) ||
+                semanticText(place.name) == normalized ||
+                (nameTokens.isNotEmpty() && nameTokens.all { it in queryTokens })
+        }?.let { return it }
+
+        return rankedSavedPlaces(clean, 1)
+            .firstOrNull()
+            ?.takeIf { place ->
+                semanticOverlapScore(clean, "${place.name} ${place.description} ${place.address}", emptyList(), "place") >= 6.0
+            }
+    }
 
     private fun rankedSavedPlaces(query: String, limit: Int): List<SavedPlaceRecord> {
         val places = getSavedPlaces()
@@ -1346,7 +1407,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = exposedToolName("create_calendar_event"),
-                description = "Deutschsprachig: Lege einen Kalendertermin per Sprache an. Berechne Start/Ende selbst und uebergib epoch milliseconds als Dezimalziffern, wenn der Nutzer Zeiten nennt.",
+                description = "Deutschsprachig: Lege einen Kalendertermin direkt an. Berechne Start/Ende selbst und uebergib epoch milliseconds als Dezimalziffern, wenn der Nutzer Zeiten nennt. Notizen nur für echte Notizen verwenden, nie Start/Ende dort wiederholen.",
                 parameters = objectSchema(listOf("title"), mapOf(
                     "title" to stringProp("Titel des Termins."),
                     "start" to stringProp("Optionale Startzeit als lesbarer Text fuer die Beschreibung."),
@@ -1391,14 +1452,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             )),
             AssistantTool(function = ToolFunction(
                 name = exposedToolName("saved_place"),
-                description = "Gespeicherte Orte verwalten: speichern, suchen/listen, dorthin navigieren oder löschen.",
+                description = "Gespeicherte Orte verwalten: speichern, suchen/listen, dorthin navigieren oder löschen. Speichern darf ohne Namen erfolgen; die App nutzt Koordinaten, Adresse oder aktuellen GPS-Standort und vergibt dann selbst einen Namen.",
                 parameters = objectSchema(listOf("action"), mapOf(
                     "action" to mapOf(
                         "type" to "string",
                         "description" to "Ortsaktion.",
                         "enum" to listOf("save", "list", "navigate", "delete")
                     ),
-                    "name" to stringProp("Ortsname, ID oder Lösch-/Navigationsziel."),
+                    "name" to stringProp("Optionaler Ortsname, ID oder Lösch-/Navigationsziel; bei save leer lassen, wenn nur der aktuelle Standort gespeichert werden soll."),
                     "query" to stringProp("Suchtext für action=list oder Alternative zu name."),
                     "description" to stringProp("Optionale Beschreibung oder Merkhilfe."),
                     "address" to stringProp("Optionale Adresse oder Ortsangabe zum Auflösen."),
@@ -1507,7 +1568,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         "set_timer" -> "Android-Timer stellen; Dauer vorher in Sekunden umrechnen."
         "create_reminder" -> "Erinnerung speichern; genannte Fälligkeit als epoch millis berechnen."
         "list_reminders" -> "Gespeicherte Erinnerungen auflisten."
-        "create_calendar_event" -> "Kalendertermin erstellen; genannte Zeiten als epoch millis berechnen."
+        "create_calendar_event" -> "Kalendertermin direkt erstellen; Zeiten in Felder, nicht in Notizen."
         "open_app" -> "Installierte App per Paketname oder App-Name öffnen."
         "share_text" -> "Text über den Android-Teilen-Dialog teilen."
         "get_battery_status" -> "Akkustand und Ladezustand abrufen."
@@ -1516,8 +1577,8 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         "search_memory" -> "Gespeichertes semantisches Gedächtnis durchsuchen."
         "list_memories" -> "Gespeicherte Erinnerungen optional gefiltert auflisten."
         "forget_memory" -> "Gespeicherte Erinnerung nur auf ausdrücklichen Wunsch löschen."
-        "saved_place" -> "Gespeicherte Orte speichern, suchen, navigieren oder löschen."
-        "save_place" -> "Benannten Ort dauerhaft speichern; GPS oder Adresse nutzen."
+        "saved_place" -> "Gespeicherte Orte speichern, suchen, navigieren oder löschen; save darf ohne Namen aktuellen GPS-Ort nutzen."
+        "save_place" -> "Ort dauerhaft speichern; Name optional, GPS oder Adresse nutzen."
         "list_saved_places" -> "Gespeicherte Orte optional gefiltert auflisten."
         "navigate_saved_place" -> "Navigation zu gespeichertem Ort per ID oder Name starten."
         "forget_saved_place" -> "Gespeicherten Ort nur auf ausdrücklichen Wunsch löschen."
@@ -1754,17 +1815,7 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
     private fun navigationActuallyStarted(result: String): Boolean =
         result.startsWith("Navigation gestartet", ignoreCase = true) ||
             result.startsWith("Navigation mode started", ignoreCase = true)
-
-    private fun toolResultLooksFailed(result: String): Boolean =
-        result.startsWith("Could not", ignoreCase = true) ||
-            result.startsWith("Konnte", ignoreCase = true) ||
-            result.startsWith("I need", ignoreCase = true) ||
-            result.startsWith("Ich brauche", ignoreCase = true) ||
-            result.contains("permission is required", ignoreCase = true) ||
-            result.contains("Berechtigung", ignoreCase = true) ||
-            result.contains("failed", ignoreCase = true) ||
-            result.contains("fehlgeschlagen", ignoreCase = true)
-
+    
     private fun buildToolResultFallback(results: List<String>): String {
         if (results.isEmpty()) return ""
         val last = results.last()
@@ -2103,23 +2154,23 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
 
     private fun startOsmNavigation(destination: String, mode: String): String {
         val cleanMode = normalizeNavigationMode(mode)
-        val resolution = navigationDestinationResolver.resolve(destination, cleanMode)
-        return when (resolution.status) {
-            NavigationDestinationResolver.Status.CONFIRMED -> {
-                val selected = resolution.selected ?: return resolution.message
-                RokidConnectionService.startNavigation(
-                    context = context,
-                    destination = selected.shortLabel,
-                    mode = resolution.mode.ifBlank { cleanMode },
-                    latitude = selected.latitude,
-                    longitude = selected.longitude
-                )
-            }
-            NavigationDestinationResolver.Status.NEEDS_CONFIRMATION,
-            NavigationDestinationResolver.Status.NOT_FOUND,
-            NavigationDestinationResolver.Status.ERROR,
-            NavigationDestinationResolver.Status.CANCELLED -> resolution.message
+        findSavedPlaceForNavigation(destination)?.let { place ->
+            return startNavigationToSavedPlace(place, cleanMode)
         }
+
+        val resolution = navigationDestinationResolver.resolve(destination, cleanMode)
+        val bestEffortResolution = if (
+            resolution.status == NavigationDestinationResolver.Status.NEEDS_CONFIRMATION &&
+            resolution.candidates.isNotEmpty()
+        ) {
+            navigationDestinationResolver.confirm(
+                selection = "1",
+                modeOverride = resolution.mode.ifBlank { cleanMode }
+            ).takeIf { it.status == NavigationDestinationResolver.Status.CONFIRMED } ?: resolution
+        } else {
+            resolution
+        }
+        return startNavigationFromResolution(bestEffortResolution, cleanMode)
     }
 
     private fun confirmOsmNavigationDestination(selection: String, destination: String, mode: String): String {
@@ -2128,13 +2179,20 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             refinedDestination = destination.takeIf { it.isNotBlank() },
             modeOverride = mode.takeIf { it.isNotBlank() }?.let(::normalizeNavigationMode)
         )
+        return startNavigationFromResolution(resolution, normalizeNavigationMode(mode))
+    }
+
+    private fun startNavigationFromResolution(
+        resolution: NavigationDestinationResolver.Result,
+        fallbackMode: String
+    ): String {
         return when (resolution.status) {
             NavigationDestinationResolver.Status.CONFIRMED -> {
                 val selected = resolution.selected ?: return resolution.message
                 RokidConnectionService.startNavigation(
                     context = context,
                     destination = selected.shortLabel,
-                    mode = normalizeNavigationMode(resolution.mode),
+                    mode = normalizeNavigationMode(resolution.mode.ifBlank { fallbackMode }),
                     latitude = selected.latitude,
                     longitude = selected.longitude
                 )
@@ -2579,18 +2637,231 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         location: String,
         notes: String
     ): String {
-        if (title.isBlank()) return "Ich brauche einen Termintitel."
+        val cleanTitle = title.trim()
+        if (cleanTitle.isBlank()) return "Ich brauche einen Termintitel."
+        val description = calendarEventDescription(notes)
+        val beginMillis = startEpochMillis?.takeIf { it > 0 }
+            ?: parseCalendarDateTimeMillis(start)
+        val finishMillis = beginMillis?.let { startMillis ->
+            val referenceDate = Instant.ofEpochMilli(startMillis).atZone(ZoneId.systemDefault()).toLocalDate()
+            val parsedEndMillis = parseCalendarDateTimeMillis(end, referenceDate)
+                ?.let { if (it <= startMillis) it + 24 * 60 * 60 * 1000L else it }
+            endEpochMillis?.takeIf { it > startMillis }
+                ?: parsedEndMillis
+                ?: (startMillis + DEFAULT_CALENDAR_EVENT_DURATION_MILLIS)
+        }
+
+        if (beginMillis != null && finishMillis != null && hasPermission(Manifest.permission.WRITE_CALENDAR)) {
+            createCalendarEventDirectly(cleanTitle, beginMillis, finishMillis, location, description)?.let {
+                return it
+            }
+        }
+
         val intent = Intent(Intent.ACTION_INSERT)
             .setData(CalendarContract.Events.CONTENT_URI)
-            .putExtra(CalendarContract.Events.TITLE, title)
+            .putExtra(CalendarContract.Events.TITLE, cleanTitle)
             .putExtra(CalendarContract.Events.EVENT_LOCATION, location)
-            .putExtra(CalendarContract.Events.DESCRIPTION, listOf(notes, start.takeIf { it.isNotBlank() }?.let { "Start: $it" }, end.takeIf { it.isNotBlank() }?.let { "Ende: $it" }).filterNotNull().joinToString("\n"))
-        startEpochMillis?.takeIf { it > 0 }?.let { startMillis ->
+            .putExtra(CalendarContract.Events.DESCRIPTION, description)
+        beginMillis?.let { startMillis ->
             intent.putExtra(CalendarContract.EXTRA_EVENT_BEGIN_TIME, startMillis)
-            val endMillis = endEpochMillis?.takeIf { it > startMillis } ?: (startMillis + 30 * 60 * 1000L)
-            intent.putExtra(CalendarContract.EXTRA_EVENT_END_TIME, endMillis)
+            intent.putExtra(CalendarContract.EXTRA_EVENT_END_TIME, finishMillis ?: (startMillis + DEFAULT_CALENDAR_EVENT_DURATION_MILLIS))
         }
         return launchIntent(intent, "Kalendertermin")
+    }
+
+    private fun createCalendarEventDirectly(
+        title: String,
+        beginMillis: Long,
+        endMillis: Long,
+        location: String,
+        description: String
+    ): String? {
+        val calendar = writableCalendarCandidate() ?: return null
+        return try {
+            val values = ContentValues().apply {
+                put(CalendarContract.Events.CALENDAR_ID, calendar.id)
+                put(CalendarContract.Events.TITLE, title)
+                put(CalendarContract.Events.DTSTART, beginMillis)
+                put(CalendarContract.Events.DTEND, endMillis)
+                put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
+                location.trim().takeIf { it.isNotBlank() }?.let { put(CalendarContract.Events.EVENT_LOCATION, it) }
+                description.takeIf { it.isNotBlank() }?.let { put(CalendarContract.Events.DESCRIPTION, it) }
+            }
+            val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values) ?: return null
+            val eventId = ContentUris.parseId(uri)
+            "Kalendertermin erstellt [${eventId}]: $title, ${formatAgendaTime(beginMillis, endMillis, allDay = false)} (${calendar.displayName})."
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not create calendar event directly", e)
+            null
+        }
+    }
+
+    private fun writableCalendarCandidate(): WritableCalendarCandidate? {
+        if (!hasPermission(Manifest.permission.READ_CALENDAR) && !hasPermission(Manifest.permission.WRITE_CALENDAR)) return null
+        val projection = arrayOf(
+            CalendarContract.Calendars._ID,
+            CalendarContract.Calendars.CALENDAR_DISPLAY_NAME,
+            CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL,
+            CalendarContract.Calendars.IS_PRIMARY,
+            CalendarContract.Calendars.OWNER_ACCOUNT,
+            CalendarContract.Calendars.ACCOUNT_NAME
+        )
+        val candidates = mutableListOf<WritableCalendarCandidate>()
+        return try {
+            context.contentResolver.query(
+                CalendarContract.Calendars.CONTENT_URI,
+                projection,
+                "${CalendarContract.Calendars.VISIBLE}=1",
+                null,
+                null
+            )?.use { cursor ->
+                val idIndex = cursor.getColumnIndex(CalendarContract.Calendars._ID)
+                val nameIndex = cursor.getColumnIndex(CalendarContract.Calendars.CALENDAR_DISPLAY_NAME)
+                val accessIndex = cursor.getColumnIndex(CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL)
+                val primaryIndex = cursor.getColumnIndex(CalendarContract.Calendars.IS_PRIMARY)
+                val ownerIndex = cursor.getColumnIndex(CalendarContract.Calendars.OWNER_ACCOUNT)
+                val accountIndex = cursor.getColumnIndex(CalendarContract.Calendars.ACCOUNT_NAME)
+
+                while (cursor.moveToNext()) {
+                    val accessLevel = cursor.getIntOrDefault(accessIndex, 0)
+                    if (accessLevel < CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR) continue
+                    candidates += WritableCalendarCandidate(
+                        id = cursor.getLongOrDefault(idIndex, -1L),
+                        displayName = cursor.getStringOrBlank(nameIndex).ifBlank { "Kalender" },
+                        accessLevel = accessLevel,
+                        isPrimary = cursor.getIntOrDefault(primaryIndex, 0) == 1,
+                        isOwner = cursor.getStringOrBlank(ownerIndex).equals(
+                            cursor.getStringOrBlank(accountIndex),
+                            ignoreCase = true
+                        )
+                    )
+                }
+            }
+            candidates
+                .filter { it.id >= 0 }
+                .sortedWith(
+                    compareByDescending<WritableCalendarCandidate> { it.isPrimary }
+                        .thenByDescending { it.isOwner }
+                        .thenByDescending { it.accessLevel }
+                )
+                .firstOrNull()
+        } catch (e: Exception) {
+            Log.e(appTag, "Could not find writable calendar", e)
+            null
+        }
+    }
+
+    private fun calendarEventDescription(notes: String): String =
+        notes.trim()
+
+    private fun parseCalendarDateTimeMillis(raw: String, referenceDate: LocalDate = LocalDate.now(ZoneId.systemDefault())): Long? {
+        val clean = raw.trim()
+        if (clean.isBlank()) return null
+
+        clean.toLongOrNull()
+            ?.takeIf { it > 1_000_000_000_000L }
+            ?.let { return it }
+
+        runCatching { return ZonedDateTime.parse(clean).toInstant().toEpochMilli() }
+        runCatching { return Instant.parse(clean).toEpochMilli() }
+
+        calendarDateTimeFormatters().forEach { formatter ->
+            runCatching {
+                return LocalDateTime.parse(clean, formatter)
+                    .atZone(ZoneId.systemDefault())
+                    .toInstant()
+                    .toEpochMilli()
+            }
+        }
+
+        val date = calendarDateFromText(clean, referenceDate)
+        val time = calendarTimeFromText(clean, date != null) ?: return null
+        return LocalDateTime.of(date ?: referenceDate, time)
+            .atZone(ZoneId.systemDefault())
+            .toInstant()
+            .toEpochMilli()
+    }
+
+    private fun calendarDateTimeFormatters(): List<DateTimeFormatter> =
+        listOf(
+            DateTimeFormatter.ISO_LOCAL_DATE_TIME,
+            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm", Locale.GERMANY),
+            DateTimeFormatter.ofPattern("yyyy-MM-dd H:mm", Locale.GERMANY),
+            DateTimeFormatter.ofPattern("dd.MM.yyyy HH:mm", Locale.GERMANY),
+            DateTimeFormatter.ofPattern("dd.MM.yyyy H:mm", Locale.GERMANY),
+            DateTimeFormatter.ofPattern("dd.MM.yy HH:mm", Locale.GERMANY),
+            DateTimeFormatter.ofPattern("dd.MM.yy H:mm", Locale.GERMANY)
+        )
+
+    private fun calendarDateFromText(raw: String, referenceDate: LocalDate): LocalDate? {
+        val text = semanticText(raw)
+        if (text.contains("uebermorgen") || text.contains("ubermorgen")) return referenceDate.plusDays(2)
+        if (text.contains("morgen") || text.contains("tomorrow")) return referenceDate.plusDays(1)
+        if (text.contains("heute") || text.contains("today")) return referenceDate
+
+        Regex("""\b(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?\b""").find(raw)?.let { match ->
+            val day = match.groupValues.getOrNull(1)?.toIntOrNull() ?: return@let
+            val month = match.groupValues.getOrNull(2)?.toIntOrNull() ?: return@let
+            val rawYear = match.groupValues.getOrNull(3).orEmpty()
+            val year = when {
+                rawYear.length == 2 -> 2000 + rawYear.toInt()
+                rawYear.length == 4 -> rawYear.toInt()
+                else -> referenceDate.year
+            }
+            return runCatching { LocalDate.of(year, month, day) }.getOrNull()
+        }
+
+        val weekdays = mapOf(
+            "montag" to DayOfWeek.MONDAY,
+            "dienstag" to DayOfWeek.TUESDAY,
+            "mittwoch" to DayOfWeek.WEDNESDAY,
+            "donnerstag" to DayOfWeek.THURSDAY,
+            "freitag" to DayOfWeek.FRIDAY,
+            "samstag" to DayOfWeek.SATURDAY,
+            "sonntag" to DayOfWeek.SUNDAY,
+            "monday" to DayOfWeek.MONDAY,
+            "tuesday" to DayOfWeek.TUESDAY,
+            "wednesday" to DayOfWeek.WEDNESDAY,
+            "thursday" to DayOfWeek.THURSDAY,
+            "friday" to DayOfWeek.FRIDAY,
+            "saturday" to DayOfWeek.SATURDAY,
+            "sunday" to DayOfWeek.SUNDAY
+        )
+        weekdays.firstNotNullOfOrNull { (token, dayOfWeek) ->
+            if (!text.contains(token)) null else dayOfWeek
+        }?.let { dayOfWeek ->
+            val delta = (dayOfWeek.value - referenceDate.dayOfWeek.value + 7) % 7
+            return referenceDate.plusDays(delta.toLong())
+        }
+
+        return null
+    }
+
+    private fun calendarTimeFromText(raw: String, allowStandaloneHour: Boolean): LocalTime? {
+        val lower = raw.lowercase(Locale.ROOT)
+        Regex("""\b([01]?\d|2[0-3])[:.]([0-5]\d)\b""").find(lower)?.let { match ->
+            val hour = match.groupValues[1].toInt()
+            val minute = match.groupValues[2].toInt()
+            return LocalTime.of(hour, minute)
+        }
+
+        Regex("""\b([01]?\d|2[0-3])\s*(?:uhr|h)\s*([0-5]\d)?\b""").find(lower)?.let { match ->
+            val hour = match.groupValues[1].toInt()
+            val minute = match.groupValues.getOrNull(2)?.takeIf { it.isNotBlank() }?.toIntOrNull() ?: 0
+            return LocalTime.of(hour, minute)
+        }
+
+        Regex("""\b(?:um|at)\s+([01]?\d|2[0-3])\b""").find(lower)?.let { match ->
+            return LocalTime.of(match.groupValues[1].toInt(), 0)
+        }
+
+        if (allowStandaloneHour) {
+            Regex("""\b([01]?\d|2[0-3])\b""").findAll(lower).lastOrNull()?.let { match ->
+                return LocalTime.of(match.groupValues[1].toInt(), 0)
+            }
+        }
+
+        return null
     }
 
     private fun getAgenda(
@@ -2670,21 +2941,33 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val cleanCategory = category.trim().ifBlank { "Orte" }
         val radius = (radiusMeters ?: 1000).coerceIn(100, 5000)
         val boundedLimit = (limit ?: NEARBY_RESULT_LIMIT).coerceIn(1, 12)
-        val query = buildOverpassNearbyQuery(cleanCategory, location.latitude, location.longitude, radius, boundedLimit)
-        val raw = fetchTextPost(OVERPASS_API_URL, query, "nahe Orte", maxChars = 400_000)
-        if (raw.startsWith("Could not", ignoreCase = true) || raw.startsWith("Konnte", ignoreCase = true)) return raw
-
-        val places = runCatching {
-            parseNearbyPlaces(raw, cleanCategory, location.latitude, location.longitude)
+        val overpassError = StringBuilder()
+        val overpassPlaces = runCatching {
+            val query = buildOverpassNearbyQuery(cleanCategory, location.latitude, location.longitude, radius, boundedLimit)
+            val raw = fetchOverpassText(query, "nahe Orte", maxChars = 250_000)
+            if (raw.startsWith("Could not", ignoreCase = true) || raw.startsWith("Konnte", ignoreCase = true)) {
+                overpassError.append(raw)
+                emptyList()
+            } else {
+                parseNearbyPlaces(raw, cleanCategory, location.latitude, location.longitude)
+            }
         }.getOrElse {
             Log.e(appTag, "Could not parse nearby places", it)
-            return "Konnte nahe Orte nicht auswerten: ${it.message}"
+            overpassError.append("Konnte nahe Orte nicht auswerten: ${it.message}")
+            emptyList()
+        }
+
+        val places = if (overpassPlaces.isNotEmpty()) {
+            overpassPlaces
+        } else {
+            searchNominatimNearbyPlaces(cleanCategory, location.latitude, location.longitude, radius, boundedLimit)
         }
             .sortedBy { it.distanceMeters }
             .take(boundedLimit)
 
         if (places.isEmpty()) {
-            return "Keine nahen Orte für '$cleanCategory' im Umkreis von ${radius}m gefunden."
+            val detail = overpassError.toString().takeIf { it.isNotBlank() }?.let { " ($it)" }.orEmpty()
+            return "Keine nahen Orte für '$cleanCategory' im Umkreis von ${radius}m gefunden.$detail"
         }
         return places.mapIndexed { index, place ->
             "${index + 1}. ${place.name} (${formatDistance(place.distanceMeters.toDouble())}) - " +
@@ -2798,12 +3081,11 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             """
                 node(around:$radiusMeters,$latitude,$longitude)$filter;
                 way(around:$radiusMeters,$latitude,$longitude)$filter;
-                relation(around:$radiusMeters,$latitude,$longitude)$filter;
             """.trimIndent()
         }
-        val outputLimit = (limit * 4).coerceAtLeast(12)
+        val outputLimit = (limit * 3).coerceAtLeast(10)
         return """
-            [out:json][timeout:8];
+            [out:json][timeout:6];
             (
             $body
             );
@@ -2859,6 +3141,100 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 add(NearbyPlace(name, category, lat, lon, distance, detail))
             }
         }.distinctBy { "${it.name}:${it.latitude}:${it.longitude}" }
+    }
+
+    private fun searchNominatimNearbyPlaces(
+        category: String,
+        latitude: Double,
+        longitude: Double,
+        radiusMeters: Int,
+        limit: Int
+    ): List<NearbyPlace> {
+        val url = nominatimNearbySearchUrl(category, latitude, longitude, radiusMeters, limit)
+        val raw = fetchText(url, "nahe Orte per Nominatim", maxChars = 120_000)
+        if (raw.startsWith("Could not", ignoreCase = true) || raw.startsWith("Konnte", ignoreCase = true)) {
+            Log.w(appTag, raw)
+            return emptyList()
+        }
+
+        return runCatching {
+            parseNominatimNearbyPlaces(raw, category, latitude, longitude, radiusMeters)
+        }.getOrElse {
+            Log.e(appTag, "Could not parse nearby Nominatim places", it)
+            emptyList()
+        }
+    }
+
+    private fun nominatimNearbySearchUrl(
+        category: String,
+        latitude: Double,
+        longitude: Double,
+        radiusMeters: Int,
+        limit: Int
+    ): String {
+        val latDelta = radiusMeters / 111_320.0
+        val lonDelta = radiusMeters / (111_320.0 * cos(Math.toRadians(latitude)).coerceAtLeast(0.2))
+        val left = longitude - lonDelta
+        val right = longitude + lonDelta
+        val top = latitude + latDelta
+        val bottom = latitude - latDelta
+        val query = URLEncoder.encode(nominatimNearbySearchTerm(category), "UTF-8")
+        return "https://nominatim.openstreetmap.org/search" +
+            "?format=jsonv2&limit=${(limit * 3).coerceAtLeast(10)}&countrycodes=at&accept-language=de" +
+            "&addressdetails=1&extratags=1&dedupe=1&bounded=1" +
+            "&viewbox=$left,$top,$right,$bottom&q=$query"
+    }
+
+    private fun nominatimNearbySearchTerm(category: String): String {
+        val normalized = semanticText(category)
+        return when {
+            normalized.contains("pharmacy") || normalized.contains("apotheke") -> "Apotheke"
+            normalized.contains("toilet") || normalized.contains("wc") || normalized.contains("restroom") || normalized.contains("klo") -> "Toiletten"
+            normalized.contains("atm") || normalized.contains("bankomat") || normalized.contains("geldautomat") -> "Bankomat"
+            normalized.contains("supermarket") || normalized.contains("grocery") || normalized.contains("lebensmittel") || normalized.contains("supermarkt") -> "Supermarkt"
+            normalized.contains("station") || normalized.contains("stop") || normalized.contains("haltestelle") || normalized.contains("bahnhof") -> "Haltestelle"
+            normalized.contains("restaurant") || normalized.contains("essen") -> "Restaurant"
+            normalized.contains("cafe") || normalized.contains("kaffee") -> "Cafe"
+            normalized.contains("hospital") || normalized.contains("arzt") || normalized.contains("clinic") || normalized.contains("krankenhaus") -> "Krankenhaus"
+            normalized.contains("water") || normalized.contains("wasser") || normalized.contains("trink") -> "Trinkwasser"
+            normalized.contains("parking") || normalized.contains("parkplatz") || normalized.contains("parken") -> "Parkplatz"
+            normalized.contains("hotel") -> "Hotel"
+            else -> category
+        }
+    }
+
+    private fun parseNominatimNearbyPlaces(
+        rawJson: String,
+        requestedCategory: String,
+        originLat: Double,
+        originLon: Double,
+        radiusMeters: Int
+    ): List<NearbyPlace> {
+        val array = JSONArray(rawJson)
+        return buildList {
+            for (index in 0 until array.length()) {
+                val item = array.optJSONObject(index) ?: continue
+                val lat = item.optString("lat").toDoubleOrNull() ?: continue
+                val lon = item.optString("lon").toDoubleOrNull() ?: continue
+                val distance = distanceMeters(originLat, originLon, lat, lon)
+                if (distance > radiusMeters * 1.5) continue
+                val displayName = item.optString("display_name")
+                val name = item.optString("name")
+                    .ifBlank { displayName.split(',').firstOrNull()?.trim().orEmpty() }
+                    .ifBlank { requestedCategory }
+                val category = item.optString("type")
+                    .ifBlank { item.optString("class") }
+                    .ifBlank { requestedCategory }
+                val detail = displayName
+                    .split(',')
+                    .drop(1)
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() }
+                    .take(2)
+                    .joinToString(", ")
+                add(NearbyPlace(name, category, lat, lon, distance, detail))
+            }
+        }.distinctBy { "${semanticText(it.name)}:${"%.5f".format(Locale.US, it.latitude)}:${"%.5f".format(Locale.US, it.longitude)}" }
     }
 
     private fun categoryFromTags(tags: JSONObject, fallback: String): String =
@@ -3083,7 +3459,33 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         return fetchText("$OEBB_API_BASE_URL$path", label, maxChars)
     }
 
-    private fun fetchTextPost(url: String, bodyText: String, label: String, maxChars: Int = Int.MAX_VALUE): String = try {
+    private fun fetchOverpassText(bodyText: String, label: String, maxChars: Int): String {
+        var lastError = "Konnte $label nicht abrufen."
+        OVERPASS_API_URLS.forEach { url ->
+            repeat(2) { attempt ->
+                val result = fetchTextPostDetailed(url, bodyText, label, maxChars)
+                result.text?.let { return it }
+                lastError = result.errorMessage ?: lastError
+                if (!isTransientOverpassStatus(result.httpCode)) return lastError
+                runCatching { Thread.sleep(250L * (attempt + 1)) }
+            }
+        }
+        return if (lastError.contains("HTTP 409") || lastError.contains("HTTP 429")) {
+            "$lastError Overpass ist gerade ausgelastet; bitte gleich noch einmal versuchen."
+        } else {
+            lastError
+        }
+    }
+
+    private fun isTransientOverpassStatus(httpCode: Int?): Boolean =
+        httpCode in setOf(409, 429, 502, 503, 504)
+
+    private fun fetchTextPost(url: String, bodyText: String, label: String, maxChars: Int = Int.MAX_VALUE): String {
+        val result = fetchTextPostDetailed(url, bodyText, label, maxChars)
+        return result.text ?: result.errorMessage ?: "Konnte $label nicht abrufen."
+    }
+
+    private fun fetchTextPostDetailed(url: String, bodyText: String, label: String, maxChars: Int = Int.MAX_VALUE): TextFetchResult = try {
         val request = Request.Builder()
             .url(url)
             .post(bodyText.toRequestBody("text/plain; charset=utf-8".toMediaType()))
@@ -3092,14 +3494,14 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .build()
         getWebFetchClient().newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
-                "Konnte $label nicht abrufen: HTTP ${response.code}"
+                TextFetchResult(httpCode = response.code, errorMessage = "Konnte $label nicht abrufen: HTTP ${response.code}")
             } else {
                 val text = response.body?.string()?.trim().orEmpty()
-                if (maxChars == Int.MAX_VALUE) text else text.take(maxChars)
+                TextFetchResult(text = if (maxChars == Int.MAX_VALUE) text else text.take(maxChars), httpCode = response.code)
             }
         }
     } catch (e: Exception) {
-        "Konnte $label nicht abrufen: ${e.message}"
+        TextFetchResult(errorMessage = "Konnte $label nicht abrufen: ${e.message}")
     }
 
     private fun explicitCoordinates(latitudeRaw: String, longitudeRaw: String): LocationCoordinates? {
@@ -3118,6 +3520,18 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
                 LocationCoordinates(it.latitude, it.longitude, 0f)
             }
         }.getOrNull()
+    }
+
+    private fun defaultSavedPlaceName(
+        description: String,
+        address: String,
+        coordinates: LocationCoordinates,
+        now: Long
+    ): String {
+        description.trim().takeIf { it.isNotBlank() }?.let { return it.take(48) }
+        address.trim().takeIf { it.isNotBlank() }?.let { return it.take(48) }
+        val timestamp = DateFormat.getDateTimeInstance(DateFormat.SHORT, DateFormat.SHORT, Locale.GERMANY).format(Date(now))
+        return "Ort $timestamp (${formatCoordinates(coordinates.latitude, coordinates.longitude)})"
     }
 
     private fun placeDetail(place: SavedPlaceRecord): String =
@@ -3147,6 +3561,62 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .map { it.take(40) }
     }
 
+    private fun inferMemoryCategory(content: String): String =
+        if (looksLikeIdentityMemory(content)) "identitaet" else "general"
+
+    private fun inferredMemoryImportance(content: String, category: String): Int =
+        if (isIdentityMemory(content, category, emptyList())) 5 else 1
+
+    private fun enrichedMemoryTags(tags: List<String>, content: String, category: String): List<String> {
+        val inferred = if (isIdentityMemory(content, category, tags)) listOf("identitaet", "name") else emptyList()
+        return (tags + inferred)
+            .map { it.trim().take(40) }
+            .filter { it.isNotBlank() }
+            .distinctBy { semanticText(it) }
+    }
+
+    private fun passiveMemoryQuery(instruction: String): String {
+        val additions = mutableListOf<String>()
+        if (looksLikeIdentityMemoryQuestion(instruction)) additions += "name identitaet identity called heisse"
+        return (listOf(instruction) + additions).joinToString(" ")
+    }
+
+    private fun looksLikeIdentityMemoryQuestion(value: String): Boolean {
+        val text = semanticText(value)
+        return listOf(
+            "wie heisse ich",
+            "was ist mein name",
+            "wie ist mein name",
+            "wer bin ich",
+            "what is my name",
+            "who am i"
+        ).any { text.contains(it) }
+    }
+
+    private fun looksLikeIdentityMemory(value: String): Boolean {
+        val text = semanticText(value)
+        return listOf(
+            "mein name ist",
+            "ich heisse",
+            "ich bin",
+            "my name is",
+            "i am called"
+        ).any { text.contains(it) }
+    }
+
+    private fun isIdentityMemory(content: String, category: String, tags: List<String>): Boolean {
+        val categoryText = semanticText(category)
+        val tagText = semanticText(tags.joinToString(" "))
+        val contentText = semanticText(content)
+        val contentTokens = semanticTokens(content)
+        return categoryText in setOf("identitaet", "identitat", "identity", "person", "profil", "profile") ||
+            "identitaet" in semanticTokens(tagText) ||
+            "identitat" in semanticTokens(tagText) ||
+            "identity" in semanticTokens(tagText) ||
+            looksLikeIdentityMemory(content) ||
+            ("name" in contentTokens && (contentText.contains("mein") || contentText.startsWith("name ")))
+    }
+
     private fun semanticOverlapScore(query: String, content: String, tags: List<String>, category: String): Double {
         val queryTokens = semanticTokens(query)
         if (queryTokens.isEmpty()) return 0.0
@@ -3164,11 +3634,21 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
             .asSequence()
             .map { it.trim() }
             .filter { it.length >= 3 && it !in SEMANTIC_STOP_WORDS }
+            .flatMap { semanticTokenAliases(it).asSequence() }
             .toSet()
+
+    private fun semanticTokenAliases(token: String): Set<String> =
+        when (token) {
+            "heisse", "heisst", "heissen", "genannt", "called" -> setOf(token, "name")
+            "name", "namen" -> setOf(token, "heisse")
+            "identitaet", "identitat", "identity", "profil", "profile" -> setOf(token, "identitaet", "identitat", "identity")
+            else -> setOf(token)
+        }
 
     private fun semanticText(value: String): String {
         val normalized = Normalizer.normalize(value.lowercase(Locale.ROOT), Normalizer.Form.NFD)
             .replace(Regex("\\p{Mn}+"), "")
+            .replace("ß", "ss")
         return normalized.map { char ->
             if (char.isLetterOrDigit()) char else ' '
         }.joinToString("").collapseWhitespace()
@@ -3532,10 +4012,10 @@ class OpenAIHelper(private val context: Context, private val appTag: String = "O
         val systemPrompt = getSystemPrompt() +
             "\n\nDu heißt Neuro. Deutsch (Österreich), kurz und freihändig. ${currentAssistantTimeHint()} " +
             "Nutze Werkzeuge nur bei klarer Handlung, nie für kurze Tests wie hallo/test/ping. Sichtfragen brauchen brillenfoto_aufnehmen. " +
-            "Navigation: nutze navigation mit action=start, confirm oder stop; target ist das Ziel, selection die Nutzerwahl. oeffi ist Standard, zu_fuss nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Werkzeug-Antwort fragt ausdrücklich nach Auswahl. " +
-            "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings. Erwarte keine Textinterpretation durch die App. " +
+            "Navigation: nutze navigation mit action=start, confirm oder stop; target ist das Ziel, selection die Nutzerwahl; gespeicherte Ortsnamen wie Zuhause/Home/Parkplatz werden lokal bevorzugt. oeffi ist Standard, zu_fuss nur bei Fußweg. Vertraue dem besten Zieltreffer, außer die Werkzeug-Antwort fragt ausdrücklich nach Auswahl. " +
+            "Öffne keine externe Navi-App. Kontaktname reicht für Anruf/SMS. Timer/Erinnerungen/Kalender: berechne exakte seconds oder epoch_millis selbst und übergib numerische Zeitwerte als Dezimalziffern-Strings; Kalender-Start/Ende gehören nie in notes. " +
             "Semantische Erinnerung: gedaechtnis action=save nur für ausdrückliches Merken oder stabile persönliche Fakten; search/list/delete für Erinnerungsfragen oder Löschwunsch. " +
-            "Gespeicherte Orte: orte action=save/list/navigate/delete für Parkplatz, Hotel, Eingang, Treffpunkt und ähnliche Orte; nutze delete statt vagem 'vergessen'. " +
+            "Gespeicherte Orte: orte action=save/list/navigate/delete für Parkplatz, Hotel, Eingang, Treffpunkt und ähnliche Orte; save darf ohne name den aktuellen GPS-Ort speichern; nutze delete statt vagem 'vergessen'. " +
             "Kalender: agenda_abrufen für Termin-/Agenda-Abfragen. Umgebung: nahe_orte_finden für nahe Orte; abfahrten_abrufen für Bus/Bahn/Bim/U-Bahn-Abfahrten. " +
             "QR-/Barcode-Fragen sind Sichtfragen und brauchen brillenfoto_aufnehmen; lies sichtbaren Code/URL/Text aus dem frischen Bild, soweit erkennbar. " +
             "Rokid-Brillenapps: rokid_app_oeffnen, auch für uebersetzer. Aktuelles/Web/Preise/Öffnungszeiten: web_suche und aus den zurückgegebenen Webfunden antworten, keinen Browser öffnen. Persistente Chats: chat action=new/list/switch/rename/leave/delete nur bei ausdrücklichem Wunsch. $sessionPrompt" +
